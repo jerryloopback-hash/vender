@@ -29,9 +29,35 @@ const (
 // simply never emitted.
 type singboxConfig struct {
 	Log       singboxLog       `json:"log"`
+	DNS       *singboxDNS      `json:"dns,omitempty"`
 	Inbounds  []singboxInbound `json:"inbounds"`
 	Outbounds []any            `json:"outbounds"`
 	Route     singboxRoute     `json:"route"`
+}
+
+// singboxDNS is the generated `dns` section. vender emits it only for the
+// modes that have a proxy to resolve through; in direct mode there is nothing
+// to protect and sing-box's own default (the system resolver) is right.
+type singboxDNS struct {
+	Servers  []singboxDNSServer `json:"servers"`
+	Rules    []singboxDNSRule   `json:"rules,omitempty"`
+	Final    string             `json:"final,omitempty"`
+	Strategy string             `json:"strategy,omitempty"`
+}
+
+type singboxDNSServer struct {
+	Tag    string `json:"tag"`
+	Type   string `json:"type"`
+	Server string `json:"server"`
+	// Detour is the outbound the query leaves through. It is omitted for the
+	// domestic resolver, which is reached directly; sing-box 1.14 rejects a
+	// detour to the empty `direct` outbound vender otherwise emits.
+	Detour string `json:"detour,omitempty"`
+}
+
+type singboxDNSRule struct {
+	RuleSet []string `json:"rule_set"`
+	Server  string   `json:"server"`
 }
 
 type singboxLog struct {
@@ -47,22 +73,49 @@ type singboxInbound struct {
 }
 
 type singboxRoute struct {
-	Final string        `json:"final"`
-	Rules []singboxRule `json:"rules"`
+	// RuleSet declares the embedded rule set files sing-box may match against.
+	RuleSet []singboxRuleSet `json:"rule_set,omitempty"`
+	// DefaultDomainResolver resolves a destination name when a rule needs its
+	// address (ip_is_private, geoip-cn) or when a direct outbound dials a name.
+	DefaultDomainResolver *singboxDomainResolver `json:"default_domain_resolver,omitempty"`
+	Rules                 []singboxRule          `json:"rules"`
+	Final                 string                 `json:"final"`
 }
 
-// singboxRule is the generated form of a rules.Rule. Only the fields sing-box
-// shares with vender's model are emitted; a rule that matches nothing would
-// never be produced (rules.Rule.Validate rejects it first).
+// singboxRuleSet points sing-box at one rule set file extracted from the
+// vender binary.
+type singboxRuleSet struct {
+	Type   string `json:"type"`   // always "local"
+	Tag    string `json:"tag"`    // referenced by rules and DNS rules
+	Format string `json:"format"` // always "binary" (SRS)
+	Path   string `json:"path"`   // absolute, inside the run dir
+}
+
+type singboxDomainResolver struct {
+	Server string `json:"server"`
+}
+
+// singboxRule is the generated form of one route rule. A rule is either an
+// action (no matchers, no outbound), or a matcher list plus an outbound; the
+// zero omitempty tags keep the two shapes from bleeding into each other.
 type singboxRule struct {
+	// Action turns the entry into a route action (sniff, hijack-dns) instead
+	// of an outbound selection.
+	Action string `json:"action,omitempty"`
+	// Protocol restricts an action to a sniffed protocol.
+	Protocol []string `json:"protocol,omitempty"`
+	// RuleSet matches destinations covered by the named rule sets.
+	RuleSet       []string `json:"rule_set,omitempty"`
 	Domain        []string `json:"domain,omitempty"`
 	DomainSuffix  []string `json:"domain_suffix,omitempty"`
 	DomainKeyword []string `json:"domain_keyword,omitempty"`
 	IPCIDR        []string `json:"ip_cidr,omitempty"`
-	Port          []int    `json:"port,omitempty"`
-	ProcessName   []string `json:"process_name,omitempty"`
+	// IPIsPrivate matches private/loopback/link-local destination addresses.
+	IPIsPrivate bool     `json:"ip_is_private,omitempty"`
+	Port        []int    `json:"port,omitempty"`
+	ProcessName []string `json:"process_name,omitempty"`
 	// Outbound is the tag the connection is routed to.
-	Outbound string `json:"outbound"`
+	Outbound string `json:"outbound,omitempty"`
 }
 
 // --- outbound dialects -----------------------------------------------------
@@ -120,9 +173,11 @@ type realityOpts struct {
 	ShortID   string `json:"short_id,omitempty"`
 }
 
-// BuildConfig renders rc into the sing-box configuration that M1 understands.
-// It is pure: the result is a deterministic JSON document, which is what the
-// golden tests compare against.
+// BuildConfig renders rc into the sing-box configuration vender runs. It is
+// pure: the result is a deterministic JSON document, which is what the golden
+// tests compare against. (The one ambient input is the run directory, which
+// vender always resolves to an absolute path and which the golden cases pass
+// as an absolute path.)
 func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 	if err := rc.Validate(); err != nil {
 		return nil, err
@@ -143,8 +198,8 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 	}
 
 	// sing-box 1.13 removed the legacy inbound `sniff` option outright, so
-	// vender never emits it; inbound sniffing is expressed as a route action
-	// (`{"action":"sniff"}`) once M2 needs it.
+	// vender never emits it; sniffing is a route action ({action: sniff}),
+	// emitted below in rule mode.
 
 	direct := plainOutbound{Type: "direct", Tag: tagDirect}
 	block := plainOutbound{Type: "block", Tag: tagBlock}
@@ -163,11 +218,47 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 		final = tagProxy
 	}
 
-	rules, err := buildRules()
-	if err != nil {
-		return nil, err
+	// Rule mode is the only mode that ships the built-in policy; global means
+	// what it says (everything through the proxy), so emitting CN-direct rules
+	// there would silently break the mode's contract.
+	switch rc.Config.Proxy.Mode {
+	case config.ModeRule:
+		dns, err := buildDNS(rules.BuiltinDNS())
+		if err != nil {
+			return nil, err
+		}
+		cfg.DNS = dns
+
+		sets, err := buildRuleSets(rc.RunDir, rules.ReferencedRuleSets())
+		if err != nil {
+			return nil, err
+		}
+		routeRules, err := buildRules()
+		if err != nil {
+			return nil, err
+		}
+		cfg.Route = singboxRoute{
+			RuleSet: sets,
+			// Destination names are resolved with the domestic resolver: it is
+			// the one that can answer for the names a direct outbound dials,
+			// and a proxied outbound never resolves locally at all (it passes
+			// the name to the server), so this cannot leak a proxied lookup.
+			DefaultDomainResolver: &singboxDomainResolver{Server: rules.DNSCN},
+			Rules:                 routeRules,
+			Final:                 final,
+		}
+
+	case config.ModeGlobal:
+		dns, err := buildDNS(rules.GlobalDNS())
+		if err != nil {
+			return nil, err
+		}
+		cfg.DNS = dns
+		cfg.Route = singboxRoute{Rules: []singboxRule{}, Final: final}
+
+	default: // config.ModeDirect
+		cfg.Route = singboxRoute{Rules: []singboxRule{}, Final: final}
 	}
-	cfg.Route = singboxRoute{Final: final, Rules: rules}
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -268,18 +359,68 @@ func utls(fingerprint string) *utlsConfig {
 	return &utlsConfig{Enabled: true, Fingerprint: fingerprint}
 }
 
-// buildRules converts vender's built-in rule set into sing-box route rules.
+// buildRuleSets declares the embedded rule sets sing-box may match against, in
+// the order the caller lists them. Paths are absolute and inside the run dir,
+// where core.WriteConfig has extracted the embedded .srs files.
+func buildRuleSets(runDir string, tags []string) ([]singboxRuleSet, error) {
+	sets := make([]singboxRuleSet, 0, len(tags))
+	for _, tag := range tags {
+		path, err := rules.RuleSetPath(runDir, tag)
+		if err != nil {
+			return nil, err
+		}
+		sets = append(sets, singboxRuleSet{
+			Type:   "local",
+			Tag:    tag,
+			Format: "binary",
+			Path:   path,
+		})
+	}
+	return sets, nil
+}
+
+// buildDNS converts vender's DNS policy into sing-box's `dns` section.
+func buildDNS(policy rules.DNS) (*singboxDNS, error) {
+	out := &singboxDNS{
+		Servers:  make([]singboxDNSServer, 0, len(policy.Servers)),
+		Final:    policy.Final,
+		Strategy: policy.Strategy,
+	}
+	for _, s := range policy.Servers {
+		if s.Tag == "" || s.Server == "" {
+			return nil, fmt.Errorf("core: DNS server %q is incomplete", s.Tag)
+		}
+		out.Servers = append(out.Servers, singboxDNSServer{
+			Tag:    s.Tag,
+			Type:   s.Type,
+			Server: s.Server,
+			Detour: s.Detour,
+		})
+	}
+	for _, r := range policy.Rules {
+		if len(r.RuleSets) == 0 {
+			return nil, fmt.Errorf("core: DNS rule %q matches no rule set", r.Name)
+		}
+		out.Rules = append(out.Rules, singboxDNSRule{RuleSet: r.RuleSets, Server: r.Server})
+	}
+	return out, nil
+}
+
+// buildRules converts the built-in policy into sing-box route rules: first the
+// actions (sniff, hijack-dns), then the destination rules in evaluation order.
 //
-// M1's rules.BuiltinRules() returns nil, meaning "no routing rules": every
-// connection follows route.final. M2 fills in the rule sets and this function
-// starts producing route rules without any change to the engine.
-//
-// DNS-only rules are skipped on purpose: sing-box expresses those as route
-// *actions* (sniff / hijack-dns) plus `dns` rules, not as ordinary destination
-// matches, so rendering them here would silently misroute DNS. M2 owns that
-// mapping.
+// DNS-only rules are still skipped: sing-box expresses DNS policy as the
+// `dns` section plus the hijack-dns action, not as destination matches, so a
+// DNSOnly rule here would silently misroute DNS. BuiltinRules returns none.
 func buildRules() ([]singboxRule, error) {
 	out := make([]singboxRule, 0)
+	for _, a := range rules.BuiltinActions() {
+		rule := singboxRule{Action: string(a.Kind)}
+		if a.Protocol != "" {
+			rule.Protocol = []string{a.Protocol}
+		}
+		out = append(out, rule)
+	}
 	for _, r := range rules.BuiltinRules() {
 		if err := r.Validate(); err != nil {
 			return nil, err
@@ -292,10 +433,12 @@ func buildRules() ([]singboxRule, error) {
 			return nil, err
 		}
 		out = append(out, singboxRule{
+			RuleSet:       r.RuleSets,
 			Domain:        r.Domains,
 			DomainSuffix:  r.DomainSuffixes,
 			DomainKeyword: r.DomainKeywords,
 			IPCIDR:        r.IPCIDRs,
+			IPIsPrivate:   r.IPIsPrivate,
 			Port:          r.Ports,
 			ProcessName:   r.ProcessNames,
 			Outbound:      tag,

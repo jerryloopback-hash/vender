@@ -3,6 +3,18 @@
     "level": "info",
     "timestamp": true
   },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-remote",
+        "type": "https",
+        "server": "1.1.1.1",
+        "detour": "proxy"
+      }
+    ],
+    "final": "dns-remote",
+    "strategy": "prefer_ipv4"
+  },
   "inbounds": [
     {
       "type": "mixed",
@@ -41,7 +53,7 @@
     }
   ],
   "route": {
-    "final": "proxy",
-    "rules": []
+    "rules": [],
+    "final": "proxy"
   }
 }

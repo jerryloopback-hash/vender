@@ -22,7 +22,7 @@
     }
   ],
   "route": {
-    "final": "direct",
-    "rules": []
+    "rules": [],
+    "final": "direct"
   }
 }

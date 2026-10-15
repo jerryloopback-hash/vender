@@ -67,7 +67,7 @@ Two directories, deliberately:
 | Directory | Contents | Lifetime |
 |---|---|---|
 | `os.UserConfigDir()/vender` | `config.yaml`, `servers.yaml` | the user's; editable, backable-up, never overwritten by vender except through `import`/`servers`/`select` |
-| `os.UserCacheDir()/vender` | `singbox.json`, `vender.lock`, `vender.pid` | the daemon's; disposable, regenerated on every start |
+| `os.UserCacheDir()/vender` | `singbox.json`, `rules/*.srs`, `vender.lock`, `vender.pid` | the daemon's; disposable, regenerated on every start |
 
 `--config-dir` and `--run-dir` override both, which is what keeps the test
 suite from touching a real installation.
@@ -75,14 +75,14 @@ suite from touching a real installation.
 ## 3. Packages
 
 ```
-cmd/vender/            CLI (cobra): version, import, servers, daemon, status, proxy
+cmd/vender/            CLI (cobra): version, import, servers, rules, daemon, status, proxy
 internal/config/       config.yaml + servers.yaml + share-link parsing  [M0]
 internal/core/         engine contract + sing-box rendering + supervision [M1]
-internal/rules/        built-in routing rules -> sing-box route rules    [M2]
+internal/rules/        built-in routing policy + embedded rule sets       [M2]
 internal/tui/          Bubble Tea TUI (daemon client)                    [M3]
 internal/autostart/    start-at-login registration                       [M4]
 docs/                  this document
-scripts/               build + fetch helpers
+scripts/               build + fetch helpers (fetch-rules.sh, fetch-sing-box.sh)
 ```
 
 Dependency direction is strictly downward:
@@ -91,9 +91,10 @@ Dependency direction is strictly downward:
 cmd/vender     ->  internal/core
                ->  internal/tui (M3)
                ->  internal/config
+               ->  internal/rules
 internal/core  ->  internal/config
-               ->  internal/rules (nil in M1; the rule sets arrive in M2)
-internal/rules ->  (pure data; consumed by core)
+               ->  internal/rules
+internal/rules ->  (pure data + embedded assets; imports nothing of vender's)
 internal/tui   ->  internal/config (+ a daemon control client, M3)
 internal/autostart -> (standalone)
 ```
@@ -258,6 +259,7 @@ without touching the user's real configuration.
 | `vender import <share-link>` | implemented (M0) (`--name`, `--force`) |
 | `vender servers list` | implemented (M0) (`--links`) |
 | `vender servers rm <name>` | implemented (M0) |
+| `vender rules list` | implemented (M2) — the ordered policy, DNS split and embedded sets |
 | `vender daemon` | implemented (M1) — foreground, one per run dir |
 | `vender status` | implemented (M1) — exit code means "usable" |
 | `vender proxy on\|off` | implemented (M1) Linux/GNOME; Windows is M4 |
@@ -322,8 +324,8 @@ machine.
 ### 6.2 Rendering (`render.go`)
 
 `BuildConfig` is pure and deterministic, which is what makes the golden tests
-possible. It emits four top-level sections — `log`, `inbounds`, `outbounds`,
-`route` — and nothing else:
+possible. It emits up to five top-level sections — `log`, `dns`, `inbounds`,
+`outbounds`, `route` — and nothing else:
 
 - one `mixed` inbound tagged `mixed-in`, with `listen` / `listen_port` split
   from `proxy.listen`;
@@ -331,18 +333,34 @@ possible. It emits four top-level sections — `log`, `inbounds`, `outbounds`,
   `hysteria2` with `password` + `obfs` + `tls`), always tagged `proxy`;
 - a `direct` outbound and a `block` outbound, always present so that rules
   written against `rules.OutDirect` / `rules.OutBlock` always have a target;
-- `route.final` = `proxy` for `rule`/`global` and `direct` for `direct`, with
-  `route.rules` fed from `internal/rules.BuiltinRules()`;
+- `route.final` = `proxy` for `rule`/`global` and `direct` for `direct`;
+- in **rule** mode, `route.rule_set` (one `local`/`binary` entry per embedded
+  set, with an **absolute** path inside the run dir), then `route.rules`: the
+  actions (`sniff`, `hijack-dns`) first, followed by the destination rules from
+  `internal/rules.BuiltinRules()`, plus `route.default_domain_resolver` and the
+  `dns` section from `internal/rules.BuiltinDNS()`;
+- in **global** mode, a `dns` section with a single proxied resolver and **no**
+  routing rules — `global` must stay global, so emitting the CN-direct rules
+  there would silently turn it into `rule`;
+- in **direct** mode, neither: there is no proxy to resolve through, so
+  sing-box's own default (the system resolver) is right;
 - `engine.bind_interface`, when set, is passed through to the outbound, which
   pins the connection to the proxy server to a specific interface on a
   multi-homed (or TUN-hijacked) host.
 
-Two decisions are worth recording because the pinned engine forced them:
+Three decisions are worth recording because the pinned engine forced them:
 
-- **No `sniff`.** sing-box 1.13 *removed* the legacy inbound options, so
+- **No legacy `sniff`.** sing-box 1.13 *removed* the legacy inbound options, so
   emitting `"sniff": true` makes the pinned version refuse the config outright.
-  Inbound sniffing is a route action (`{"action": "sniff"}`) in the current
-  schema, and M2 adds it together with the rules that need it.
+  Inbound sniffing is the route action `{"action": "sniff"}`, and M2 renders it
+  (followed by `{"protocol": ["dns"], "action": "hijack-dns"}`) as the first two
+  route entries.
+- **No detour on the domestic resolver.** sing-box 1.14 refuses a DNS server
+  whose `detour` is the empty `direct` outbound vender emits ("detour to an
+  empty direct outbound makes no sense"). The domestic resolver therefore has no
+  `detour` at all — absence already means direct — while the foreign resolver
+  names the `proxy` outbound explicitly. This was found by running the config,
+  not by reading the schema.
 - **Direct mode emits no proxy outbound at all.** A `mode: direct` run does not
   reference the selected server, so an unusable server entry cannot break the
   one mode whose whole point is to work without a proxy.
@@ -390,33 +408,132 @@ path lands with M4, and the command says so instead of pretending.
 
 ## 7. Routing rules (`internal/rules`) — implemented in M2
 
-M0 defines the data model and the entry point:
+`internal/rules` owns the default policy, the DNS policy and the compiled rule
+sets those policies match against. Nothing about sing-box leaks upward: the
+package speaks in vender's own terms and `core/render.go` is the only place that
+knows the JSON schema.
 
 ```go
-// BuiltinRules returns vender's default rule set, in evaluation order.
-func BuiltinRules() []Rule
+func BuiltinRules() []Rule       // destination rules, in evaluation order
+func BuiltinActions() []Action   // sniff, hijack-dns
+func BuiltinDNS() DNS            // split DNS for rule mode
+func GlobalDNS() DNS             // proxied-only DNS for global mode
+
+func RuleSets() []RuleSet                      // the embedded sets, pinned table
+func ReferencedRuleSets() []string             // the tags the policy needs
+func WriteRuleSets(dir string) (int, error)    // extract embedded .srs to disk
+func RuleSetPath(runDir, tag string) (string, error)
 ```
 
-`Rule` expresses routing in vender's own terms (`Domains`, `DomainSuffixes`,
-`DomainKeywords`, `IPCIDRs`, `Ports`, `ProcessNames`, `Outbound`), so the rule
-model never leaks sing-box's JSON schema into the rest of the codebase. M2
-converts rules to sing-box `route.rules`, and adds the built-in sets: private
-IPs direct, LAN direct, China direct, ads blocked. `BuiltinRules` returns `nil`
-until then, which callers must read as "no routing rules configured" (route
-everything through the proxy), not as "match nothing".
+`Rule` expresses routing in vender's own terms (`RuleSets`, `Domains`,
+`DomainSuffixes`, `DomainKeywords`, `IPCIDRs`, `IPIsPrivate`, `Ports`,
+`ProcessNames`, `Outbound`), and `Rule.Validate` additionally rejects a rule that
+names a rule set vender does not embed — a typo fails the build's tests rather
+than a user's connection.
 
-M1 already ships the converter in `core.render.go` (`buildRules`,
-`outboundTag`) and always emits the `direct` and `block` outbounds it targets,
-so M2 is a change to `internal/rules` alone. Two things M2 must handle:
+### 7.1 The policy
 
-- rules whose `DNSOnly` flag is set are **skipped** by the converter, because
-  sing-box expresses DNS policy as route *actions* (`{"action":"sniff"}`,
-  `{"action":"hijack-dns"}`) plus `dns` rules rather than as destination
-  matches;
-- `Ports` maps to a single `port` array; `port_range` is not produced.
+Order is the policy, because the first matching rule wins:
 
-**M2 work:** fill `BuiltinRules`, add the matching route actions, and verify
-`proxy.mode: rule` against the pinned engine with `sing-box check`.
+| # | Rule | Matches | Goes to |
+|---|---|---|---|
+| 1 | `private-dest-direct` | `ip_is_private` | `direct` |
+| 2 | `ads-block` | `geosite-category-ads-all` | `block` |
+| 3 | `service-overrides-proxy` | steam, onedrive, microsoft, google, youtube, telegram, netflix, openai, bahamut | `proxy` |
+| 4 | `cn-direct` | `geosite-cn`, `geoip-cn` | `direct` |
+| — | `route.final` | everything else | `proxy` |
+
+The reference config this is derived from carried ~9500 rules (9018
+`DOMAIN-SUFFIX`); aggregating them into categories is the whole point — a
+category list can be updated by moving one pinned commit, a hand-maintained list
+of 9000 domains cannot.
+
+The overrides sit *before* the China rule on purpose: several of those services
+have China-facing entries in `geosite-cn`, and if the China rule ran first a
+Steam store page or a Microsoft sign-in would be dialled directly and fail.
+`private-dest-direct` matches the **destination** only: the mixed inbound only
+ever accepts connections from localhost, so matching the source would match
+everything and send all traffic direct.
+
+### 7.2 Actions
+
+Sniffing and DNS hijacking are route *actions* in sing-box 1.13+, and they are
+emitted as the first two route entries, in this order:
+
+```json
+{ "action": "sniff" },
+{ "protocol": ["dns"], "action": "hijack-dns" }
+```
+
+Sniffing first, because a connection that arrives as a bare IP is just an IP
+until the engine looks at its first bytes; without it no domain rule could ever
+match. `hijack-dns` then hands a DNS connection to the engine's DNS module
+instead of routing it as plain traffic, so an application that resolves names
+"through" the proxy still gets the split policy below.
+
+### 7.3 Split DNS
+
+Names are resolved on the same side of the world they will be dialled from —
+resolving a Chinese CDN's name through a foreign resolver (or the reverse) is how
+"smart routing" produces stale or plainly wrong addresses:
+
+| Queries for | Resolver | Reached |
+|---|---|---|
+| `geosite-cn` | `dns-cn` (`223.5.5.5`, UDP) | directly |
+| everything else | `dns-remote` (Cloudflare DoH) | through `proxy` |
+
+`final: dns-remote`, `strategy: prefer_ipv4`. Two sing-box details were
+established by running the engine, not by reading the schema: the domestic
+resolver must **not** name a `detour` (1.14 rejects a detour to the empty
+`direct` outbound), and the DNS rule sets are looked up in the same
+`route.rule_set` list as the routing rules, so `ReferencedRuleSets()` feeds both.
+
+`route.default_domain_resolver` points at `dns-cn`. It is used when a rule needs
+a destination's address (`ip_is_private`, `geoip-cn`) or when a `direct`
+outbound dials a name; a proxied outbound never resolves locally at all — it
+hands the name to the server — so a proxied lookup can never leak here. That was
+verified against a live run: foreign destinations reach the proxy with no local
+resolution at all.
+
+### 7.4 Embedded rule sets ("全部内置")
+
+`internal/rules/assets/*.srs` holds the compiled sing-box rule sets (binary
+"SRS"), embedded with `go:embed`. sing-box's `route.rule_set` can only read
+files, so `core.WriteConfig` materialises them into `<run dir>/rules/` before
+writing the config that points at them, and skips files whose content already
+matches. The generated paths are **absolute**, otherwise
+`sing-box check -c <run dir>/singbox.json` would only work from the run dir.
+
+| | |
+|---|---|
+| Source | `MetaCubeX/meta-rules-dat`, branch `sing` (`geo/geosite/*.srs`, `geo/geoip/*.srs`) |
+| Pin | commit `d1c433471f5b` (2026-10-15) — a commit, never a branch or `latest` |
+| Integrity | per-file SHA-256, checked by `scripts/fetch-rules.sh` on download and by `--check`, and re-checked against the embedded bytes by `internal/rules`' tests |
+| Size | 12 sets, **506,214 B (494.3 KiB)** |
+| Committed? | yes. `go build ./...` therefore works from a clean clone with no extra step, `go test` can verify the assets, and changes to binary data are reviewable as a diff. The alternative (generating an embedded `.go` at fetch time) would have made a clean clone and CI depend on a network fetch. |
+
+`scripts/fetch-rules.sh` re-fetches or verifies them (`--list`, `--check`,
+`--print-size`). A test parses the script and asserts its pinned table matches
+`RuleSets()`, so the two cannot drift. The hand-maintained list of *which*
+categories the policy uses is the only thing a human edits.
+
+`vender rules list` prints the actions, the ordered rules, the DNS split and the
+embedded sets with their provenance and sizes.
+
+### 7.5 Deliberate simplifications
+
+- **One outbound.** A single `proxy` outbound; no proxy groups and no per-rule
+  node selection yet.
+- **No per-user rules file.** Adding or overriding entries would slot in exactly
+  where `BuiltinRules()` returns its slice; ordering, conversion and the CLI
+  listing all work off that slice already, so the seam is the function, not a
+  new code path.
+- **No `mode: global` rules.** `global` emits no routing rules at all, and
+  `direct` emits no proxy outbound and no `dns` section.
+- **Category granularity.** `geosite-microsoft` covers GitHub too, so GitHub is
+  proxied; that is the upstream list's composition, and it is the behaviour most
+  users want from a China-facing client anyway. `geosite-cn` is one category
+  rather than a hand-tuned set of exceptions.
 
 ## 8. TUI (`internal/tui`) — implemented in M3
 
@@ -468,7 +585,7 @@ installed. All entry points return `ErrNotImplemented` until M4.
 |---|---|---|
 | **M0** | Skeleton, `internal/config` (config, servers, share links), CLI (`version`, `import`, `servers`), docs, unit tests, cross-compilation | `go build ./...`, `GOOS=windows go build ./...`, `go test ./...`, `go vet ./...` all clean; stubs print their milestone |
 | **M1** | `internal/core` engine + `vender daemon`, `status`, `proxy on\|off` | With a real server: daemon starts sing-box, `127.0.0.1:7897` proxies HTTP and SOCKS5; stopping the daemon frees the port; `status` reflects reality |
-| **M2** | `internal/rules` built-in rule sets wired into the generated config | `proxy.mode: rule` sends CN/private destinations direct and everything else through the proxy; `global` and `direct` behave as documented |
+| **M2** | `internal/rules` built-in policy, actions, split DNS and embedded rule sets, wired into the generated config; `vender rules list` | `proxy.mode: rule` sends CN/private destinations direct, blocks ads, proxies a documented override list and everything else, with matching split DNS; `sing-box check` passes for both server types and a live run shows direct vs proxied vs blocked; `global` and `direct` behave as documented |
 | **M3** | `internal/tui` Bubble Tea client | TUI attaches to a running daemon, switches the active server and mode, tails engine logs, quits cleanly; behaves with no daemon |
 | **M4** | `internal/autostart` | `autostart on` starts the daemon after login on both platforms; `off` removes it; `status` reports it; all idempotent |
 | **M5** | Subscription URLs and bulk import, server latency testing | Importing a subscription adds all of its servers; a latency command reports a reachability ranking |
@@ -501,6 +618,14 @@ installed. All entry points return `ErrNotImplemented` until M4.
   release, restart, a child that dies, a port that never opens, an occupied
   port) is covered without sing-box or a network. Rendering is covered by golden
   files under `internal/core/testdata/`, refreshable with
-  `go test ./internal/core -update`.
+  `go test ./internal/core -update`. The built-in policy is covered by its own
+  tests: rule order (the order *is* the policy), that every referenced rule set
+  is embedded, that the embedded bytes still hash to the pinned checksums, and
+  that `scripts/fetch-rules.sh` and `internal/rules` pin the same table.
+- **Committed binary assets.** The embedded `.srs` rule sets are the only
+  binary data in the repository. They are committed rather than generated at
+  fetch time so a clean clone builds, tests and runs offline; their provenance
+  and checksums are pinned in both `scripts/fetch-rules.sh` and
+  `internal/rules/assets.go`, and a test asserts the two agree.
 
 [cobra]: https://github.com/spf13/cobra

@@ -193,25 +193,44 @@ func (f *fakeEngine) Stop() error                        { return nil }
 func (f *fakeEngine) Logs() <-chan string                { return make(chan string) }
 func (f *fakeEngine) Healthy() bool                      { return true }
 
-// The generated config must stay within the four top-level sections vender
-// knows how to produce; anything else means a renderer change slipped through.
+// The generated config must stay within the top-level sections vender knows
+// how to produce; anything else means a renderer change slipped through.
 func TestBuildConfigTopLevelKeys(t *testing.T) {
-	data, err := BuildConfig(RuntimeConfig{Config: *config.Default(), Server: testVLESS(), RunDir: "/tmp"})
+	ruleMode, err := BuildConfig(RuntimeConfig{Config: *config.Default(), Server: testVLESS(), RunDir: "/tmp"})
 	if err != nil {
 		t.Fatalf("BuildConfig: %v", err)
 	}
 	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
+	if err := json.Unmarshal(ruleMode, &raw); err != nil {
 		t.Fatalf("generated config is not JSON: %v", err)
 	}
-	want := []string{"log", "inbounds", "outbounds", "route"}
+	want := []string{"log", "dns", "inbounds", "outbounds", "route"}
 	for _, k := range want {
 		if _, ok := raw[k]; !ok {
-			t.Errorf("generated config has no %q key", k)
+			t.Errorf("rule-mode config has no %q key", k)
 		}
 	}
 	if len(raw) != len(want) {
-		t.Errorf("generated config has %d top-level keys, want %d", len(raw), len(want))
+		t.Errorf("rule-mode config has %d top-level keys, want %d", len(raw), len(want))
+	}
+
+	// Direct mode has no proxy to resolve DNS through, so it emits no `dns`
+	// section at all and lets sing-box use the system resolver.
+	directCfg := *config.Default()
+	directCfg.Proxy.Mode = config.ModeDirect
+	directData, err := BuildConfig(RuntimeConfig{Config: directCfg, RunDir: "/tmp"})
+	if err != nil {
+		t.Fatalf("BuildConfig(direct): %v", err)
+	}
+	raw = nil
+	if err := json.Unmarshal(directData, &raw); err != nil {
+		t.Fatalf("direct config is not JSON: %v", err)
+	}
+	if _, ok := raw["dns"]; ok {
+		t.Error("direct mode emitted a dns section")
+	}
+	if len(raw) != 4 {
+		t.Errorf("direct-mode config has %d top-level keys, want 4", len(raw))
 	}
 }
 
@@ -228,16 +247,50 @@ func TestSplitListenRejectsGarbage(t *testing.T) {
 	}
 }
 
-func TestBuildRulesIsEmptyInM1(t *testing.T) {
-	if got := rules.BuiltinRules(); got != nil {
-		t.Fatalf("BuiltinRules() = %v, want nil in M1", got)
-	}
-	r, err := buildRules()
+// buildRules must emit the actions before any destination rule: sniffing is
+// what turns an IP-addressed connection back into a domain, and hijack-dns
+// only fires on a protocol sniffing has already identified.
+func TestBuildRulesActionsComeFirst(t *testing.T) {
+	got, err := buildRules()
 	if err != nil {
 		t.Fatalf("buildRules: %v", err)
 	}
-	if len(r) != 0 {
-		t.Errorf("buildRules() = %v, want no rules until M2", r)
+	if len(got) < 3 {
+		t.Fatalf("buildRules() = %+v, want actions plus destination rules", got)
+	}
+	if got[0].Action != string(rules.ActionSniff) {
+		t.Errorf("first entry = %+v, want the sniff action", got[0])
+	}
+	if got[1].Action != string(rules.ActionHijackDNS) || len(got[1].Protocol) != 1 || got[1].Protocol[0] != "dns" {
+		t.Errorf("second entry = %+v, want hijack-dns for the sniffed dns protocol", got[1])
+	}
+	// The destination rules follow, in the order the policy declares them, and
+	// every one of them names an outbound.
+	wantOrder := make([]string, 0, len(got)-2)
+	for _, r := range rules.BuiltinRules() {
+		if r.DNSOnly {
+			continue
+		}
+		tag, err := outboundTag(r.Outbound)
+		if err != nil {
+			t.Fatalf("outboundTag(%q): %v", r.Outbound, err)
+		}
+		wantOrder = append(wantOrder, tag)
+	}
+	if len(got)-2 != len(wantOrder) {
+		t.Fatalf("buildRules() has %d destination rules, want %d", len(got)-2, len(wantOrder))
+	}
+	for i, want := range wantOrder {
+		if got[i+2].Outbound != want {
+			t.Errorf("destination rule %d routes to %q, want %q", i, got[i+2].Outbound, want)
+		}
+		if got[i+2].Action != "" {
+			t.Errorf("destination rule %d carries action %q and an outbound", i, got[i+2].Action)
+		}
+	}
+	// The private-destination rule must be the first destination rule.
+	if !got[2].IPIsPrivate || got[2].Outbound != tagDirect {
+		t.Errorf("first destination rule = %+v, want ip_is_private -> direct", got[2])
 	}
 }
 

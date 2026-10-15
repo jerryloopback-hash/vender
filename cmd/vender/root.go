@@ -102,6 +102,7 @@ in the platform cache directory instead:
 		a.newVersionCmd(),
 		a.newImportCmd(),
 		a.newServersCmd(),
+		a.newRulesCmd(),
 		a.newDaemonCmd(),
 		a.newStatusCmd(),
 		a.newProxyCmd(),

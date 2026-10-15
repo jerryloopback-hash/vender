@@ -11,6 +11,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ll-lite/vender/internal/config"
+	"github.com/ll-lite/vender/internal/rules"
 )
 
 // Defaults for the supervision knobs. They are fields on engine (not package
@@ -68,6 +71,11 @@ func newEngine(rc RuntimeConfig) *engine {
 
 // WriteConfig renders rc into <RunDir>/singbox.json atomically and records it
 // as the configuration the next Start will run.
+//
+// In rule mode it also materialises the embedded rule sets under
+// <RunDir>/rules, because sing-box's route.rule_set only reads files. The
+// files are written before the config that points at them, so a failed
+// extraction never leaves a config referring to missing rule sets.
 func (e *engine) WriteConfig(rc RuntimeConfig) error {
 	if err := rc.Validate(); err != nil {
 		return err
@@ -78,6 +86,12 @@ func (e *engine) WriteConfig(rc RuntimeConfig) error {
 	}
 	if err := os.MkdirAll(rc.RunDir, 0o700); err != nil {
 		return fmt.Errorf("core: create run dir %s: %w", rc.RunDir, err)
+	}
+	if rc.Config.Proxy.Mode == config.ModeRule {
+		dir := filepath.Join(rc.RunDir, rules.RulesSubdir)
+		if _, err := rules.WriteRuleSets(dir); err != nil {
+			return fmt.Errorf("core: extract built-in rule sets: %w", err)
+		}
 	}
 	// The generated config carries the server's credentials (uuid, password),
 	// so it is written 0600 like servers.yaml.

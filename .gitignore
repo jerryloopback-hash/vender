@@ -26,3 +26,8 @@ servers.local.yaml
 
 # Secrets must never be committed. servers.yaml holds credentials.
 servers.yaml
+
+# A killed scripts/fetch-rules.sh could leave a partial download behind; the
+# script cleans up after itself, this is a belt-and-braces guard so a partial
+# .srs can never be committed or embedded.
+internal/rules/assets/*.tmp.*

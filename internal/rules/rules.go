@@ -1,11 +1,14 @@
-// Package rules will supply vender's built-in routing rules and translate them
-// into sing-box route rules (M2).
+// Package rules supplies vender's built-in routing rules — the default
+// "smart routing" policy — and the compiled rule sets they match against.
 //
-// M0 ships the data model and the BuiltinRules entry point only: the rule sets
-// themselves (CN direct, ad blocking, private IP direct, ...) land in M2
-// together with the "rule" proxy mode. Keeping the types here, next to the
-// contract, lets M1 render an empty route section and M2 fill it without
-// touching the engine.
+// The policy is deliberately tiny. The reference configuration this is derived
+// from carries ~9500 individual rules (9018 of them DOMAIN-SUFFIX); vender
+// aggregates the same intent into a handful of geosite/geoip categories that
+// ship inside the binary, so the default behaves like the hand-written list
+// without carrying (or rotting with) thousands of domains.
+//
+// Order is the whole policy: the first matching rule wins, and it is the only
+// reason the service overrides sit where they do.
 package rules
 
 import "fmt"
@@ -22,13 +25,16 @@ const (
 	OutBlock Outbound = "block"
 )
 
-// Rule is one routing rule, expressed in vender's own terms. M1/M2 convert it
-// to sing-box's route rule JSON (domain_suffix, ip_cidr, port, process_name...).
+// Rule is one routing rule, expressed in vender's own terms. core converts it
+// to sing-box's route rule JSON (rule_set, domain_suffix, ip_cidr, port, ...).
 type Rule struct {
-	// Name is a human-readable identifier, e.g. "private-ips".
+	// Name is a human-readable identifier, e.g. "cn-direct".
 	Name string
 	// Outbound is where matches are sent.
 	Outbound Outbound
+	// RuleSets matches destinations covered by the named built-in rule sets
+	// (see RuleSets()). Tags are validated by Validate.
+	RuleSets []string
 	// Domains matches exact domain names.
 	Domains []string
 	// DomainSuffixes matches suffixes, e.g. "cn" matches "example.cn".
@@ -37,6 +43,11 @@ type Rule struct {
 	DomainKeywords []string
 	// IPCIDRs matches destination IP ranges.
 	IPCIDRs []string
+	// IPIsPrivate matches destinations whose IP is private (RFC1918),
+	// loopback or link-local. It is a single flag rather than a CIDR list
+	// because sing-box has a dedicated `ip_is_private` matcher, and spelling
+	// the ranges out by hand is how such lists go stale.
+	IPIsPrivate bool
 	// Ports matches destination ports.
 	Ports []int
 	// ProcessNames matches the local process name (Linux) / executable (Windows).
@@ -45,7 +56,8 @@ type Rule struct {
 	DNSOnly bool
 }
 
-// Validate checks that a rule actually says something.
+// Validate checks that a rule says something vender can render and that every
+// rule set it references is actually embedded.
 func (r Rule) Validate() error {
 	if r.Name == "" {
 		return fmt.Errorf("rules: rule name must not be empty")
@@ -55,7 +67,13 @@ func (r Rule) Validate() error {
 	default:
 		return fmt.Errorf("rules: rule %q has unknown outbound %q", r.Name, r.Outbound)
 	}
-	if len(r.Domains)+len(r.DomainSuffixes)+len(r.DomainKeywords)+len(r.IPCIDRs)+len(r.Ports)+len(r.ProcessNames) == 0 {
+	for _, tag := range r.RuleSets {
+		if _, ok := LookupRuleSet(tag); !ok {
+			return fmt.Errorf("rules: rule %q references unknown rule set %q", r.Name, tag)
+		}
+	}
+	if len(r.RuleSets)+len(r.Domains)+len(r.DomainSuffixes)+len(r.DomainKeywords)+
+		len(r.IPCIDRs)+len(r.Ports)+len(r.ProcessNames) == 0 && !r.IPIsPrivate {
 		return fmt.Errorf("rules: rule %q matches nothing", r.Name)
 	}
 	return nil
@@ -63,9 +81,99 @@ func (r Rule) Validate() error {
 
 // BuiltinRules returns vender's default rule set, in evaluation order.
 //
-// M2 implements this. M0 returns nil so that `proxy.mode: rule` behaves like
-// "proxy everything" until the rule sets exist; callers must treat a nil result
-// as "no routing rules configured" rather than as "match nothing".
+// A nil/empty result means "no routing rules configured" (route everything
+// through the proxy), not "match nothing".
 func BuiltinRules() []Rule {
-	return nil
+	return []Rule{
+		// 1. Never sweep private traffic through a remote server: RFC1918,
+		// loopback and link-local destinations are the local network, and a
+		// NAS, a printer or a router admin page must keep working.
+		//
+		// Only the destination is inspected. Matching the *source* would be
+		// meaningless here and actively harmful: the mixed SOCKS5/HTTP inbound
+		// only ever accepts connections from localhost, so `source_ip_is_private`
+		// would match every single connection and send everything direct.
+		{
+			Name:        "private-dest-direct",
+			Outbound:    OutDirect,
+			IPIsPrivate: true,
+		},
+
+		// 2. Ads, trackers and telemetry are rejected outright rather than
+		// proxied, which is what the 1596 "拦截广告" rules were for.
+		{
+			Name:     "ads-block",
+			Outbound: OutBlock,
+			RuleSets: []string{"geosite-category-ads-all"},
+		},
+
+		// 3. Service overrides. These must come *before* the China rule,
+		// because several of them (Steam, Microsoft, Google) have China-facing
+		// entries in geosite-cn that would otherwise claim them and send a
+		// store page or a CDN handshake direct. Everything here is a service
+		// that only works properly from outside the mainland.
+		//
+		// Keep this list short and justified; adding a category here costs a
+		// proxy hop for every connection it contains.
+		{
+			Name:     "service-overrides-proxy",
+			Outbound: OutProxy,
+			RuleSets: []string{
+				"geosite-steam",     // store / community (download CDNs stay in geosite-cn)
+				"geosite-onedrive",  // sync endpoints are throttled from CN
+				"geosite-microsoft", // non-CN Microsoft services (also covers GitHub)
+				"geosite-google",
+				"geosite-youtube",
+				"geosite-telegram",
+				"geosite-netflix",
+				"geosite-openai",
+				"geosite-bahamut", // 動畫瘋 / gamer.com.tw, region-locked
+			},
+		},
+
+		// 4. Everything recognizably Chinese goes out directly: the geosite
+		// list by domain, geoip-cn by address so bare-IP traffic is covered
+		// even when nothing can be sniffed (a plain TCP stream, say).
+		{
+			Name:     "cn-direct",
+			Outbound: OutDirect,
+			RuleSets: []string{"geosite-cn", "geoip-cn"},
+		},
+
+		// 5. route.final (see core.render) sends the rest through the proxy.
+	}
+}
+
+// ActionKind names a sing-box route action. Actions change what the engine
+// does with a connection instead of choosing an outbound for it, and they are
+// emitted before any destination rule.
+type ActionKind string
+
+const (
+	// ActionSniff asks the engine to inspect the first bytes of a connection
+	// to recover the real protocol and domain name. Without it, a connection
+	// addressed to an IP is just an IP and no domain rule can match it.
+	ActionSniff ActionKind = "sniff"
+	// ActionHijackDNS hands a DNS connection to the engine's DNS module
+	// instead of routing it as plain traffic, so the split DNS policy below
+	// applies even to applications that send their queries "through" the
+	// proxy as UDP.
+	ActionHijackDNS ActionKind = "hijack-dns"
+)
+
+// Action is a route action rule.
+type Action struct {
+	// Kind is the action to take.
+	Kind ActionKind
+	// Protocol optionally restricts the action to a sniffed protocol, e.g.
+	// "dns" for hijack-dns.
+	Protocol string
+}
+
+// BuiltinActions returns the actions that must precede the destination rules.
+func BuiltinActions() []Action {
+	return []Action{
+		{Kind: ActionSniff},
+		{Kind: ActionHijackDNS, Protocol: "dns"},
+	}
 }
