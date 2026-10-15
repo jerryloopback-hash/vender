@@ -25,22 +25,24 @@ and the interfaces that later milestones compile against today.
 ```
         +----------------------------+
         |        vender daemon       |   authoritative, headless
-        |  (M1)                      |
+        |  (M1, control channel M3)  |
         |  - loads config.yaml       |
         |  - loads servers.yaml      |
         |  - renders singbox.json    |
         |  - supervises sing-box     |
-        |  - run dir: lock + pid     |<----------+
+        |  - run dir: lock, pid,     |
+        |    control.json (M3)       |<----------+
         +-------------+--------------+           |
-                      | manages                   | attaches
+                      | manages                   | attaches (control channel)
                       v                           |
         +----------------------------+   +--------+---------+
         |        sing-box child      |   |   vender tui     |
         |  mixed inbound 127.0.0.1:  |   |     (M3)         |
         |  7897 -> selected outbound |   |  Bubble Tea UI   |
-        +----------------------------+   +------------------+
-                      ^                           ^
-                      | local apps                 | CLI commands
+        |  clash api 127.0.0.1:<auto>|   +------------------+
+        +----------------------------+            ^
+                      ^                           | CLI commands
+                      | local apps                |
         +----------------------------+   +--------+---------+
         |  browser / curl / ...      |   |  vender CLI      |
         +----------------------------+   | import, servers, |
@@ -58,16 +60,22 @@ shipped the CLI with a clean separation between *configuration* (files on disk)
 and *control* (a running daemon), and why M1 kept the daemon a plain foreground
 process: the control surface a client needs is the run directory — the lock
 says whether a daemon is up, and the generated config plus the listen address
-say what it is doing. M3 adds a real control socket for the operations that
-cannot be expressed as files (switching server, changing mode, tailing logs),
-at which point the clients stop reading files directly.
+say what it is doing.
+
+M3 adds a real control channel (§8) for the operations a file cannot express —
+switching server, changing mode, starting and stopping the engine, tailing
+engine output, streaming live traffic — and it is from that point on that
+clients stop reading the generated config directly. The one thing the TUI still
+reads itself is the *user's* configuration (`config.yaml`, `servers.yaml`) and
+the built-in policy, which is what lets the Nodes and Settings screens be
+useful with no daemon running at all.
 
 Two directories, deliberately:
 
 | Directory | Contents | Lifetime |
 |---|---|---|
 | `os.UserConfigDir()/vender` | `config.yaml`, `servers.yaml` | the user's; editable, backable-up, never overwritten by vender except through `import`/`servers`/`select` |
-| `os.UserCacheDir()/vender` | `singbox.json`, `rules/*.srs`, `vender.lock`, `vender.pid` | the daemon's; disposable, regenerated on every start |
+| `os.UserCacheDir()/vender` | `singbox.json`, `rules/*.srs`, `vender.lock`, `vender.pid`, `control.json` | the daemon's; disposable, regenerated on every start |
 
 `--config-dir` and `--run-dir` override both, which is what keeps the test
 suite from touching a real installation.
@@ -75,11 +83,14 @@ suite from touching a real installation.
 ## 3. Packages
 
 ```
-cmd/vender/            CLI (cobra): version, import, servers, rules, daemon, status, proxy
+cmd/vender/            CLI (cobra): version, import, servers, rules, daemon, status, proxy, tui
 internal/config/       config.yaml + servers.yaml + share-link parsing  [M0]
 internal/core/         engine contract + sing-box rendering + supervision [M1]
+                       + the Clash API client used for traffic and latency  [M3]
 internal/rules/        built-in routing policy + embedded rule sets       [M2]
-internal/tui/          Bubble Tea TUI (daemon client)                    [M3]
+internal/control/      daemon control channel: protocol, server, client,
+                       and the controller that owns the engine            [M3]
+internal/tui/          Bubble Tea TUI (a control-channel client)         [M3]
 internal/autostart/    start-at-login registration                       [M4]
 docs/                  this document
 scripts/               build + fetch helpers (fetch-rules.sh, fetch-sing-box.sh)
@@ -89,13 +100,19 @@ Dependency direction is strictly downward:
 
 ```
 cmd/vender     ->  internal/core
+               ->  internal/control
                ->  internal/tui (M3)
                ->  internal/config
                ->  internal/rules
 internal/core  ->  internal/config
                ->  internal/rules
 internal/rules ->  (pure data + embedded assets; imports nothing of vender's)
-internal/tui   ->  internal/config (+ a daemon control client, M3)
+internal/control -> internal/core
+                 -> internal/config
+                 -> internal/rules
+internal/tui   ->  internal/control
+               ->  internal/config
+               ->  internal/rules
 internal/autostart -> (standalone)
 ```
 
@@ -103,7 +120,9 @@ No package imports `cmd/`. `internal/config` has no dependency on OS-specific
 APIs: it defers the config directory to `os.UserConfigDir()`, which resolves to
 `~/.config/vender` on Linux and `%AppData%\vender` on Windows. `internal/core`
 owns the two OS-specific seams it needs (the lock and the child process group)
-behind build tags, so the CLI stays platform-free above it.
+behind build tags, so the CLI stays platform-free above it. M3's control
+channel needed no new platform seam at all — that is the whole argument for
+loopback TCP (§8).
 
 ## 4. Configuration layer (`internal/config`)
 
@@ -263,7 +282,7 @@ without touching the user's real configuration.
 | `vender daemon` | implemented (M1) — foreground, one per run dir |
 | `vender status` | implemented (M1) — exit code means "usable" |
 | `vender proxy on\|off` | implemented (M1) Linux/GNOME; Windows is M4 |
-| `vender tui` | stub — M3 |
+| `vender tui` | implemented (M3) — the TUI; prints a snapshot when not a terminal |
 | `vender autostart on\|off\|status` | stub — M4 |
 
 A stub is a real, documented command that exits with
@@ -347,6 +366,18 @@ possible. It emits up to five top-level sections — `log`, `dns`, `inbounds`,
 - `engine.bind_interface`, when set, is passed through to the outbound, which
   pins the connection to the proxy server to a specific interface on a
   multi-homed (or TUN-hijacked) host.
+
+M3 adds a sixth top-level section, `experimental`, and only when the caller
+asks for it:
+
+- `Route`, `Outbounds` and the rest are unchanged; `RuntimeConfig.ClashListen`
+  non-empty asks for sing-box's **Clash API**, which is what gives the TUI live
+  traffic counters and a latency measurement that goes *through* the tunnel
+  (§8.3). It is validated rather than passed through blindly: the address must
+  be loopback and a secret is mandatory, because an unauthenticated local API
+  can switch the active outbound. Leaving `ClashListen` empty emits no
+  `experimental` section at all, which keeps every M1/M2 golden file and any
+  hand-written config byte-identical.
 
 Three decisions are worth recording because the pinned engine forced them:
 
@@ -535,30 +566,193 @@ embedded sets with their provenance and sizes.
   users want from a China-facing client anyway. `geosite-cn` is one category
   rather than a hand-tuned set of exceptions.
 
-## 8. TUI (`internal/tui`) — implemented in M3
+## 8. Control channel (`internal/control`) — implemented in M3
 
-The TUI is a daemon client, entered through a single function:
+The daemon's local API. Everything the TUI, and anything else that wants to
+drive vender, does to a running daemon goes through here.
+
+```go
+// Daemon side: the controller owns the engine, the server side serves the API.
+ctrl, _ := control.NewController(control.ControllerOptions{Store: store, RunDir: runDir, Engine: engine, ...})
+srv, _  := control.NewServer(control.ServerOptions{Handler: ctrl, RunDir: runDir})
+go srv.Serve()
+
+// Client side.
+cli, _ := control.Dial(ctx, runDir)     // reads <runDir>/control.json
+st,  _ := cli.Status(ctx)
+logs, _ := cli.FollowLogs(ctx)          // a subscription owns its connection
+```
+
+### 8.1 Transport, and why not a unix socket
+
+**TCP on 127.0.0.1 with an OS-assigned port and a random 128-bit token.** The
+daemon writes `{v, pid, addr, token, started, runDir}` to `<run_dir>/control.json`
+with mode `0600`, and removes the file on exit so a stale token cannot outlive
+its daemon.
+
+A unix domain socket on Linux and a named pipe on Windows would be the more
+idiomatic choice, and the alternative was considered seriously. It was rejected
+because it is two implementations behind build tags whose *security* properties
+differ: a unix socket is protected by the file mode of the socket inode, while
+a Windows named pipe is protected by its DACL and by who may open it at all —
+which means the "is this channel private?" argument has to be made twice, in
+two idioms, and tested twice. Loopback TCP needs neither: the kernel refuses
+any off-host connection to `127.0.0.1`, and every request must present the
+token, which lives in a `0600` file inside a `0700` directory. The same code,
+the same tests, the same guarantees on both platforms — which is exactly what
+M4's Windows packaging needs.
+
+The token is regenerated on every daemon start and never written to a log or an
+error message.
+
+### 8.2 Protocol
+
+Newline-delimited JSON, one request per line, exactly one response per request.
+Every message carries `{"v":1,...}`; a client speaking another version is
+rejected with an explicit error rather than misparsed.
+
+```
+-> {"v":1,"auth":"<token>","id":7,"cmd":"select","args":{"name":"LA"}}
+<- {"v":1,"id":7,"ok":true,"data":{"action":"select","status":{...}}}
+<- {"v":1,"id":7,"ok":false,"kind":"not_found","error":"control: server not found: ..."}
+```
+
+Responses carry a machine-readable `kind` (`auth`, `bad_request`, `not_found`,
+`busy`, `internal`) so a client can react without matching message text.
+
+A **subscription** is a request whose response acknowledges the stream, after
+which the connection belongs to it:
+
+```
+-> {"v":1,"auth":"<token>","cmd":"traffic"}
+<- {"v":1,"ok":true,"stream":"traffic"}
+<- {"v":1,"stream":"traffic","data":{"up":1024,"down":65536,"totalDown":12407}}
+<- {"v":1,"stream":"traffic","ka":true}          # heartbeat, skipped by clients
+```
+
+| Command | Args | Reply |
+|---|---|---|
+| `ping` | — | daemon identity (cheapest liveness probe) |
+| `status` | — | engine state, mode, selection, uptime, pids, Clash endpoint |
+| `servers` | — | the server list, with the active one flagged |
+| `select` | `{name}` | persists the choice, restarts the engine |
+| `mode` | `{mode}` | persists `rule`/`global`/`direct`, restarts the engine |
+| `latency` | `{name?}` | round trip in ms (through the tunnel for the active server) |
+| `start` / `stop` / `restart` | — | engine lifecycle inside the running daemon |
+| `rules` | — | the active policy: actions, ordered rules, DNS, rule sets |
+| `logs` (stream) | — | engine output, with the daemon's lifecycle notes |
+| `traffic` (stream) | — | one sample per second from the engine's Clash API |
+
+### 8.3 The controller, and where the numbers come from
+
+`Controller` is the daemon's brain: it owns the engine, re-renders
+`RuntimeConfig` from the files on disk on every restart (so a `vender import`
+in another terminal is picked up by the next restart), and fans engine output
+out to every subscriber.
+
+Three decisions in it are worth recording:
+
+- **Reads and mutations are separate locks.** A server switch stops and starts
+  sing-box inside one call, which takes seconds. That call holds only the
+  operation mutex, so `status` on another connection is answered from a
+  snapshot, immediately — the daemon stays responsive while the engine blinks.
+  A test asserts it (`TestServerStaysResponsiveDuringARestart`).
+- **Subscribers are dropped from, never blocked on.** Each subscription is a
+  buffered channel; a client that stops reading loses samples instead of
+  wedging the daemon. This is the same policy `core` applies to the child's
+  stdout. A new subscriber is first handed the last 250 log lines, so attaching
+  the TUI an hour into a session still shows history.
+- **Traffic and latency come from sing-box's own counters.** Local counters on
+  the mixed inbound cannot see the proxied payload, so M3 turns on sing-box's
+  experimental **Clash API** (`127.0.0.1`, an OS-assigned port decided by the
+  daemon, a generated secret) and reads `/traffic`, `/connections` and
+  `/proxies/<tag>/delay` through `core.ClashClient`. The endpoint is only
+  reachable from the daemon; the TUI never talks to it.
+  Latency is measured **through the tunnel** for the active server, which is
+  what a user switching servers actually wants to know; for any other server
+  (vender has a single outbound) it falls back to a bare TCP handshake and says
+  so — `(tcp)` — because on a host where a TUN hijacks outbound TCP that number
+  can be optimistic to the point of being meaningless.
+
+Streams reconnect on their own: if the engine restarts, the traffic poller
+backs off and reconnects with no involvement from any client.
+
+## 9. TUI (`internal/tui`) — implemented in M3
+
+The TUI is a control-channel client, entered through a single function:
 
 ```go
 // Run starts the interactive TUI and blocks until the user quits or ctx is
-// cancelled.
+// cancelled. It never requires a daemon to be up.
 func Run(ctx context.Context, opts Options) error
+
+type Options struct {
+    ConfigDir       string // config.yaml / servers.yaml (read directly)
+    RunDir          string // where the daemon published control.json
+    ControlSocket   string // optional explicit "host:port" override
+    RefreshInterval int    // status poll, in seconds (0 = 1s)
+}
 ```
 
-`Options` carries the config directory, the daemon control endpoint (a unix
-socket on Linux / named pipe on Windows; empty means the platform default), and
-the poll interval. `Run` returns `ErrNotImplemented` until M3.
+### 9.1 Screens
 
-**M3 plan:** a Bubble Tea model with three panes — server list (switch active
-server), status (daemon health, active server, mode, live engine log tail from
-`Engine.Logs()`), and settings (listen address, mode). Traffic through the local
-inbound cannot be measured without an engine-side counter, so any "speed"
-animation reflects connection activity gleaned from engine logs unless M1
-exposes richer metrics. The TUI must work identically whether the daemon was
-started by hand or by autostart, and must degrade gracefully (clear message, not
-a crash) when no daemon is running.
+| Key | Screen | Contents |
+|---|---|---|
+| `1` | **Dashboard** | daemon and engine state, selected server, mode, uptime, latency badge, and an animated up/down traffic graph with a load gauge, human-readable rates and session totals |
+| `2` | **Nodes** | table of configured servers (name, type, protocol, endpoint, latency); `enter` selects and lets the daemon restart the engine, `t` measures latency, `r` reloads from disk |
+| `3` | **Logs** | the engine's own output as streamed by the daemon, in a scrolling viewport with follow mode (`f`) and a substring filter (`/`) |
+| `4` | **Settings** | the routing mode (rule/global/direct), the listener and engine paths, the **active built-in routing policy** rendered from `internal/rules`, and clearly-marked `M4` placeholders for autostart |
 
-## 9. Autostart (`internal/autostart`) — implemented in M4
+Global keys: `tab`/`shift+tab` (next/previous screen), `?` (help overlay), `q`
+(or Ctrl-C) to quit. On the Dashboard: `t` latency, `s`/`x`/`R` start/stop/
+restart the engine, `m` cycle the mode, `r` refresh. The engine controls exist
+so the daemon does not have to be restarted to stop and start the proxy.
+
+### 9.2 Behaviour with no daemon
+
+The TUI starts anyway and is useful: Nodes and Settings are built from
+`config.yaml`, `servers.yaml` and `internal/rules`, so they are complete with
+nothing running. The Dashboard says what is missing and prints the exact
+command that fixes it (`vender daemon`), and attaching is retried once a
+second — start the daemon later and the TUI simply picks it up. Every action
+that needs the daemon explains itself in a toast instead of failing silently.
+
+### 9.3 Animation, colour and terminals
+
+State is a value (`Model`); `View` is pure. That is what makes the view tests
+possible: a test builds a model by hand and compares `View()` against a golden
+file, with no terminal and no daemon.
+
+- Motion is driven by two ticks: a data tick (status poll, 1s) and an animation
+  tick (8/s) for the spinner and for the tab highlight, which slides from the
+  old screen to the new one over a few frames. The traffic graph is a sparkline
+  scaled to the window peak, with a floor so an idle connection is a flat trace
+  rather than a full-height bar.
+- Colour lives in one `theme` built from a `lipgloss.Renderer`. A renderer over
+  `io.Discard` has an ASCII profile whose styles are no-ops, so the same `View`
+  code produces plain text — that is the `NO_COLOR` path, the non-TTY path, and
+  the golden-test path, all at once. Box drawing is deliberately *not*
+  conditional on colour.
+- With no terminal at all, `Run` prints one status snapshot and exits 0 instead
+  of failing or clearing a terminal it cannot restore.
+- Bubble Tea owns the terminal: it enters the alternate screen, and exits it,
+  shows the cursor again, and restores the line discipline on `q`, Ctrl-C and
+  SIGTERM. The CLI deliberately does **not** install its own signal handler for
+  `vender tui`: cancelling the context on the same signal Bubble Tea handles
+  races with Bubble Tea's own signal goroutine and can leave the process stuck
+  on the way out. One owner of the signal, and it is the component holding the
+  terminal. `Run` still honours a cancelled context, which is what embedding
+  and tests use.
+
+### 9.4 Dependencies
+
+Three TUI libraries, and nothing else: `bubbletea`, `lipgloss`, `bubbles`
+(spinner, viewport, table, progress, help). The control channel adds no
+dependency at all — it is `net`, `encoding/json`, `crypto/rand` and
+`crypto/subtle`. Everything stays cross-compilable to `windows/amd64` with no
+build tags in either package.
+
+## 10. Autostart (`internal/autostart`) — implemented in M4
 
 ```go
 func Enable() error              // idempotent
@@ -579,25 +773,41 @@ Per platform:
 registry value), so `vender autostart status` can explain exactly what is
 installed. All entry points return `ErrNotImplemented` until M4.
 
-## 10. Milestone plan
+**What M4 inherits from M3.** The autostart entry only has to run `vender
+daemon`; everything else already exists. Three things about it are deliberate:
+
+- the daemon needs **no console**. It writes its log to stdout, which a
+  `systemd --user` unit captures and a detached Windows process discards, and
+  it never reads stdin. Its control channel is loopback TCP rather than a
+  console- or session-bound object, so a client started from any later login
+  session can reach the daemon that autostart started;
+- it takes a **fresh token on every start**, so a control endpoint left over
+  from a previous boot cannot be used by anything;
+- it exits cleanly on `SIGTERM`, which is what `systemctl --user stop` sends. On
+  Windows the service wrapper will have to send the equivalent termination (or
+  run the daemon as a console application under Task Scheduler), and the
+  `process_windows.go` seam is where that lands.
+
+## 11. Milestone plan
 
 | Milestone | Deliverable | Acceptance |
 |---|---|---|
 | **M0** | Skeleton, `internal/config` (config, servers, share links), CLI (`version`, `import`, `servers`), docs, unit tests, cross-compilation | `go build ./...`, `GOOS=windows go build ./...`, `go test ./...`, `go vet ./...` all clean; stubs print their milestone |
 | **M1** | `internal/core` engine + `vender daemon`, `status`, `proxy on\|off` | With a real server: daemon starts sing-box, `127.0.0.1:7897` proxies HTTP and SOCKS5; stopping the daemon frees the port; `status` reflects reality |
 | **M2** | `internal/rules` built-in policy, actions, split DNS and embedded rule sets, wired into the generated config; `vender rules list` | `proxy.mode: rule` sends CN/private destinations direct, blocks ads, proxies a documented override list and everything else, with matching split DNS; `sing-box check` passes for both server types and a live run shows direct vs proxied vs blocked; `global` and `direct` behave as documented |
-| **M3** | `internal/tui` Bubble Tea client | TUI attaches to a running daemon, switches the active server and mode, tails engine logs, quits cleanly; behaves with no daemon |
+| **M3** | `internal/control` + `internal/tui`: the daemon control channel and the Bubble Tea client | TUI attaches to a running daemon, switches the active server and mode, tails engine logs, shows live traffic from the engine's own counters, quits cleanly and restores the terminal; behaves with no daemon; the channel rejects an unauthenticated client, and a bad host leaves no side effects |
 | **M4** | `internal/autostart` | `autostart on` starts the daemon after login on both platforms; `off` removes it; `status` reports it; all idempotent |
 | **M5** | Subscription URLs and bulk import, server latency testing | Importing a subscription adds all of its servers; a latency command reports a reachability ranking |
 | **M6** | Hardening and release | Health-based failover across servers, log rotation, reproducible cross-builds, signed Windows binaries, user documentation |
 
-## 11. Engineering conventions
+## 12. Engineering conventions
 
-- **Minimal dependencies.** vender uses only `cobra` and `yaml.v3` plus the
-  standard library: no networking library (that is sing-box's job) and no TUI
-  dependency until M3. Windows-specific calls that the standard library does not
-  expose (`LockFileEx`) go through `syscall.NewLazyDLL`, which loads from
-  `System32` only.
+- **Minimal dependencies.** vender uses only `cobra`, `yaml.v3` and — from M3,
+  for the TUI alone — `bubbletea`, `lipgloss` and `bubbles`. There is no
+  networking library (that is sing-box's job); the control channel is `net` +
+  `encoding/json` + `crypto/rand`/`crypto/subtle`. Windows-specific calls that
+  the standard library does not expose (`LockFileEx`) go through
+  `syscall.NewLazyDLL`, which loads from `System32` only.
 - **No OS-specific code.** Everything builds for `linux/amd64` and
   `windows/amd64`; platform differences are handled through standard-library
   abstractions (`os.UserConfigDir`, `os.UserCacheDir`). Where `syscall`-level
@@ -622,6 +832,23 @@ installed. All entry points return `ErrNotImplemented` until M4.
   tests: rule order (the order *is* the policy), that every referenced rule set
   is embedded, that the embedded bytes still hash to the pinned checksums, and
   that `scripts/fetch-rules.sh` and `internal/rules` pin the same table.
+- **A control channel that cannot be reached off-host, and cannot be reached
+  without the token.** Every message is versioned and authenticated, the token
+  is 128 random bits per daemon start, it lives in a `0600` file next to the
+  lock, and it is removed when the daemon exits. A test asserts the file mode,
+  the removal, and that a forged token is rejected while the daemon carries on
+  serving everyone else.
+- **The TUI is testable without a terminal.** `View` is pure and colour is a
+  property of one renderer, so the screens are covered by golden files
+  (`internal/tui/testdata/`, refreshable with `go test ./internal/tui -update`)
+  for the Dashboard running and not running, Nodes populated and empty, and
+  Settings — plus the behaviour tests that go through the same `Update` the
+  program uses.
+- **The daemon's own channel is tested against a real daemon.** `cmd/vender`'s
+  tests run `vender daemon` in-process with the test binary standing in for
+  sing-box (including its Clash API), then drive status/servers/select/mode/
+  latency and both streams over loopback TCP, and assert that a bad token is
+  rejected and that the endpoint file is published and withdrawn.
 - **Committed binary assets.** The embedded `.srs` rule sets are the only
   binary data in the repository. They are committed rather than generated at
   fetch time so a clean clone builds, tests and runs offline; their provenance

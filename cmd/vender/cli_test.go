@@ -74,7 +74,6 @@ func TestCLIMilestoneStubs(t *testing.T) {
 		args      []string
 		milestone string
 	}{
-		{args: []string{"tui"}, milestone: "M3"},
 		{args: []string{"autostart", "on"}, milestone: "M4"},
 		{args: []string{"autostart", "off"}, milestone: "M4"},
 		{args: []string{"autostart", "status"}, milestone: "M4"},
@@ -120,6 +119,23 @@ func TestCLIRootHelpListsEveryCommand(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("help output does not mention %q:\n%s", want, out)
 		}
+	}
+}
+
+// `vender tui` is a real command from M3 on, and it must stay usable as a
+// non-terminal: piping it must print a snapshot instead of failing.
+func TestCLITUIHelp(t *testing.T) {
+	out, err := runCLI(t, "tui", "--help")
+	if err != nil {
+		t.Fatalf("tui --help: %v", err)
+	}
+	for _, want := range []string{"Dashboard", "Nodes", "Logs", "Settings", "quit"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("tui help does not mention %q:\n%s", want, out)
+		}
+	}
+	if _, err := runCLI(t, "tui", "extra"); err == nil {
+		t.Error("tui with an argument = nil error, want a usage error")
 	}
 }
 

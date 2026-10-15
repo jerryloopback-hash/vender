@@ -28,11 +28,28 @@ const (
 // the rendered file reads top-down. Unknown-to-vender sing-box options are
 // simply never emitted.
 type singboxConfig struct {
-	Log       singboxLog       `json:"log"`
-	DNS       *singboxDNS      `json:"dns,omitempty"`
-	Inbounds  []singboxInbound `json:"inbounds"`
-	Outbounds []any            `json:"outbounds"`
-	Route     singboxRoute     `json:"route"`
+	Log          singboxLog           `json:"log"`
+	Experimental *singboxExperimental `json:"experimental,omitempty"`
+	DNS          *singboxDNS          `json:"dns,omitempty"`
+	Inbounds     []singboxInbound     `json:"inbounds"`
+	Outbounds    []any                `json:"outbounds"`
+	Route        singboxRoute         `json:"route"`
+}
+
+// singboxExperimental carries sing-box's out-of-band runtime services. vender
+// emits it only when the daemon asked for them (M3: the Clash API, which is
+// how the TUI gets live traffic counters and latency).
+type singboxExperimental struct {
+	ClashAPI *singboxClashAPI `json:"clash_api,omitempty"`
+}
+
+// singboxClashAPI is sing-box's Clash-compatible REST/streaming API. It is
+// bound to loopback only and always carries a secret: without one,
+// sing-box rejects the config, and an unauthenticated local API would let any
+// local process reconfigure the running engine.
+type singboxClashAPI struct {
+	ExternalController string `json:"external_controller"`
+	Secret             string `json:"secret,omitempty"`
 }
 
 // singboxDNS is the generated `dns` section. vender emits it only for the
@@ -195,6 +212,18 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 			Listen:     host,
 			ListenPort: port,
 		}},
+	}
+
+	// The Clash API is opt-in: only the daemon asks for it, and only so the TUI
+	// can read live traffic and measure latency. The address is validated by
+	// RuntimeConfig.Validate (loopback only, secret required).
+	if rc.ClashListen != "" {
+		cfg.Experimental = &singboxExperimental{
+			ClashAPI: &singboxClashAPI{
+				ExternalController: rc.ClashListen,
+				Secret:             rc.ClashSecret,
+			},
+		}
 	}
 
 	// sing-box 1.13 removed the legacy inbound `sniff` option outright, so
@@ -458,6 +487,30 @@ func outboundTag(o rules.Outbound) (string, error) {
 	default:
 		return "", fmt.Errorf("core: rule outbound %q has no sing-box tag", o)
 	}
+}
+
+// validateClashListen rejects a Clash API address that would expose the API
+// beyond loopback. sing-box's Clash API is powerful (it can switch the active
+// outbound) and vender only ever needs it locally, so a wildcard or external
+// address is treated as a configuration mistake rather than accepted.
+func validateClashListen(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("core: clash api address %q must be host:port: %w", addr, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		if host != "localhost" {
+			return fmt.Errorf("core: clash api address %q must use a loopback host, not a name", addr)
+		}
+	} else if !ip.IsLoopback() {
+		return fmt.Errorf("core: clash api address %q must be a loopback address", addr)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 0 || p > 65535 {
+		return fmt.Errorf("core: clash api address %q has an invalid port", addr)
+	}
+	return nil
 }
 
 // splitListen splits a validated "host:port" listen address into sing-box's

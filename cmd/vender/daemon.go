@@ -3,14 +3,17 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ll-lite/vender/internal/config"
+	"github.com/ll-lite/vender/internal/control"
 	"github.com/ll-lite/vender/internal/core"
 )
 
@@ -25,6 +28,11 @@ servers.yaml, renders a sing-box configuration into the run directory, starts
 and supervises the sing-box child process, and streams its log to standard
 output. It runs in the foreground and shuts down on SIGINT or SIGTERM, which
 is what a systemd unit or the Windows service wrapper (M4) expects.
+
+It also serves the local control channel the TUI attaches to: a loopback TCP
+listener with a random token, published as control.json (mode 0600) inside the
+run directory. The token is removed on exit, so a stale token can never
+outlive its daemon.
 
 Only one daemon may own a run directory: an advisory lock is taken before
 sing-box is started, and a second ` + "`vender daemon`" + ` fails immediately
@@ -42,7 +50,11 @@ Use --run-dir to override it (tests, portable installs).`,
 }
 
 func (a *app) runDaemon(cmd *cobra.Command) error {
-	out := cmd.OutOrStdout()
+	// The daemon writes to its stdout from two goroutines — the banner and the
+	// engine log pump — so every write is serialised through one writer.
+	// Without it two lines can interleave, and (as the race detector notices)
+	// an unbuffered writer like the one the tests use is not safe for it.
+	out := &syncWriter{w: cmd.OutOrStdout()}
 
 	store, err := a.configStore()
 	if err != nil {
@@ -95,9 +107,32 @@ func (a *app) runDaemon(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	if err := engine.WriteConfig(rc); err != nil {
+
+	// The controller owns the engine from here on: it renders the runtime
+	// configuration (including sing-box's Clash API, which is how live traffic
+	// and latency reach the TUI), restarts it when the server or mode changes,
+	// and fans engine output out to every attached client.
+	ctrl, err := control.NewController(control.ControllerOptions{
+		Store:      store,
+		RunDir:     runDir,
+		Engine:     engine,
+		BinaryPath: binaryPath,
+		Version:    version,
+		Logf:       func(format string, args ...any) { fmt.Fprintf(out, "vender: "+format+"\n", args...) },
+	})
+	if err != nil {
 		return err
 	}
+	defer ctrl.Close()
+
+	// Subscribe before starting so the daemon's own stdout carries the very
+	// first engine lines; the controller buffers history, so this is a
+	// convenience rather than a requirement.
+	logs, unsubscribe, err := ctrl.Subscribe(control.StreamLogs)
+	if err != nil {
+		return err
+	}
+	defer unsubscribe()
 
 	// The signal handler is installed *before* the engine is spawned, so a
 	// SIGTERM that arrives during startup is caught and the child is still
@@ -118,32 +153,54 @@ func (a *app) runDaemon(cmd *cobra.Command) error {
 	}
 	fmt.Fprintln(out, "  stop with Ctrl-C or SIGTERM")
 
-	if err := engine.Start(); err != nil {
-		return err
-	}
-	fmt.Fprintf(out, "listening on %s\n", cfg.Proxy.Listen)
-
-	// Engine output is the daemon's own log: stream it to stdout until the
-	// channel closes (the process exited), which also keeps the channel drained
-	// so the reporter never blocks.
-	//
-	// The subscription is taken *after* Start: Logs() returns the channel of
-	// the current run, and a run's channel only exists once Start has spawned
-	// it. Output emitted before the subscription is buffered, so the listener
-	// announcement is not lost.
 	logsDone := make(chan struct{})
 	go func() {
 		defer close(logsDone)
-		for line := range engine.Logs() {
-			fmt.Fprintln(out, "sing-box:", line)
+		for v := range logs {
+			line, ok := v.(control.LogLine)
+			if !ok {
+				continue
+			}
+			if line.Source == control.SourceDaemon {
+				fmt.Fprintf(out, "vender: %s\n", line.Line)
+				continue
+			}
+			fmt.Fprintln(out, "sing-box:", line.Line)
 		}
 	}()
 
-	<-ctx.Done()
-	fmt.Fprintln(out, "stopping...")
-	if err := engine.Stop(); err != nil {
+	if err := ctrl.StartEngine(); err != nil {
 		return err
 	}
+
+	// The control channel is published only once the engine is up: a daemon
+	// that failed to start leaves no endpoint behind for a client to dial.
+	ctrlSrv, err := control.NewServer(control.ServerOptions{
+		Handler: ctrl,
+		RunDir:  runDir,
+		Version: version,
+	})
+	if err != nil {
+		return err
+	}
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		ctrlSrv.Serve()
+	}()
+
+	fmt.Fprintf(out, "listening on %s\n", cfg.Proxy.Listen)
+	fmt.Fprintf(out, "control on %s (attach with `vender tui`)\n", ctrlSrv.Addr())
+
+	<-ctx.Done()
+	fmt.Fprintln(out, "stopping...")
+
+	// Stop accepting clients first: it drops the live subscriptions, so the
+	// TUI's streams end cleanly instead of hanging while the engine stops.
+	_ = ctrlSrv.Close()
+	<-served
+	ctrl.Close()
+
 	// Wait for the log stream to drain so the last line is not lost.
 	select {
 	case <-logsDone:
@@ -175,6 +232,20 @@ func resolveSelectedServer(cfg *config.Config, ss *config.ServerSet) (*config.Se
 // errNotRunning is reported by `vender status` when no daemon owns the run
 // directory. It makes the exit code meaningful for scripts.
 var errNotRunning = errors.New("vender daemon is not running")
+
+// syncWriter serialises writes from the daemon's several output goroutines.
+// fmt writes a complete formatted string with a single Write call, so a
+// mutex around Write is enough to keep whole lines intact.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
 
 // daemonRunning reports whether a daemon owns runDir, and its recorded pid.
 func daemonRunning(runDir string) (bool, int, error) {

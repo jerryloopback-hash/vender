@@ -19,14 +19,14 @@ The pinned engine is **sing-box 1.14.3** (see `scripts/fetch-sing-box.sh`).
 
 ## Status
 
-`vender` is at **M2**: the configuration layer and share-link parser (M0) and the
-engine (M1) are complete, and **smart routing now works out of the box** —
-`proxy.mode: rule` sends Chinese and private destinations direct, blocks ads and
-trackers, forces a short list of foreign services through the proxy, and resolves
-DNS along the same split. The rule sets it matches against are **embedded in the
-binary**, so a working default needs no download at runtime. Commands that belong
-to a later milestone are present but exit with an explicit `not implemented in
-this milestone (Mx)` message.
+`vender` is at **M3**: the configuration layer and share-link parser (M0), the
+engine (M1), **smart routing out of the box** (M2) and now an **animated
+terminal UI** (M3) are complete. The rule sets the default policy matches
+against are **embedded in the binary**, so a working default needs no download
+at runtime; the TUI attaches to the running daemon over a local control channel
+and can switch servers, change mode, start and stop the engine, tail its log
+and show live traffic. Commands that belong to a later milestone are present
+but exit with an explicit `not implemented in this milestone (Mx)` message.
 
 ## Roadmap
 
@@ -34,8 +34,8 @@ this milestone (Mx)` message.
 |---|---|
 | M0 | Module skeleton, config load/save, share-link parsing, `version` / `import` / `servers` CLI, docs |
 | M1 | Engine: generate the sing-box config, supervise the child process, `daemon`, `status`, `proxy on\|off` |
-| **M2** | Built-in routing rules (CN direct, ad block, private IPs), split DNS, embedded rule sets, `rules list` |
-| M3 | Bubble Tea animated TUI that attaches to the running daemon |
+| M2 | Built-in routing rules (CN direct, ad block, private IPs), split DNS, embedded rule sets, `rules list` |
+| **M3** | Control channel (loopback TCP + token, `control.json`), live traffic from sing-box's Clash API, animated Bubble Tea TUI (`vender tui`) |
 | M4 | Autostart (systemd user unit / XDG autostart on Linux; Registry Run key / Task Scheduler on Windows), Windows system-proxy control |
 | M5 | Subscription links and bulk import, server latency testing |
 | M6 | Hardening & release: health-based failover, log rotation, signed builds |
@@ -62,6 +62,10 @@ GOOS=windows GOARCH=amd64 go build -o vender.exe ./cmd/vender
 
 `scripts/build.sh` builds both targets into `dist/` with version metadata
 injected via `-ldflags`.
+
+Dependencies are deliberately few: `cobra` and `yaml.v3` for the CLI, plus
+`bubbletea`, `lipgloss` and `bubbles` for the TUI. The control channel uses
+only the standard library.
 
 ## Installing sing-box
 
@@ -107,6 +111,7 @@ If none is found, the error names all three locations.
 
 ./vender daemon                # run the proxy (foreground; Ctrl-C to stop)
 ./vender status                # is it running, and is the port accepting? (exit code!)
+./vender tui                   # attach the terminal UI to the running daemon
 ./vender proxy on              # also point the desktop's system proxy at vender
 ./vender proxy off             # restore the system proxy
 ```
@@ -117,6 +122,49 @@ the test suite stays away from your real setup.
 
 The first server imported also becomes the active one; removing the active
 server clears the selection.
+
+## The terminal UI
+
+```
+./vender tui
+```
+
+An animated Bubble Tea interface with four screens:
+
+| Key | Screen | What it shows |
+|---|---|---|
+| `1` | **Dashboard** | daemon and engine state, the selected server, the mode, uptime, and a **live up/down traffic graph** with human-readable rates and session totals |
+| `2` | **Nodes** | every configured server with its type, protocol, endpoint and latency. `enter` makes one active (the daemon restarts the engine in place), `t` measures latency |
+| `3` | **Logs** | the engine's own output, streamed live, with follow mode (`f`) and a filter (`/`) |
+| `4` | **Settings** | the routing mode, the listener, and a read-only view of the **active built-in policy** |
+
+Other keys: `tab` / `shift+tab` between screens, `?` for help, `t` to test
+latency, `s` / `x` / `R` to start, stop and restart the engine, `m` to cycle
+the mode, `q` or Ctrl-C to quit.
+
+The TUI is a **client**: it never runs sing-box itself, it asks the daemon. So
+it can attach and detach at any time, and two of them can be open at once. It
+also **does not need a daemon to start** — Nodes and Settings are built from
+your configuration files, the Dashboard prints the exact command to start the
+daemon, and attaching is retried once a second.
+
+Traffic and latency come from sing-box's own experimental Clash API, which
+vender switches on for its daemon on a loopback address with a generated
+secret. Nothing outside the daemon talks to it.
+
+### How the TUI talks to the daemon
+
+The daemon publishes a small endpoint at `<run-dir>/control.json` (mode `0600`)
+holding a loopback TCP address and a random token, regenerated on every start
+and deleted on exit. Clients speak newline-delimited, versioned JSON over that
+connection: `status`, `servers`, `select`, `mode`, `latency`, `start`, `stop`,
+`restart` and `rules` are request/response, while `logs` and `traffic` are
+subscriptions that take their connection over. A request without the token is
+rejected. See `docs/ARCHITECTURE.md` §8 for the protocol and for why it is
+loopback TCP rather than a unix socket.
+
+`vender tui` piped somewhere (no terminal) prints a one-line-per-field snapshot
+instead of failing.
 
 ### Behind an existing VPN or TUN
 
@@ -309,12 +357,22 @@ scripts/fetch-rules.sh --print-size # the embedded total
    the config that references them);
 4. renders `singbox.json` **atomically** (`0600`, since it holds credentials)
    with one `mixed` inbound, the selected outbound, a `direct` outbound, a
-   `block` outbound, the built-in rules, their actions and the split DNS policy;
+   `block` outbound, the built-in rules, their actions, the split DNS policy and
+   the experimental Clash API (loopback, with a generated secret) the TUI reads
+   live traffic from;
 5. starts `sing-box run -c <run dir>/singbox.json` in its own process group and
    returns only once the inbound port actually accepts TCP connections;
-6. streams sing-box's output to its own standard output, prefixed `sing-box:`;
-7. on `SIGINT`/`SIGTERM`, stops sing-box gracefully (`SIGTERM`, then `SIGKILL`
-   after a grace period), removes the pid file and releases the lock.
+6. publishes its control endpoint as `<run dir>/control.json` (`0600`) and
+   serves it, so `vender tui` can attach;
+7. streams sing-box's output to its own standard output, prefixed `sing-box:`,
+   and to every attached client;
+8. on `SIGINT`/`SIGTERM`, stops sing-box gracefully (`SIGTERM`, then `SIGKILL`
+   after a grace period), removes the pid file and the control endpoint, and
+   releases the lock.
+
+While it runs, a client can also switch the active server, change the routing
+mode, and start/stop/restart the engine in place — the daemon re-renders the
+configuration and restarts sing-box without the daemon itself going away.
 
 `vender status` reads the same lock, so its exit code means exactly "the proxy
 is up" and is safe to use in scripts or a health check.

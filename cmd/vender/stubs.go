@@ -1,12 +1,9 @@
 package main
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/spf13/cobra"
-
-	"github.com/ll-lite/vender/internal/tui"
 )
 
 // milestoneError is the uniform "this command exists but its milestone has not
@@ -14,27 +11,6 @@ import (
 // while the exit code still signals that nothing happened.
 func milestoneError(what, milestone string) error {
 	return fmt.Errorf("%s: not implemented in this milestone (%s)", what, milestone)
-}
-
-func (a *app) newTUICmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "tui",
-		Short: "Attach the interactive terminal UI (M3)",
-		Long: `Start the Bubble Tea terminal UI and attach it to the running daemon.
-
-The TUI is a client: it reads the same configuration files and sends control
-requests to the daemon, so it can be attached and detached at any time.
-
-Not implemented in this milestone.`,
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			store, err := a.configStore()
-			if err != nil {
-				return err
-			}
-			return tui.Run(context.Background(), tui.Options{ConfigDir: store.Dir()})
-		},
-	}
 }
 
 func (a *app) newAutostartCmd() *cobra.Command {

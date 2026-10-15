@@ -39,6 +39,17 @@ type RuntimeConfig struct {
 	// RunDir is where the generated config, lock file and logs live. It belongs
 	// to the runtime (cache) directory, not the config directory.
 	RunDir string `json:"run_dir"`
+
+	// ClashListen enables sing-box's experimental Clash API when non-empty: a
+	// "host:port" address the API listens on. The daemon uses it to read live
+	// traffic counters and to measure proxy latency. Empty means "do not emit
+	// the experimental section at all", which is what the M1/M2 golden files
+	// and any hand-written config expect.
+	ClashListen string `json:"clash_listen,omitempty"`
+	// ClashSecret is the bearer token the Clash API requires. It is written
+	// into the generated config (which is 0600 for exactly this reason) and is
+	// never logged.
+	ClashSecret string `json:"clash_secret,omitempty"`
 }
 
 // Validate rejects a runtime configuration that cannot produce a working
@@ -56,6 +67,14 @@ func (rc RuntimeConfig) Validate() error {
 	if rc.Server != nil {
 		if err := rc.Server.Validate(); err != nil {
 			return err
+		}
+	}
+	if rc.ClashListen != "" {
+		if err := validateClashListen(rc.ClashListen); err != nil {
+			return err
+		}
+		if rc.ClashSecret == "" {
+			return errors.New("core: RuntimeConfig.ClashListen requires a ClashSecret")
 		}
 	}
 	return nil

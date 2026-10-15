@@ -1,0 +1,11 @@
+ Dashboard   Nodes       Logs        Settings                                             vender M3
+ servers  0   ↑/↓ move · enter select · t latency · r reload
+╭─ configuration ──────────────────────────────────────────────────────────────────────────────────╮
+│ No servers configured.                                                                           │
+│                                                                                                  │
+│   add one with     vender import '<share-link>'                                                  │
+│   servers live in /home/test/.config/vender/servers.yaml                                         │
+│   then press       r to reload                                                                   │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+ ○ daemon not running — start it with `vender daemon`  (waiting)
+ ↑/↓ move • enter select • t latency • r reload • tab screens • ? help

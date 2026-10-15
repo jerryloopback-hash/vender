@@ -98,6 +98,20 @@ func goldenCases(t *testing.T) []goldenCase {
 				RunDir: "/run/vender",
 			},
 		},
+		{
+			// M3: the daemon turns on the Clash API so the TUI can read live
+			// traffic and measure latency; the experimental section is the only
+			// difference from the plain case, so it gets its own golden file.
+			name: "clash-api",
+			file: "clash_api.golden",
+			rc: RuntimeConfig{
+				Config:      *config.Default(),
+				Server:      reality,
+				RunDir:      "/run/vender",
+				ClashListen: "127.0.0.1:19090",
+				ClashSecret: "0123456789abcdef0123456789abcdef",
+			},
+		},
 	}
 }
 
