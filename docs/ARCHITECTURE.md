@@ -30,14 +30,14 @@ and the interfaces that later milestones compile against today.
         |  - loads servers.yaml      |
         |  - renders singbox.json    |
         |  - supervises sing-box     |
-        |  - local control socket    |<----------+
+        |  - run dir: lock + pid     |<----------+
         +-------------+--------------+           |
                       | manages                   | attaches
                       v                           |
         +----------------------------+   +--------+---------+
         |        sing-box child      |   |   vender tui     |
         |  mixed inbound 127.0.0.1:  |   |     (M3)         |
-        |  7890 -> selected outbound |   |  Bubble Tea UI   |
+        |  7897 -> selected outbound |   |  Bubble Tea UI   |
         +----------------------------+   +------------------+
                       ^                           ^
                       | local apps                 | CLI commands
@@ -53,29 +53,46 @@ rendered engine configuration, and the runtime state. The TUI and the
 command-line control commands (`vender status`, `vender proxy on|off`) are
 clients: they never launch sing-box themselves, they ask the daemon.
 
-This split is what makes the TUI optional and restartable, and it is why M0
-ships the CLI with a clean separation between *configuration* (files on disk,
-implemented now) and *control* (a running daemon, M1).
+This split is what makes the TUI optional and restartable. It is also why M0
+shipped the CLI with a clean separation between *configuration* (files on disk)
+and *control* (a running daemon), and why M1 kept the daemon a plain foreground
+process: the control surface a client needs is the run directory — the lock
+says whether a daemon is up, and the generated config plus the listen address
+say what it is doing. M3 adds a real control socket for the operations that
+cannot be expressed as files (switching server, changing mode, tailing logs),
+at which point the clients stop reading files directly.
+
+Two directories, deliberately:
+
+| Directory | Contents | Lifetime |
+|---|---|---|
+| `os.UserConfigDir()/vender` | `config.yaml`, `servers.yaml` | the user's; editable, backable-up, never overwritten by vender except through `import`/`servers`/`select` |
+| `os.UserCacheDir()/vender` | `singbox.json`, `vender.lock`, `vender.pid` | the daemon's; disposable, regenerated on every start |
+
+`--config-dir` and `--run-dir` override both, which is what keeps the test
+suite from touching a real installation.
 
 ## 3. Packages
 
 ```
-cmd/vender/            CLI (cobra): version, import, servers, and stubs
+cmd/vender/            CLI (cobra): version, import, servers, daemon, status, proxy
 internal/config/       config.yaml + servers.yaml + share-link parsing  [M0]
-internal/core/         engine contract + sing-box supervision            [M1]
+internal/core/         engine contract + sing-box rendering + supervision [M1]
 internal/rules/        built-in routing rules -> sing-box route rules    [M2]
 internal/tui/          Bubble Tea TUI (daemon client)                    [M3]
 internal/autostart/    start-at-login registration                       [M4]
 docs/                  this document
-scripts/               build helpers
+scripts/               build + fetch helpers
 ```
 
 Dependency direction is strictly downward:
 
 ```
-cmd/vender  ->  internal/tui (M3)
-            ->  internal/config
+cmd/vender     ->  internal/core
+               ->  internal/tui (M3)
+               ->  internal/config
 internal/core  ->  internal/config
+               ->  internal/rules (nil in M1; the rule sets arrive in M2)
 internal/rules ->  (pure data; consumed by core)
 internal/tui   ->  internal/config (+ a daemon control client, M3)
 internal/autostart -> (standalone)
@@ -83,7 +100,9 @@ internal/autostart -> (standalone)
 
 No package imports `cmd/`. `internal/config` has no dependency on OS-specific
 APIs: it defers the config directory to `os.UserConfigDir()`, which resolves to
-`~/.config/vender` on Linux and `%AppData%\vender` on Windows.
+`~/.config/vender` on Linux and `%AppData%\vender` on Windows. `internal/core`
+owns the two OS-specific seams it needs (the lock and the child process group)
+behind build tags, so the CLI stays platform-free above it.
 
 ## 4. Configuration layer (`internal/config`)
 
@@ -107,18 +126,23 @@ A missing file is not an error — a fresh install loads built-in defaults.
 ```yaml
 log_level: info                 # debug | info | warn | error
 proxy:
-    listen: 127.0.0.1:7890      # host:port of the mixed inbound
+    listen: 127.0.0.1:7897      # host:port of the mixed inbound
     mode: rule                  # rule | global | direct
 engine:
     binary: ""                  # empty => bundled next to vender, else PATH
+    bind_interface: ""          # pin the proxy outbound to an interface
 selected_server: ""             # name of the active entry in servers.yaml
 ```
 
 `Config.Normalize` fills zero values with defaults and canonicalises casing, so
 a partial file behaves like a documented one. `Config.Validate` rejects an
-unknown log level, an unknown mode, and a malformed or wildcard listen address
+unknown log level, an unknown mode, a malformed or wildcard listen address
 (a wildcard listener would expose the proxy, so it is treated as a mistake
-rather than a convenience).
+rather than a convenience), and an implausible `engine.bind_interface`.
+
+The default listen address is **7897, not 7890**: 7890 is the conventional port
+of a system-wide mihomo/clash instance, so defaulting to it would make vender
+fail to bind on exactly the hosts that already run a proxy.
 
 ### 4.3 `servers.yaml`
 
@@ -228,15 +252,15 @@ Built with [cobra]. Each subcommand is constructed by a method on a shared
 points the whole CLI at an alternative directory, which is how the CLI is tested
 without touching the user's real configuration.
 
-| Command | M0 state |
+| Command | State |
 |---|---|
-| `vender version` | implemented |
-| `vender import <share-link>` | implemented (`--name`, `--force`) |
-| `vender servers list` | implemented (`--links`) |
-| `vender servers rm <name>` | implemented |
-| `vender daemon` | stub — M1 |
-| `vender status` | stub — M1 |
-| `vender proxy on\|off` | stub — M1 |
+| `vender version` | implemented (M0) |
+| `vender import <share-link>` | implemented (M0) (`--name`, `--force`) |
+| `vender servers list` | implemented (M0) (`--links`) |
+| `vender servers rm <name>` | implemented (M0) |
+| `vender daemon` | implemented (M1) — foreground, one per run dir |
+| `vender status` | implemented (M1) — exit code means "usable" |
+| `vender proxy on\|off` | implemented (M1) Linux/GNOME; Windows is M4 |
 | `vender tui` | stub — M3 |
 | `vender autostart on\|off\|status` | stub — M4 |
 
@@ -245,10 +269,10 @@ A stub is a real, documented command that exits with
 exit codes stable across milestones, so scripts and the TUI can be written
 against the final command set before the implementations land.
 
-## 6. Engine contract (`internal/core`) — implemented in M1
+## 6. Engine (`internal/core`) — implemented in M1
 
-The engine is the only seam between vender and sing-box. M0 ships the interface
-and the resolved runtime input; M1 implements it.
+The engine is the only seam between vender and sing-box. M0 shipped the
+interface and the resolved runtime input; M1 implements both.
 
 ```go
 // RuntimeConfig is the fully resolved input for one engine run.
@@ -269,17 +293,100 @@ type Engine interface {
 }
 ```
 
-`core.New` currently returns `ErrNotImplemented`; M1 returns a real
-implementation. `RuntimeConfig.Validate` already enforces the invariants M1
-relies on (a run dir, a valid listen address, and a selected server whenever the
-mode is not `direct`).
+M1 adds exactly one method on the concrete type, `Pid() int`, for the daemon's
+own reporting. The interface itself is unchanged, so M3's TUI compiles against
+it as written in M0.
 
-**M1 work:** map `RuntimeConfig` to sing-box JSON (`inbounds` = one mixed
-inbound; `outbounds` = the selected server plus `direct`; `route` from
-`internal/rules`). Supervision details to settle in M1: where to put the run dir
-(`os.UserCacheDir()/vender` is the natural choice), how to detect listener
-readiness (sing-box startup log lines vs. a TCP dial probe), backoff on crash,
-and one daemon per user (a lock file or pidfile in the run dir).
+Files:
+
+| File | Role |
+|---|---|
+| `engine.go` | the frozen contract, `RuntimeConfig.Validate`, `New` |
+| `render.go` | `RuntimeConfig` → sing-box JSON (pure, golden-tested) |
+| `singbox.go` | `Engine` over a supervised child process |
+| `binary.go` | engine lookup: config → bundled → PATH |
+| `paths.go` | run dir, generated-config path, lock path, pid file |
+| `lock.go` + `lock_unix.go` / `lock_windows.go` | one daemon per run dir |
+| `process_unix.go` / `process_windows.go` | process group and signal/terminate |
+
+### 6.1 Engine lookup (`binary.go`)
+
+`ResolveBinary` searches, in order: `engine.binary` from config.yaml; a
+`sing-box` / `sing-box.exe` next to the `vender` executable; `sing-box` on
+`PATH`. The winner is returned absolute, and the failure names all three
+locations along with the `scripts/fetch-sing-box.sh` hint. The pure core,
+`resolveBinary(configured, exeDir, pathEnv)`, takes every ambient input as a
+parameter, so the resolution order is unit-tested without a sing-box on the
+machine.
+
+### 6.2 Rendering (`render.go`)
+
+`BuildConfig` is pure and deterministic, which is what makes the golden tests
+possible. It emits four top-level sections — `log`, `inbounds`, `outbounds`,
+`route` — and nothing else:
+
+- one `mixed` inbound tagged `mixed-in`, with `listen` / `listen_port` split
+  from `proxy.listen`;
+- the **proxy** outbound (`vless` with `flow` + `tls.utls` + `tls.reality`, or
+  `hysteria2` with `password` + `obfs` + `tls`), always tagged `proxy`;
+- a `direct` outbound and a `block` outbound, always present so that rules
+  written against `rules.OutDirect` / `rules.OutBlock` always have a target;
+- `route.final` = `proxy` for `rule`/`global` and `direct` for `direct`, with
+  `route.rules` fed from `internal/rules.BuiltinRules()`;
+- `engine.bind_interface`, when set, is passed through to the outbound, which
+  pins the connection to the proxy server to a specific interface on a
+  multi-homed (or TUN-hijacked) host.
+
+Two decisions are worth recording because the pinned engine forced them:
+
+- **No `sniff`.** sing-box 1.13 *removed* the legacy inbound options, so
+  emitting `"sniff": true` makes the pinned version refuse the config outright.
+  Inbound sniffing is a route action (`{"action": "sniff"}`) in the current
+  schema, and M2 adds it together with the rules that need it.
+- **Direct mode emits no proxy outbound at all.** A `mode: direct` run does not
+  reference the selected server, so an unusable server entry cannot break the
+  one mode whose whole point is to work without a proxy.
+
+### 6.3 Supervision (`singbox.go`)
+
+`Start` spawns `sing-box run -c <RunDir>/singbox.json` with the run dir as its
+working directory and its own process group, captures stdout and stderr through
+pipes, and returns only when the mixed inbound accepts a TCP connection. Logs
+are delivered to a channel that is closed after the process has exited *and*
+both pipe readers have drained, so a consumer that ranges over `Logs()`
+terminates instead of leaking a goroutine — and so `Stop` can wait on a single
+channel instead of polling. Lines are dropped rather than blocking when nobody
+is reading, so a slow consumer can never wedge the child.
+
+Failure modes are made explicit rather than left to time out:
+
+- an occupied listen port is detected *before* spawning — otherwise the
+  readiness dial would be answered by the other listener and a failed start
+  would look successful;
+- a child that dies during startup yields the child's own last output, not a
+  bare timeout, because the supervisor keeps a small ring buffer of recent
+  lines;
+- `Stop` is idempotent, signals the process group with `SIGTERM` and escalates
+  to `SIGKILL` after a grace period. On Windows there is no in-band equivalent,
+  so it terminates the process (documented in `process_windows.go`).
+
+### 6.4 One daemon per run dir (`lock.go`)
+
+The daemon holds an exclusive advisory lock on `<run dir>/vender.lock` for its
+whole lifetime (`flock` on unix, `LockFileEx` on Windows). Because both are
+released by the OS when the process dies, the lock can never go stale, which is
+why `vender status` uses the lock — not the pid file — to answer "is a daemon
+running?". The pid file exists only so status can print a pid.
+
+### 6.5 System proxy (`cmd/vender/proxy*.go`)
+
+`proxy on` writes the GNOME proxy schema (`org.gnome.system.proxy.*`) through
+`gsettings`, setting the endpoints before flipping the mode so a failure part
+way through leaves the proxy disabled rather than half-configured; `proxy off`
+restores `mode: none`. It also prints the `http_proxy` / `https_proxy` /
+`all_proxy` exports for shells that ignore the desktop settings. Nothing else is
+touched: no TUN, no daemon state. On Windows the Registry `Internet Settings`
+path lands with M4, and the command says so instead of pretending.
 
 ## 7. Routing rules (`internal/rules`) — implemented in M2
 
@@ -297,6 +404,19 @@ converts rules to sing-box `route.rules`, and adds the built-in sets: private
 IPs direct, LAN direct, China direct, ads blocked. `BuiltinRules` returns `nil`
 until then, which callers must read as "no routing rules configured" (route
 everything through the proxy), not as "match nothing".
+
+M1 already ships the converter in `core.render.go` (`buildRules`,
+`outboundTag`) and always emits the `direct` and `block` outbounds it targets,
+so M2 is a change to `internal/rules` alone. Two things M2 must handle:
+
+- rules whose `DNSOnly` flag is set are **skipped** by the converter, because
+  sing-box expresses DNS policy as route *actions* (`{"action":"sniff"}`,
+  `{"action":"hijack-dns"}`) plus `dns` rules rather than as destination
+  matches;
+- `Ports` maps to a single `port` array; `port_range` is not produced.
+
+**M2 work:** fill `BuiltinRules`, add the matching route actions, and verify
+`proxy.mode: rule` against the pinned engine with `sing-box check`.
 
 ## 8. TUI (`internal/tui`) — implemented in M3
 
@@ -347,7 +467,7 @@ installed. All entry points return `ErrNotImplemented` until M4.
 | Milestone | Deliverable | Acceptance |
 |---|---|---|
 | **M0** | Skeleton, `internal/config` (config, servers, share links), CLI (`version`, `import`, `servers`), docs, unit tests, cross-compilation | `go build ./...`, `GOOS=windows go build ./...`, `go test ./...`, `go vet ./...` all clean; stubs print their milestone |
-| **M1** | `internal/core` engine + `vender daemon`, `status`, `proxy on\|off` | With a real server: daemon starts sing-box, `127.0.0.1:7890` proxies HTTP and SOCKS5; stopping the daemon frees the port; `status` reflects reality |
+| **M1** | `internal/core` engine + `vender daemon`, `status`, `proxy on\|off` | With a real server: daemon starts sing-box, `127.0.0.1:7897` proxies HTTP and SOCKS5; stopping the daemon frees the port; `status` reflects reality |
 | **M2** | `internal/rules` built-in rule sets wired into the generated config | `proxy.mode: rule` sends CN/private destinations direct and everything else through the proxy; `global` and `direct` behave as documented |
 | **M3** | `internal/tui` Bubble Tea client | TUI attaches to a running daemon, switches the active server and mode, tails engine logs, quits cleanly; behaves with no daemon |
 | **M4** | `internal/autostart` | `autostart on` starts the daemon after login on both platforms; `off` removes it; `status` reports it; all idempotent |
@@ -356,18 +476,31 @@ installed. All entry points return `ErrNotImplemented` until M4.
 
 ## 11. Engineering conventions
 
-- **Minimal dependencies.** M0 uses only `cobra` and `yaml.v3` plus the standard
-  library. The TUI and networking dependencies arrive with the milestone that
-  needs them.
+- **Minimal dependencies.** vender uses only `cobra` and `yaml.v3` plus the
+  standard library: no networking library (that is sing-box's job) and no TUI
+  dependency until M3. Windows-specific calls that the standard library does not
+  expose (`LockFileEx`) go through `syscall.NewLazyDLL`, which loads from
+  `System32` only.
 - **No OS-specific code.** Everything builds for `linux/amd64` and
   `windows/amd64`; platform differences are handled through standard-library
-  abstractions (`os.UserConfigDir`). Where a milestone genuinely needs
-  `syscall`-level work (autostart, control sockets), it will be split behind
-  build tags inside the relevant package, not sprinkled through the CLI.
-- **Secrets.** `servers.yaml` is `0600`; secrets never reach logs or error
-  messages; committed tests use only dummy values.
+  abstractions (`os.UserConfigDir`, `os.UserCacheDir`). Where `syscall`-level
+  work is genuinely needed, it is split behind build tags inside the relevant
+  package — `internal/core/lock_{unix,windows}.go`,
+  `internal/core/process_{unix,windows}.go`,
+  `cmd/vender/proxy_{linux,windows}.go` — and never sprinkled through the CLI.
+- **Secrets.** `servers.yaml` is `0600`; the generated `singbox.json` is `0600`
+  too, because it repeats the credentials; secrets never reach logs or error
+  messages (`Server.String` is redaction-safe); committed tests use only dummy
+  values, and the one test that exercises the system-proxy command substitutes
+  the platform implementation so `go test` cannot rewrite a developer's desktop.
 - **Tests reach the edges.** Parsers, validators and file round-trips are tested
   directly, including IPv6 hosts, percent-encoded names, every parameter alias,
-  missing/duplicate fields, and file permissions.
+  missing/duplicate fields, and file permissions. The engine is tested against a
+  fake binary — the test binary itself, re-entered through an environment
+  variable — so the lifecycle (readiness, log streaming, idempotent stop, port
+  release, restart, a child that dies, a port that never opens, an occupied
+  port) is covered without sing-box or a network. Rendering is covered by golden
+  files under `internal/core/testdata/`, refreshable with
+  `go test ./internal/core -update`.
 
 [cobra]: https://github.com/spf13/cobra

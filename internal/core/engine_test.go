@@ -1,11 +1,13 @@
 package core
 
 import (
-	"errors"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ll-lite/vender/internal/config"
+	"github.com/ll-lite/vender/internal/rules"
 )
 
 const (
@@ -14,24 +16,80 @@ const (
 	testHost = "203.0.113.10"
 )
 
-func TestNewIsNotImplementedYet(t *testing.T) {
-	eng, err := New(RuntimeConfig{RunDir: "/tmp/vender"})
-	if !errors.Is(err, ErrNotImplemented) {
-		t.Fatalf("New() error = %v, want ErrNotImplemented", err)
+// testVLESS is a complete REALITY server entry used by several tests.
+func testVLESS() *config.Server {
+	return &config.Server{
+		Name: "Test-VLESS", Type: config.TypeVLESS, Address: testHost, Port: 443,
+		UUID: testUUID, Flow: "xtls-rprx-vision", Security: config.SecurityReality,
+		SNI: "www.example.com", Fingerprint: "chrome",
+		PublicKey: "DUMMY-PUBLIC-KEY", ShortID: "0123456789abcdef",
+		Network: "tcp", HeaderType: "none",
 	}
-	if eng != nil {
-		t.Errorf("New() engine = %v, want nil until M1", eng)
+}
+
+func TestNewReturnsAUsableEngine(t *testing.T) {
+	eng, err := New(RuntimeConfig{
+		Config: *config.Default(), Server: testVLESS(),
+		BinaryPath: "/bin/sh", RunDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v, want nil", err)
 	}
-	if !strings.Contains(err.Error(), "(M1)") {
-		t.Errorf("error = %q, want it to name the milestone", err)
+	if eng == nil {
+		t.Fatal("New() = nil engine")
+	}
+	if _, ok := eng.(*engine); !ok {
+		t.Errorf("New() = %T, want *core.engine", eng)
+	}
+	if eng.Healthy() {
+		t.Error("Healthy() = true before Start")
+	}
+	if err := eng.Stop(); err != nil {
+		t.Errorf("Stop() on a never-started engine = %v, want nil", err)
+	}
+}
+
+func TestNewRejectsBadRuntimeConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		rc      RuntimeConfig
+		wantSub string
+	}{
+		{
+			name:    "no run dir",
+			rc:      RuntimeConfig{Config: *config.Default(), BinaryPath: "/bin/sh"},
+			wantSub: "RunDir",
+		},
+		{
+			name: "no binary",
+			rc: RuntimeConfig{
+				Config: *config.Default(), Server: testVLESS(), RunDir: "/tmp/vender",
+			},
+			wantSub: "BinaryPath",
+		},
+		{
+			name: "proxy mode without a server",
+			rc: RuntimeConfig{
+				Config: *config.Default(), BinaryPath: "/bin/sh", RunDir: "/tmp/vender",
+			},
+			wantSub: "no server selected",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := New(tt.rc)
+			if err == nil {
+				t.Fatal("New() = nil error, want a failure")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %q, want it to mention %q", err, tt.wantSub)
+			}
+		})
 	}
 }
 
 func TestRuntimeConfigValidate(t *testing.T) {
-	vless := config.Server{
-		Name: "n", Type: config.TypeVLESS, Address: testHost, Port: 443, UUID: testUUID,
-		Security: config.SecurityReality, SNI: "www.example.com", PublicKey: "DUMMY-PBK",
-	}
+	vless := *testVLESS()
 
 	tests := []struct {
 		name    string
@@ -103,6 +161,26 @@ func TestRuntimeConfigValidate(t *testing.T) {
 // consumes it, so a signature change here is a breaking change.
 func TestEngineInterfaceShape(t *testing.T) {
 	var _ Engine = (*fakeEngine)(nil)
+	var _ Engine = (*engine)(nil)
+}
+
+// TestEngineExposesPid pins the one method M1 added on top of the frozen
+// interface, so renaming it is a deliberate change rather than an accident.
+func TestEngineExposesPid(t *testing.T) {
+	eng, err := New(RuntimeConfig{
+		Config: *config.Default(), Server: testVLESS(),
+		BinaryPath: "/bin/sh", RunDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	pidder, ok := eng.(interface{ Pid() int })
+	if !ok {
+		t.Fatalf("%T does not expose Pid()", eng)
+	}
+	if got := pidder.Pid(); got != 0 {
+		t.Errorf("Pid() = %d before Start, want 0", got)
+	}
 }
 
 type fakeEngine struct {
@@ -114,3 +192,85 @@ func (f *fakeEngine) Start() error                       { return nil }
 func (f *fakeEngine) Stop() error                        { return nil }
 func (f *fakeEngine) Logs() <-chan string                { return make(chan string) }
 func (f *fakeEngine) Healthy() bool                      { return true }
+
+// The generated config must stay within the four top-level sections vender
+// knows how to produce; anything else means a renderer change slipped through.
+func TestBuildConfigTopLevelKeys(t *testing.T) {
+	data, err := BuildConfig(RuntimeConfig{Config: *config.Default(), Server: testVLESS(), RunDir: "/tmp"})
+	if err != nil {
+		t.Fatalf("BuildConfig: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("generated config is not JSON: %v", err)
+	}
+	want := []string{"log", "inbounds", "outbounds", "route"}
+	for _, k := range want {
+		if _, ok := raw[k]; !ok {
+			t.Errorf("generated config has no %q key", k)
+		}
+	}
+	if len(raw) != len(want) {
+		t.Errorf("generated config has %d top-level keys, want %d", len(raw), len(want))
+	}
+}
+
+func TestSplitListenRejectsGarbage(t *testing.T) {
+	if _, _, err := splitListen("127.0.0.1"); err == nil {
+		t.Error("splitListen(\"127.0.0.1\") = nil error, want a failure")
+	}
+	if _, _, err := splitListen("127.0.0.1:0"); err == nil {
+		t.Error("splitListen with port 0 = nil error, want a failure")
+	}
+	host, port, err := splitListen("127.0.0.1:7897")
+	if err != nil || host != "127.0.0.1" || port != 7897 {
+		t.Errorf("splitListen = (%q, %d, %v), want (127.0.0.1, 7897, nil)", host, port, err)
+	}
+}
+
+func TestBuildRulesIsEmptyInM1(t *testing.T) {
+	if got := rules.BuiltinRules(); got != nil {
+		t.Fatalf("BuiltinRules() = %v, want nil in M1", got)
+	}
+	r, err := buildRules()
+	if err != nil {
+		t.Fatalf("buildRules: %v", err)
+	}
+	if len(r) != 0 {
+		t.Errorf("buildRules() = %v, want no rules until M2", r)
+	}
+}
+
+func TestOutboundTag(t *testing.T) {
+	cases := []struct {
+		in   rules.Outbound
+		want string
+	}{
+		{rules.OutProxy, tagProxy},
+		{rules.OutDirect, tagDirect},
+		{rules.OutBlock, tagBlock},
+	}
+	for _, c := range cases {
+		got, err := outboundTag(c.in)
+		if err != nil {
+			t.Fatalf("outboundTag(%q): %v", c.in, err)
+		}
+		if got != c.want {
+			t.Errorf("outboundTag(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	if _, err := outboundTag("nonsense"); err == nil {
+		t.Error("outboundTag(\"nonsense\") = nil error, want a failure")
+	}
+}
+
+func TestWaitClosed(t *testing.T) {
+	ch := make(chan struct{})
+	if waitClosed(ch, 5*time.Millisecond) {
+		t.Error("waitClosed on an open channel = true")
+	}
+	close(ch)
+	if !waitClosed(ch, 5*time.Millisecond) {
+		t.Error("waitClosed on a closed channel = false")
+	}
+}

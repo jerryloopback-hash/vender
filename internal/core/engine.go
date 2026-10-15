@@ -1,12 +1,17 @@
-// Package core will own the proxy engine: generating a sing-box configuration
-// from vender's own config and managing the sing-box child process.
+// Package core owns the proxy engine: it renders vender's own configuration
+// into sing-box's JSON schema and supervises the sing-box child process.
 //
-// M0 ships only the contract below (the interface, the resolved runtime
-// configuration, and an error-returning constructor), so that the CLI, the TUI
-// (M3) and the rule engine (M2) can be written against a stable API. M1 fills
-// in the implementation: write <rundir>/singbox.json, spawn `sing-box run -c
-// <path>`, stream its stderr into Logs, and treat a healthy process whose
-// first log lines report listeners bound as Healthy.
+// The package split is deliberate. render.go is pure and deterministic (which
+// is what makes it golden-testable), binary.go knows only where an engine
+// binary may live, and singbox.go owns the process lifecycle. The only
+// OS-specific code is the lock and the child process group, each behind a build
+// tag in this package, so everything above core stays platform-free.
+//
+// M1 implemented the contract M0 froze: WriteConfig writes
+// <RunDir>/singbox.json atomically, Start spawns `sing-box run -c <path>` and
+// returns once the mixed inbound accepts TCP connections, and Logs streams the
+// child's output until it exits (closing the channel then, so consumers do not
+// leak).
 package core
 
 import (
@@ -15,9 +20,6 @@ import (
 
 	"github.com/ll-lite/vender/internal/config"
 )
-
-// ErrNotImplemented is returned by every entry point until M1 lands.
-var ErrNotImplemented = errors.New("core: engine management is not implemented in this milestone (M1)")
 
 // ConfigFileName is the generated sing-box configuration inside the run dir.
 const ConfigFileName = "singbox.json"
@@ -60,7 +62,7 @@ func (rc RuntimeConfig) Validate() error {
 }
 
 // Engine is the single seam between vender and its proxy engine. M1 implements
-// it over a managed sing-box subprocess; tests in M1 will use a fake.
+// it over a managed sing-box subprocess.
 type Engine interface {
 	// WriteConfig renders rc into the engine's own configuration file
 	// (<RunDir>/singbox.json) and writes it atomically.
@@ -77,9 +79,15 @@ type Engine interface {
 	Healthy() bool
 }
 
-// New returns the M1 engine implementation. Until then it fails loudly rather
-// than returning a half-working engine.
+// New returns the M1 engine: an implementation that renders sing-box JSON and
+// supervises a sing-box child process. The returned engine is stopped; call
+// WriteConfig, then Start.
 func New(rc RuntimeConfig) (Engine, error) {
-	_ = rc
-	return nil, ErrNotImplemented
+	if err := rc.Validate(); err != nil {
+		return nil, err
+	}
+	if rc.BinaryPath == "" {
+		return nil, errors.New("core: RuntimeConfig.BinaryPath is empty (resolve it with core.ResolveBinary)")
+	}
+	return newEngine(rc), nil
 }

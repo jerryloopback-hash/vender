@@ -27,7 +27,12 @@ const (
 )
 
 // DefaultListen is the local mixed SOCKS5+HTTP inbound address.
-const DefaultListen = "127.0.0.1:7890"
+//
+// 7890 is deliberately avoided: it is the conventional port of a system-wide
+// mihomo/clash instance, and colliding with one would make vender fail to bind
+// on a host that already runs a proxy. 7897 is the clash "mixed" companion
+// port, which such a host leaves free.
+const DefaultListen = "127.0.0.1:7897"
 
 // ProxyMode selects how traffic is routed by the engine.
 type ProxyMode string
@@ -67,6 +72,13 @@ type EngineConfig struct {
 	// Binary is the path to the sing-box executable. Empty means "use the
 	// bundled binary next to the vender executable, else look up PATH".
 	Binary string `yaml:"binary"`
+	// BindInterface pins outgoing connections of the proxy outbound to a
+	// network interface by name (e.g. "eth0"). It is empty by default, which
+	// lets the kernel choose. It exists for multi-homed hosts: a TUN/vpn
+	// interface with a higher route metric would otherwise swallow the
+	// connection to the server. Rendered as sing-box's outbound
+	// "bind_interface".
+	BindInterface string `yaml:"bind_interface"`
 }
 
 // Config is the global vender configuration (config.yaml).
@@ -109,6 +121,7 @@ func (c *Config) Normalize() {
 	c.Proxy.Listen = strings.TrimSpace(c.Proxy.Listen)
 	c.Proxy.Mode = ProxyMode(strings.ToLower(strings.TrimSpace(string(c.Proxy.Mode))))
 	c.Engine.Binary = strings.TrimSpace(c.Engine.Binary)
+	c.Engine.BindInterface = strings.TrimSpace(c.Engine.BindInterface)
 	c.SelectedServer = strings.TrimSpace(c.SelectedServer)
 }
 
@@ -128,6 +141,10 @@ func (c *Config) Validate() error {
 
 	if err := validateListen(c.Proxy.Listen); err != nil {
 		problems = append(problems, "proxy.listen: "+err.Error())
+	}
+
+	if strings.ContainsAny(c.Engine.BindInterface, " \t/") {
+		problems = append(problems, fmt.Sprintf("engine.bind_interface %q must be an interface name without spaces or slashes", c.Engine.BindInterface))
 	}
 
 	if len(problems) > 0 {

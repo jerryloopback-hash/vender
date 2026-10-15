@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ll-lite/vender/internal/config"
+	"github.com/ll-lite/vender/internal/core"
 )
 
 const appName = "vender"
@@ -17,8 +18,25 @@ type app struct {
 	// configDir overrides the platform config directory when non-empty
 	// (set by --config-dir).
 	configDir string
+	// runDir overrides the platform runtime directory when non-empty
+	// (set by --run-dir). It is where singbox.json, the lock and the pid file
+	// live.
+	runDir string
 	// store caches the resolved store.
 	store *config.Store
+}
+
+// runDirPath returns the runtime directory: --run-dir when given, otherwise
+// the platform default (os.UserCacheDir()/vender).
+func (a *app) runDirPath() (string, error) {
+	if a.runDir == "" {
+		return core.DefaultRunDir()
+	}
+	abs, err := filepath.Abs(a.runDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve --run-dir: %w", err)
+	}
+	return abs, nil
 }
 
 // configStore returns the configuration store for this invocation.
@@ -52,7 +70,7 @@ func newRootCmd() *cobra.Command {
 		Long: `vender is a lightweight, cross-platform personal proxy client.
 
 It runs sing-box as a managed child process and exposes a local mixed
-SOCKS5+HTTP inbound (default 127.0.0.1:7890) that applications can use. Two
+SOCKS5+HTTP inbound (default 127.0.0.1:7897) that applications can use. Two
 outbound protocols are supported: VLESS + Vision + REALITY (TCP) and
 Hysteria2 (UDP).
 
@@ -63,7 +81,13 @@ to it. Configuration lives in the platform user config directory:
   Windows  %AppData%\vender\
 
   config.yaml    global settings
-  servers.yaml   server list (contains credentials, mode 0600)`,
+  servers.yaml   server list (contains credentials, mode 0600)
+
+Runtime state (the generated sing-box config, the lock and the pid file) lives
+in the platform cache directory instead:
+
+  Linux    ~/.cache/vender/      (or $XDG_CACHE_HOME/vender)
+  Windows  %LocalAppData%\vender\`,
 		// Errors are self-explanatory; printing the full usage after each one
 		// buries them.
 		SilenceUsage: true,
@@ -71,6 +95,8 @@ to it. Configuration lives in the platform user config directory:
 
 	root.PersistentFlags().StringVar(&a.configDir, "config-dir", "",
 		"use this directory instead of the platform config directory")
+	root.PersistentFlags().StringVar(&a.runDir, "run-dir", "",
+		"use this directory instead of the platform runtime directory")
 
 	root.AddCommand(
 		a.newVersionCmd(),

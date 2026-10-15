@@ -29,13 +29,23 @@ const (
 
 // runCLI executes the root command with args and returns everything it wrote
 // plus the error.
+//
+// Every invocation gets a throwaway --run-dir: the daemon and status commands
+// would otherwise consult (and the daemon would write to) the real
+// os.UserCacheDir()/vender of whoever runs the tests.
 func runCLI(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	return runCLIIn(t, t.TempDir(), args...)
+}
+
+// runCLIIn is runCLI with an explicit run directory.
+func runCLIIn(t *testing.T, runDir string, args ...string) (string, error) {
 	t.Helper()
 	var buf bytes.Buffer
 	cmd := newRootCmd()
 	cmd.SetOut(&buf)
 	cmd.SetErr(&buf)
-	cmd.SetArgs(args)
+	cmd.SetArgs(append([]string{"--run-dir", runDir}, args...))
 	err := cmd.Execute()
 	return buf.String(), err
 }
@@ -64,10 +74,6 @@ func TestCLIMilestoneStubs(t *testing.T) {
 		args      []string
 		milestone string
 	}{
-		{args: []string{"daemon"}, milestone: "M1"},
-		{args: []string{"status"}, milestone: "M1"},
-		{args: []string{"proxy", "on"}, milestone: "M1"},
-		{args: []string{"proxy", "off"}, milestone: "M1"},
 		{args: []string{"tui"}, milestone: "M3"},
 		{args: []string{"autostart", "on"}, milestone: "M4"},
 		{args: []string{"autostart", "off"}, milestone: "M4"},
@@ -87,6 +93,21 @@ func TestCLIMilestoneStubs(t *testing.T) {
 				t.Errorf("error = %q, want it to name %s", err, tt.milestone)
 			}
 		})
+	}
+}
+
+// On Windows the system proxy is explicitly deferred to M4, so the same
+// assertion holds there but not on Linux (where it is implemented).
+func TestCLIProxyUnsupportedPlatformIsAMilestoneError(t *testing.T) {
+	if systemProxySupported() {
+		t.Skip("the system proxy is implemented on this platform")
+	}
+	out, err := runCLI(t, "proxy", "on", "--config-dir", t.TempDir())
+	if err == nil {
+		t.Fatalf("proxy on = nil error, want a milestone error (output: %q)", out)
+	}
+	if !strings.Contains(err.Error(), "not implemented") || !strings.Contains(err.Error(), "(M4)") {
+		t.Errorf("error = %q, want it to name the M4 milestone", err)
 	}
 }
 

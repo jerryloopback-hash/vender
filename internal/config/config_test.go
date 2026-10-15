@@ -16,10 +16,11 @@ import (
 // know what is configurable.
 const documentedConfigYAML = `log_level: info
 proxy:
-    listen: 127.0.0.1:7890
+    listen: 127.0.0.1:7897
     mode: rule
 engine:
     binary: ""
+    bind_interface: ""
 selected_server: ""
 `
 

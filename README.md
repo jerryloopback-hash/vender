@@ -4,7 +4,7 @@ A lightweight, cross-platform personal proxy client for **Linux** and **Windows 
 
 `vender` is a thin, friendly control layer around [sing-box](https://sing-box.sagernet.org/),
 which it runs as a managed child process. It exposes a local mixed
-**SOCKS5 + HTTP** inbound (default `127.0.0.1:7890`) that any application can use.
+**SOCKS5 + HTTP** inbound (default `127.0.0.1:7897`) that any application can use.
 There is **no TUN mode** — nothing is routed system-wide, so the proxy is opt-in
 per application and easy to reason about.
 
@@ -15,22 +15,27 @@ Two outbound protocols are supported:
 | `vless` | TCP | VLESS + Vision + REALITY (also plain `tls` / `none`) |
 | `hysteria2` | UDP | Hysteria2, optionally with `salamander` obfuscation |
 
+The pinned engine is **sing-box 1.14.3** (see `scripts/fetch-sing-box.sh`).
+
 ## Status
 
-`vender` is at **M0**: the CLI surface, configuration layer and share-link
-parser are complete and tested. The proxy engine itself arrives in M1 — see
-the roadmap below. Commands that belong to a later milestone are present but
-exit with an explicit `not implemented in this milestone (Mx)` message.
+`vender` is at **M1**: the configuration layer and share-link parser (M0) are
+complete, and the engine is real — `vender daemon` renders a sing-box
+configuration, supervises the sing-box child process and serves the local
+inbound; `vender status` reports the daemon; `vender proxy on|off` points the
+desktop's system proxy at it. Commands that belong to a later milestone are
+present but exit with an explicit `not implemented in this milestone (Mx)`
+message.
 
 ## Roadmap
 
 | Milestone | Contents |
 |---|---|
-| **M0** | Module skeleton, config load/save, share-link parsing, `version` / `import` / `servers` CLI, docs |
-| M1 | Engine: generate the sing-box config, supervise the child process, `daemon`, `status`, `proxy on\|off` |
+| M0 | Module skeleton, config load/save, share-link parsing, `version` / `import` / `servers` CLI, docs |
+| **M1** | Engine: generate the sing-box config, supervise the child process, `daemon`, `status`, `proxy on\|off` |
 | M2 | Built-in routing rules (CN direct, ad block, private IPs) and `proxy.mode: rule` |
 | M3 | Bubble Tea animated TUI that attaches to the running daemon |
-| M4 | Autostart (systemd user unit / XDG autostart on Linux; Registry Run key / Task Scheduler on Windows) |
+| M4 | Autostart (systemd user unit / XDG autostart on Linux; Registry Run key / Task Scheduler on Windows), Windows system-proxy control |
 | M5 | Subscription links and bulk import, server latency testing |
 | M6 | Hardening & release: health-based failover, log rotation, signed builds |
 
@@ -57,6 +62,35 @@ GOOS=windows GOARCH=amd64 go build -o vender.exe ./cmd/vender
 `scripts/build.sh` builds both targets into `dist/` with version metadata
 injected via `-ldflags`.
 
+## Installing sing-box
+
+`vender` does not embed the proxy engine; it runs a sing-box binary it finds at
+runtime. Fetch the pinned release:
+
+```sh
+scripts/fetch-sing-box.sh            # linux/amd64 + windows/amd64
+scripts/fetch-sing-box.sh linux-amd64
+scripts/fetch-sing-box.sh --print-config   # show the engine.binary line to use
+```
+
+The version and the SHA-256 of both archives are pinned inside the script, so
+the download is reproducible and a substituted upstream release is rejected.
+The result lands (git-ignored) in:
+
+```
+dist/sing-box/linux-amd64/sing-box
+dist/sing-box/windows-amd64/sing-box.exe
+```
+
+`vender` looks for the engine in this order:
+
+1. `engine.binary` in `config.yaml`;
+2. a `sing-box` (`sing-box.exe` on Windows) **next to the vender executable** —
+   copy the fetched files there for a self-contained install;
+3. `sing-box` on `PATH`.
+
+If none is found, the error names all three locations.
+
 ## Usage
 
 ```sh
@@ -68,13 +102,34 @@ injected via `-ldflags`.
 ./vender servers list --links  # print the share link of every server (contains secrets)
 ./vender servers rm My-Node    # remove a server by name
 ./vender version               # build information
+
+./vender daemon                # run the proxy (foreground; Ctrl-C to stop)
+./vender status                # is it running, and is the port accepting? (exit code!)
+./vender proxy on              # also point the desktop's system proxy at vender
+./vender proxy off             # restore the system proxy
 ```
+
+Every command accepts `--config-dir <path>` (configuration) and `--run-dir
+<path>` (runtime state) to point at alternative locations, which is also how
+the test suite stays away from your real setup.
 
 The first server imported also becomes the active one; removing the active
 server clears the selection.
 
-Any command accepts `--config-dir <path>` to point at an alternative
-configuration directory (useful for testing and for portable installs).
+### Behind an existing VPN or TUN
+
+If a VPN/TUN interface has a higher route metric than your physical link, the
+connection to the proxy server is swallowed by it and the handshake fails with
+something like `REALITY authentication failed` or `received real certificate`.
+Pin the outbound to the real interface:
+
+```yaml
+engine:
+    bind_interface: wlp0s20f3      # from `ip -brief addr`
+```
+
+`bind_interface` is passed straight through to sing-box and only affects the
+connection to the proxy server, not the local inbound.
 
 ## Configuration
 
@@ -85,17 +140,27 @@ Configuration lives in the platform user config directory:
 | Linux | `~/.config/vender/` (or `$XDG_CONFIG_HOME/vender`) |
 | Windows | `%AppData%\vender\` |
 
-Two files live there:
+Runtime state — the generated `singbox.json`, the daemon lock and its pid file —
+lives in the platform **cache** directory instead, so nothing writes into your
+editable configuration:
+
+| Platform | Location |
+|---|---|
+| Linux | `~/.cache/vender/` (or `$XDG_CACHE_HOME/vender`) |
+| Windows | `%LocalAppData%\vender\` |
+
+Two files live in the config directory:
 
 - `config.yaml` — global settings (world-readable, no secrets):
 
   ```yaml
   log_level: info
   proxy:
-      listen: 127.0.0.1:7890
+      listen: 127.0.0.1:7897
       mode: rule          # rule | global | direct
   engine:
-      binary: ""
+      binary: ""          # empty => next to vender, else PATH
+      bind_interface: ""  # e.g. eth0 on a multi-homed host
   selected_server: ""
   ```
 
@@ -122,6 +187,26 @@ Two files live there:
 
 Hand-edited files are validated on load, and problems are reported all at once
 with the field that is wrong.
+
+## What the daemon does
+
+`vender daemon` is the single source of truth. For one run it:
+
+1. reads `config.yaml` + `servers.yaml` and validates the selected server;
+2. takes an advisory lock on `<run dir>/vender.lock` — a second daemon on the
+   same run dir fails immediately, and the lock is released by the OS even if
+   the daemon is killed, so it can never go stale;
+3. renders `singbox.json` **atomically** (`0600`, since it holds credentials)
+   with one `mixed` inbound, the selected outbound, a `direct` outbound and a
+   `block` outbound;
+4. starts `sing-box run -c <run dir>/singbox.json` in its own process group and
+   returns only once the inbound port actually accepts TCP connections;
+5. streams sing-box's output to its own standard output, prefixed `sing-box:`;
+6. on `SIGINT`/`SIGTERM`, stops sing-box gracefully (`SIGTERM`, then `SIGKILL`
+   after a grace period), removes the pid file and releases the lock.
+
+`vender status` reads the same lock, so its exit code means exactly "the proxy
+is up" and is safe to use in scripts or a health check.
 
 ## License
 
