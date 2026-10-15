@@ -1,0 +1,28 @@
+# Build output
+/vender
+/vender.exe
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go workspace / tooling
+go.work
+go.work.sum
+.idea/
+.vscode/
+*.swp
+
+# Local runtime state (never committed)
+# The real config lives outside the repo under os.UserConfigDir(), e.g.
+# ~/.config/vender/ on Linux. These patterns only catch copies made inside
+# the working tree during manual testing.
+/vender-data/
+/local/
+*.local.yaml
+config.local.yaml
+servers.local.yaml
+
+# Secrets must never be committed. servers.yaml holds credentials.
+servers.yaml
