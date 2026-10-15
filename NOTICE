@@ -1,0 +1,48 @@
+vender
+Copyright (C) 2026 the vender contributors
+
+vender is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+vender is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+The full text of the GNU General Public License version 3 is in the LICENSE
+file next to this notice.
+
+--------------------------------------------------------------------------------
+Bundled third-party software
+--------------------------------------------------------------------------------
+
+The vender release archives contain the sing-box binary, which vender runs as a
+managed child process:
+
+    sing-box  (https://github.com/SagerNet/sing-box)
+    Copyright (C) 2022 nekohasekai <contact-sagernet@sekai.icu>
+
+    Licensed under the GNU General Public License, version 3 or (at your
+    option) any later version, with one additional term from the upstream
+    project:
+        "In addition, no derivative work may use the name or imply association
+         with this application without prior consent."
+
+sing-box is not a library vender links against; it is a separate program that
+vender executes. It is bundled with vender in the same archive for the
+convenience of a self-contained install. Because both programs are under the
+GPL, the combined archive is distributed under the GPL as well, and the
+obligations of the GPL apply to the whole:
+
+  * sing-box's own licence text is included in the archive as
+    LICENSE.sing-box;
+  * the corresponding source for sing-box is the upstream repository at the
+    pinned tag (see the version line below), available at
+    https://github.com/SagerNet/sing-box/tree/v<version>;
+  * the corresponding source for vender is its own repository, and the
+    LICENSE file in the archive covers it.
+
+Nothing in this archive is a proprietary add-on to a GPL program.
+
+Pinned sing-box version: 1.14.3

@@ -21,6 +21,9 @@
 #   * set engine.binary in config.yaml, e.g.
 #         engine:
 #             binary: /absolute/path/to/dist/sing-box/linux-amd64/sing-box
+#
+# scripts/install.sh and scripts/package.sh call this script when the pinned
+# sing-box is missing, so a release archive or an install needs no manual step.
 set -euo pipefail
 
 # --- pinned release ---------------------------------------------------------

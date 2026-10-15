@@ -1,4 +1,4 @@
- Dashboard   Nodes       Logs        Settings                                             vender M3
+ Dashboard   Nodes       Logs        Settings                                             vender M4
 ╭─ routing mode ───────────────────────────────────────────────────────────────────────────────────╮
 │ ▸ (●) rule   active  built-in policy: CN and private destinations direct, ads blocked, the rest… │
 │   ( ) global         every connection through the selected server                                │
@@ -21,7 +21,8 @@
 │ source   MetaCubeX/meta-rules-dat @ d1c433471f (2026-10-15)                                      │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ autostart ──────────────────────────────────────────────────────────────────────────────────────╮
-│ start at login  not implemented in this milestone (M4)      system proxy  `vender proxy on|off`… │
+│ start at login  checking…                                                                        │
+│ system proxy    `vender proxy on|off` points the desktop at the local inbound                    │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
  ● daemon pid 4821  attached to the daemon at 127.0.0.1:41234
- ←/→ mode • enter apply • tab screens • ? help
+ ←/→ mode • enter apply • a start at login • tab screens • ? help

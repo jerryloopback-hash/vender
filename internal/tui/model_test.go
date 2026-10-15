@@ -11,6 +11,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/ll-lite/vender/internal/autostart"
 	"github.com/ll-lite/vender/internal/config"
 	"github.com/ll-lite/vender/internal/control"
 )
@@ -182,8 +183,68 @@ func TestViewSettings(t *testing.T) {
 		"built-in routing policy",
 		"private-dest-direct", "ads-block", "cn-direct",
 		"final", "dns", "embedded,",
-		"(M4)",
+		"start at login", "checking",
 	})
+}
+
+// The autostart panel is built from state the TUI reads itself, so it is
+// complete with no daemon running and shows the concrete artifact.
+func TestSettingsShowsTheAutostartState(t *testing.T) {
+	m := detachedModel(t)
+	m = m.switchScreen(screenSettings)
+	m.autostartKnown = true
+	m.startAtLogin = autostart.State{
+		Enabled:   true,
+		Mechanism: autostart.MechanismSystemdUser,
+		Target:    "/home/test/.config/systemd/user/vender.service",
+		Detail:    "lingering: on",
+	}
+	view := m.View()
+	for _, want := range []string{"enabled", "systemd-user", "/home/test/.config/systemd/user/vender.service", "press a to disable"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("settings does not show %q:\n%s", want, view)
+		}
+	}
+}
+
+// `a` on the Settings screen toggles start-at-login through a command (so the
+// file/registry I/O never blocks the UI) and marks the screen busy while it
+// runs. The command itself is not executed here: it would write to the host.
+func TestSettingsToggleAutostartIsACommand(t *testing.T) {
+	m := newTestModel(t)
+	m = m.switchScreen(screenSettings)
+
+	next, cmd := m.handleSettingsKey("a")
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("a did not issue an autostart command")
+	}
+	if !strings.Contains(m.busy, "autostart") {
+		t.Errorf("busy = %q", m.busy)
+	}
+}
+
+// An autostart reply updates the panel and reports the result.
+func TestAutostartReplyUpdatesTheModel(t *testing.T) {
+	m := newTestModel(t)
+	m = m.switchScreen(screenSettings)
+	next, _ := m.Update(autostartMsg{
+		state: autostart.State{Enabled: true, Mechanism: autostart.MechanismSystemdUser},
+		note:  "autostart on",
+	})
+	m = next.(Model)
+	if !m.autostartKnown || !m.startAtLogin.Enabled {
+		t.Errorf("state after a reply = %+v", m.startAtLogin)
+	}
+	if !strings.Contains(m.toast, "enabled") {
+		t.Errorf("toast = %q", m.toast)
+	}
+
+	next, _ = m.Update(autostartMsg{err: errors.New("no polkit")})
+	m = next.(Model)
+	if m.autostartErr == "" {
+		t.Error("a failed probe was not recorded")
+	}
 }
 
 func TestViewSettingsWithoutADaemonStillShowsPolicyAndDaemonDown(t *testing.T) {

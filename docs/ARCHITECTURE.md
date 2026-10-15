@@ -83,7 +83,8 @@ suite from touching a real installation.
 ## 3. Packages
 
 ```
-cmd/vender/            CLI (cobra): version, import, servers, rules, daemon, status, proxy, tui
+cmd/vender/            CLI (cobra): version, import, servers, rules, daemon, status,
+                       proxy, autostart, tui
 internal/config/       config.yaml + servers.yaml + share-link parsing  [M0]
 internal/core/         engine contract + sing-box rendering + supervision [M1]
                        + the Clash API client used for traffic and latency  [M3]
@@ -93,7 +94,8 @@ internal/control/      daemon control channel: protocol, server, client,
 internal/tui/          Bubble Tea TUI (a control-channel client)         [M3]
 internal/autostart/    start-at-login registration                       [M4]
 docs/                  this document
-scripts/               build + fetch helpers (fetch-rules.sh, fetch-sing-box.sh)
+scripts/               build + release helpers (build.sh, package.sh,
+                       install.sh, fetch-rules.sh, fetch-sing-box.sh)
 ```
 
 Dependency direction is strictly downward:
@@ -113,7 +115,9 @@ internal/control -> internal/core
 internal/tui   ->  internal/control
                ->  internal/config
                ->  internal/rules
-internal/autostart -> (standalone)
+               ->  internal/autostart  (M4: the Settings screen registers it)
+internal/autostart -> (standalone; it reads $HOME/$XDG_CONFIG_HOME and runs
+                   systemctl/loginctl or schtasks/reg, and nothing else)
 ```
 
 No package imports `cmd/`. `internal/config` has no dependency on OS-specific
@@ -281,9 +285,9 @@ without touching the user's real configuration.
 | `vender rules list` | implemented (M2) — the ordered policy, DNS split and embedded sets |
 | `vender daemon` | implemented (M1) — foreground, one per run dir |
 | `vender status` | implemented (M1) — exit code means "usable" |
-| `vender proxy on\|off` | implemented (M1) Linux/GNOME; Windows is M4 |
+| `vender proxy on\|off` | implemented (M1 Linux/GNOME, M4 Windows/WinINET) |
 | `vender tui` | implemented (M3) — the TUI; prints a snapshot when not a terminal |
-| `vender autostart on\|off\|status` | stub — M4 |
+| `vender autostart on\|off\|status` | implemented (M4) — `status` exits non-zero when disabled, `--json` is machine-readable |
 
 A stub is a real, documented command that exits with
 `<name>: not implemented in this milestone (Mx)`. This keeps the CLI surface and
@@ -434,8 +438,25 @@ running?". The pid file exists only so status can print a pid.
 way through leaves the proxy disabled rather than half-configured; `proxy off`
 restores `mode: none`. It also prints the `http_proxy` / `https_proxy` /
 `all_proxy` exports for shells that ignore the desktop settings. Nothing else is
-touched: no TUN, no daemon state. On Windows the Registry `Internet Settings`
-path lands with M4, and the command says so instead of pretending.
+touched: no TUN, no daemon state.
+
+Windows (M4) writes the per-user WinINET settings — `ProxyEnable`,
+`ProxyServer` (`http=host:port;https=...;socks=...`) and `ProxyOverride` under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` — and then
+notifies WinINET with `InternetSetOption(INTERNET_OPTION_SETTINGS_CHANGED)`
+followed by `INTERNET_OPTION_REFRESH`. Without the notification a running
+browser keeps the old configuration, which is the usual reason a registry-only
+implementation "does not work". `off` clears only `ProxyEnable`, leaving
+whatever was in `ProxyServer` behind the switch, exactly as the Linux side
+leaves the endpoints behind `mode: none`.
+
+The registry is reached through `advapi32.dll` loaded with
+`syscall.NewLazyDLL` (System32 only), and the WinINET DLL the same way — no new
+dependency, matching `internal/core`'s use of `LockFileEx`. WinHTTP has its own
+configuration (`netsh winhttp import proxy source=ie`) which a browser does not
+use, so vender does not touch it. The ordering, the value rendering and the
+no-partial-write guarantee live in `cmd/vender/winproxy.go`, which carries no
+build tag and is unit-tested with a fake registry on any platform.
 
 ## 7. Routing rules (`internal/rules`) — implemented in M2
 
@@ -701,7 +722,7 @@ type Options struct {
 | `1` | **Dashboard** | daemon and engine state, selected server, mode, uptime, latency badge, and an animated up/down traffic graph with a load gauge, human-readable rates and session totals |
 | `2` | **Nodes** | table of configured servers (name, type, protocol, endpoint, latency); `enter` selects and lets the daemon restart the engine, `t` measures latency, `r` reloads from disk |
 | `3` | **Logs** | the engine's own output as streamed by the daemon, in a scrolling viewport with follow mode (`f`) and a substring filter (`/`) |
-| `4` | **Settings** | the routing mode (rule/global/direct), the listener and engine paths, the **active built-in routing policy** rendered from `internal/rules`, and clearly-marked `M4` placeholders for autostart |
+| `4` | **Settings** | the routing mode (rule/global/direct), the listener and engine paths, the **active built-in routing policy** rendered from `internal/rules`, and the **start-at-login registration** with `a` to toggle it |
 
 Global keys: `tab`/`shift+tab` (next/previous screen), `?` (help overlay), `q`
 (or Ctrl-C) to quit. On the Dashboard: `t` latency, `s`/`x`/`R` start/stop/
@@ -757,38 +778,124 @@ build tags in either package.
 ```go
 func Enable() error              // idempotent
 func Disable() error             // idempotent
-func Status() (State, error)
+func Status() (State, error)     // never fails merely because nothing is registered
+
+type State struct {
+    Enabled   bool      // is vender registered to start at login?
+    Mechanism Mechanism // systemd-user | xdg-autostart | windows-task | windows-run-key
+    Target    string    // the concrete artifact: unit path, desktop file, task name, registry value
+    Detail    string    // why this mechanism, whether lingering is on, what could not be arranged
+}
 ```
 
-Per platform:
+The whole entry is a one-line problem: **run `vender daemon` at login**. The
+daemon is headless, so nothing here needs a console or a TTY; it takes a
+per-run-dir lock, so a login that races a manual start is harmless; it exits on
+`SIGTERM`, which is what `systemctl --user stop` sends; and its control channel
+is loopback TCP, so a client started in a later session still reaches it. `State`
+carries the concrete artifact rather than a boolean, so `vender autostart status`
+(and the TUI Settings panel) can say exactly what is installed.
 
-- **Linux** — a `systemd --user` unit (`vender.service`, `WantedBy=default.target`)
-  when systemd is available; otherwise an XDG autostart desktop entry at
-  `$XDG_CONFIG_HOME/autostart/vender.desktop`.
-- **Windows** — the per-user Registry Run key
-  (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`), or a Task Scheduler
-  entry when an elevated/triggered start is wanted.
+### 10.1 Linux
 
-`State` reports the mechanism and the concrete artifact (unit path, desktop file,
-registry value), so `vender autostart status` can explain exactly what is
-installed. All entry points return `ErrNotImplemented` until M4.
+| | |
+|---|---|
+| Primary | `~/.config/systemd/user/vender.service` (`$XDG_CONFIG_HOME` honoured), `ExecStart=<abs vender> daemon`, `Restart=on-failure`, `RestartSec=3`, `WantedBy=default.target`; then `systemctl --user daemon-reload` and `enable --now` |
+| Fallback | `$XDG_CONFIG_HOME/autostart/vender.desktop` when no systemd *user manager* answers |
+| Boot without login | `loginctl enable-linger <user>`, best-effort; `Status.Detail` reports whether lingering is on |
+| Removal | `systemctl --user disable --now`, then the unit file; the desktop entry too, so a machine that switched mechanisms cannot end up with both |
 
-**What M4 inherits from M3.** The autostart entry only has to run `vender
-daemon`; everything else already exists. Three things about it are deliberate:
+systemd availability is *probed*, not assumed: `systemctl` must exist and
+`systemctl --user is-system-running` must answer. A manager that is up but
+`degraded` still accepts units, so it counts as available; a bus-connection
+failure does not, and the XDG entry is used instead. The XDG entry assumes a
+desktop session that reads `$XDG_CONFIG_HOME/autostart` (GNOME, KDE, XFCE all
+do); it cannot start anything without a graphical login, which is why it is the
+fallback rather than the primary.
 
-- the daemon needs **no console**. It writes its log to stdout, which a
-  `systemd --user` unit captures and a detached Windows process discards, and
-  it never reads stdin. Its control channel is loopback TCP rather than a
-  console- or session-bound object, so a client started from any later login
-  session can reach the daemon that autostart started;
-- it takes a **fresh token on every start**, so a control endpoint left over
-  from a previous boot cannot be used by anything;
-- it exits cleanly on `SIGTERM`, which is what `systemctl --user stop` sends. On
-  Windows the service wrapper will have to send the equivalent termination (or
-  run the daemon as a console application under Task Scheduler), and the
-  `process_windows.go` seam is where that lands.
+Lingering is what turns "at login" into "at boot". Without it the user manager
+is torn down when the last session ends. It needs polkit, so `enable` treats a
+refusal as a note in `Detail` rather than a failure — the unit is still correct.
 
-## 11. Milestone plan
+### 10.2 Windows
+
+| | |
+|---|---|
+| Primary | a Task Scheduler **logon task** at `\vender\daemon`, registered from an XML definition with `schtasks /Create /XML`: `LogonTrigger`, `InteractiveToken`, `RunLevel=LeastPrivilege`, `Hidden=true`, no execution time limit |
+| Fallback | the per-user Registry Run key `HKCU\...\CurrentVersion\Run`, value `vender` = `"<abs vender.exe>" daemon` |
+| Removal | both: `schtasks /Delete`, `reg delete`; a "not found" result is success |
+
+Neither path needs administrator rights. The task is preferred because it can be
+registered hidden and with the least privilege, and because a scheduled task is
+not silently disabled by the per-application "startup apps" toggle the way a Run
+value can be. The task definition is *staged as a UTF-16LE file* because
+`schtasks /Create /XML` requires that encoding.
+
+**Limitations, stated plainly.** None of this can be executed on the Linux host
+vender is developed on: it is compile-checked with `GOOS=windows go build ./...`
+and every decision that can be made outside Windows is unit-tested (the XML, the
+argument vectors, UTF-16 encoding, and the parsing of `reg query` /
+`schtasks /Query` output, including the UTF-16LE that both tools write to a
+pipe). Furthermore, Task Scheduler's `Hidden` setting hides the task from the
+library view and suppresses the default window in the common case, but it does
+not guarantee that a **console-subsystem** executable shows no console at all; a
+fully windowless start needs a GUI-subsystem build or a `conhost --headless`
+launcher. That is deliberately left to M6 (signed Windows binaries) rather than
+half-done here. The daemon itself works with or without a console.
+
+The XML/argument construction and the output parsing are in `windows.go`, which
+**carries no build tag** — it is pure string work plus an injectable runner — so
+those tests run on Linux too; `autostart_windows.go` is a three-line wrapper over
+the real `schtasks`/`reg`.
+
+### 10.3 What the CLI and the TUI do
+
+`vender autostart on|off|status` is a thin shell over the three entry points;
+`status` exits non-zero when nothing is registered (the same contract as
+`vender status`) and `--json` prints the `State`. The TUI Settings screen reads
+the same `Status` and toggles with `a`; because the registration belongs to the
+user and not to the daemon, the TUI calls it **directly** rather than over the
+control channel — which is what lets a user enable start-at-login while no
+daemon is running, the situation in which the idea usually occurs. The call goes
+through a `tea.Cmd`, so neither the file I/O nor `systemctl` can block the UI,
+and `View` stays a pure function of the model.
+
+Both implementations are driven in tests through injected seams (an isolated
+`HOME`/`XDG_CONFIG_HOME` and a stub `systemctl`/`loginctl` on Linux; a fake
+runner on Windows), so `go test` cannot register a real unit or rewrite a real
+registry.
+
+## 11. Release packaging (M4)
+
+`scripts/package.sh` produces two archives in `dist/release/`:
+
+```
+vender-<version>-linux-amd64.tar.gz
+vender-<version>-windows-amd64.zip
+```
+
+Each contains a top-level `vender-<version>-<target>/` directory with the
+`vender` binary, the matching **sing-box** binary, `README.md`, `LICENSE`,
+`NOTICE` and `LICENSE.sing-box`. `scripts/build.sh` still builds the two
+binaries into `dist/`; `package.sh` reuses it, fetches the pinned sing-box for a
+target that is missing (it is 80 MB and git-ignored, so a clean clone has to get
+it from somewhere), and stages the archives with sorted entries, a fixed mtime
+and no owner metadata so two runs over the same inputs are byte-identical.
+
+**Licensing is not an afterthought here.** vender is GPL-3.0-or-later and bundles
+sing-box, which is also GPL-3.0-or-later with one extra upstream term. The
+archives therefore carry vender's `LICENSE`, sing-box's own licence text as
+`LICENSE.sing-box`, and a `NOTICE` that states the bundling, the upstream
+copyright, the additional term, the pinned version, and where the corresponding
+source lives. Nothing is silently dropped.
+
+`scripts/install.sh` is the per-user installer: it copies `vender` and
+`sing-box` into `$PREFIX/bin` (default `~/.local/bin`) — side by side, which is
+one of the three places `core.ResolveBinary` looks — optionally runs `vender
+autostart on`, and can uninstall both (removing the autostart entry first). It
+needs no root and writes nothing outside the prefix.
+
+## 12. Milestone plan
 
 | Milestone | Deliverable | Acceptance |
 |---|---|---|
@@ -796,11 +903,11 @@ daemon`; everything else already exists. Three things about it are deliberate:
 | **M1** | `internal/core` engine + `vender daemon`, `status`, `proxy on\|off` | With a real server: daemon starts sing-box, `127.0.0.1:7897` proxies HTTP and SOCKS5; stopping the daemon frees the port; `status` reflects reality |
 | **M2** | `internal/rules` built-in policy, actions, split DNS and embedded rule sets, wired into the generated config; `vender rules list` | `proxy.mode: rule` sends CN/private destinations direct, blocks ads, proxies a documented override list and everything else, with matching split DNS; `sing-box check` passes for both server types and a live run shows direct vs proxied vs blocked; `global` and `direct` behave as documented |
 | **M3** | `internal/control` + `internal/tui`: the daemon control channel and the Bubble Tea client | TUI attaches to a running daemon, switches the active server and mode, tails engine logs, shows live traffic from the engine's own counters, quits cleanly and restores the terminal; behaves with no daemon; the channel rejects an unauthenticated client, and a bad host leaves no side effects |
-| **M4** | `internal/autostart` | `autostart on` starts the daemon after login on both platforms; `off` removes it; `status` reports it; all idempotent |
+| **M4** | `internal/autostart` (systemd user unit / XDG entry, Task Scheduler task / Run key), Windows system proxy, release packaging and the installer | `autostart on` starts the daemon after login on both platforms; `off` removes it; `status` reports it; all idempotent. `vender proxy on\|off` works on Windows. Both release archives build and contain the engine plus the licence documents |
 | **M5** | Subscription URLs and bulk import, server latency testing | Importing a subscription adds all of its servers; a latency command reports a reachability ranking |
-| **M6** | Hardening and release | Health-based failover across servers, log rotation, reproducible cross-builds, signed Windows binaries, user documentation |
+| **M6** | Hardening and release | Health-based failover across servers, log rotation, reproducible cross-builds, signed Windows binaries, a windowless Windows start, user documentation |
 
-## 12. Engineering conventions
+## 13. Engineering conventions
 
 - **Minimal dependencies.** vender uses only `cobra`, `yaml.v3` and — from M3,
   for the TUI alone — `bubbletea`, `lipgloss` and `bubbles`. There is no
@@ -814,7 +921,21 @@ daemon`; everything else already exists. Three things about it are deliberate:
   work is genuinely needed, it is split behind build tags inside the relevant
   package — `internal/core/lock_{unix,windows}.go`,
   `internal/core/process_{unix,windows}.go`,
-  `cmd/vender/proxy_{linux,windows}.go` — and never sprinkled through the CLI.
+  `cmd/vender/proxy_{linux,windows}.go`,
+  `internal/autostart/autostart_{linux,windows,other}.go` — and never sprinkled
+  through the CLI.
+- **A Windows path is not "untestable".** Build tags are used only where the
+  real API is needed. Everything a Windows path *decides* — the task XML, the
+  `schtasks`/`reg` argument vectors, UTF-16 encoding, the parsing of their
+  output, and the registry write ordering — lives in a file with no build tag
+  behind an injected runner, so those tests run on Linux and the same code is
+  proven by `GOOS=windows go build ./...`. `internal/autostart/windows.go` and
+  `cmd/vender/winproxy.go` are the two examples.
+- **The licence obligation is part of the build.** vender is GPL-3.0-or-later
+  and bundles the GPL sing-box engine, so `scripts/package.sh` refuses to build
+  an archive without `LICENSE`, `NOTICE` and sing-box's own licence text, and
+  both archives carry them. The `NOTICE` names the upstream copyright, the extra
+  upstream term and the pinned version.
 - **Secrets.** `servers.yaml` is `0600`; the generated `singbox.json` is `0600`
   too, because it repeats the credentials; secrets never reach logs or error
   messages (`Server.String` is redaction-safe); committed tests use only dummy

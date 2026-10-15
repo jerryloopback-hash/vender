@@ -73,7 +73,7 @@ func (m Model) tabsView() string {
 			}
 		}
 	}
-	right := m.theme.appName.Render("vender") + " " + m.theme.appTag.Render("M3")
+	right := m.theme.appName.Render("vender") + " " + m.theme.appTag.Render("M4")
 	if gap := m.panelWidth() - lipgloss.Width(b.String()) - lipgloss.Width(right) - 1; gap > 0 {
 		b.WriteString(repeat(" ", gap))
 		b.WriteString(right)
@@ -582,17 +582,49 @@ func (m Model) settingsView() string {
 
 	policy := m.policyLines(mode)
 
-	autostart := []string{
-		m.theme.subtle.Render("start at login  ") + m.theme.dim.Render("not implemented in this milestone (M4)") +
-			m.theme.subtle.Render("      system proxy  ") + m.theme.dim.Render("`vender proxy on|off` (Windows: M4)"),
-	}
-
 	return strings.Join([]string{
 		m.theme.panel("routing mode", w, modeLines...),
 		m.theme.panel("listener", w, listener...),
 		m.theme.panel("built-in routing policy", w, policy...),
-		m.theme.panel("autostart", w, autostart...),
+		m.theme.panel("autostart", w, m.autostartLines()...),
 	}, "\n")
+}
+
+// autostartLines renders the start-at-login registration. The state is read
+// directly by the TUI (it is a file or a registry value, not daemon state), so
+// the panel is complete with no daemon running — which is exactly when a user
+// is most likely to want to turn it on.
+func (m Model) autostartLines() []string {
+	first := m.theme.subtle.Render("start at login  ")
+	switch {
+	case !m.autostartKnown:
+		first += m.theme.dim.Render("checking…")
+	case m.autostartErr != "":
+		first += m.theme.bad.Render("unknown") + m.theme.dim.Render("  "+m.autostartErr)
+	default:
+		label := m.theme.dim.Render(enabledWord(m.startAtLogin.Enabled))
+		if m.startAtLogin.Enabled {
+			label = m.theme.ok.Render(enabledWord(true))
+		}
+		action := "  press a to enable"
+		if m.startAtLogin.Enabled {
+			action = "  press a to disable"
+		}
+		first += label + m.theme.subtle.Render("  "+string(m.startAtLogin.Mechanism)) + m.theme.dim.Render(action)
+	}
+
+	lines := []string{first}
+	if m.autostartKnown && m.autostartErr == "" {
+		if m.startAtLogin.Target != "" {
+			lines = append(lines, m.theme.subtle.Render("target          ")+m.theme.value.Render(m.startAtLogin.Target))
+		}
+		if m.startAtLogin.Detail != "" {
+			lines = append(lines, m.theme.subtle.Render("detail          ")+m.theme.dim.Render(m.startAtLogin.Detail))
+		}
+	}
+	lines = append(lines, m.theme.subtle.Render("system proxy    ")+
+		m.theme.dim.Render("`vender proxy on|off` points the desktop at the local inbound"))
+	return lines
 }
 
 func (m Model) listenLabel() string {
@@ -714,6 +746,7 @@ func (m Model) helpOverlay() string {
 		{
 			"Settings",
 			"  ←/→, h/l   choose a mode     enter  apply",
+			"  a          toggle start at login (systemd unit / XDG entry / Run key)",
 		},
 		{
 			"vender is a client: the daemon owns the engine, and every action here goes",
@@ -759,7 +792,7 @@ func (m Model) keyMap() help.KeyMap {
 		return km{short: append([]key.Binding{f, b("/", "filter"), b("t", "clear")}, common...)}
 	case screenSettings:
 		return km{short: append([]key.Binding{
-			b("←/→", "mode"), b("enter", "apply"),
+			b("←/→", "mode"), b("enter", "apply"), b("a", "start at login"),
 		}, common...)}
 	default:
 		short := []key.Binding{b("t", "latency"), b("s/x", "start/stop"), b("m", "mode")}

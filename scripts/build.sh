@@ -7,6 +7,10 @@
 #   scripts/build.sh linux      # linux/amd64 only
 #   scripts/build.sh windows    # windows/amd64 only
 #
+# This produces the bare binaries. For distributable archives — the binaries
+# plus the bundled sing-box and the licence documents — use scripts/package.sh,
+# which calls this script and then stages dist/release/.
+#
 # Version metadata is injected with -ldflags, matching the variables in
 # cmd/vender/version.go.
 set -euo pipefail

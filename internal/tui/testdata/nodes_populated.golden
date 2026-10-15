@@ -1,4 +1,4 @@
- Dashboard   Nodes       Logs        Settings                                             vender M3
+ Dashboard   Nodes       Logs        Settings                                             vender M4
  servers  2   ↑/↓ move · enter select · t latency · r reload
 ╭─ servers.yaml ───────────────────────────────────────────────────────────────────────────────────╮
 │   NAME                  TYPE      PROTOCOL           ENDPOINT               ACTIVE LATENCY       │

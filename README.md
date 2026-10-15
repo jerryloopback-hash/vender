@@ -19,14 +19,17 @@ The pinned engine is **sing-box 1.14.3** (see `scripts/fetch-sing-box.sh`).
 
 ## Status
 
-`vender` is at **M3**: the configuration layer and share-link parser (M0), the
-engine (M1), **smart routing out of the box** (M2) and now an **animated
-terminal UI** (M3) are complete. The rule sets the default policy matches
-against are **embedded in the binary**, so a working default needs no download
-at runtime; the TUI attaches to the running daemon over a local control channel
-and can switch servers, change mode, start and stop the engine, tail its log
-and show live traffic. Commands that belong to a later milestone are present
-but exit with an explicit `not implemented in this milestone (Mx)` message.
+`vender` is at **M4**: the configuration layer and share-link parser (M0), the
+engine (M1), **smart routing out of the box** (M2), an **animated terminal UI**
+(M3), and now **start at login on Linux and Windows 11**, **Windows system-proxy
+control** and **release packaging** (M4). The rule sets the default policy
+matches against are **embedded in the binary**, so a working default needs no
+download at runtime; the TUI attaches to the running daemon over a local control
+channel and can switch servers, change mode, start and stop the engine, tail its
+log, show live traffic and turn start-at-login on and off.
+
+Everything the CLI offers is implemented; there are no `not implemented` stubs
+left.
 
 ## Roadmap
 
@@ -35,8 +38,8 @@ but exit with an explicit `not implemented in this milestone (Mx)` message.
 | M0 | Module skeleton, config load/save, share-link parsing, `version` / `import` / `servers` CLI, docs |
 | M1 | Engine: generate the sing-box config, supervise the child process, `daemon`, `status`, `proxy on\|off` |
 | M2 | Built-in routing rules (CN direct, ad block, private IPs), split DNS, embedded rule sets, `rules list` |
-| **M3** | Control channel (loopback TCP + token, `control.json`), live traffic from sing-box's Clash API, animated Bubble Tea TUI (`vender tui`) |
-| M4 | Autostart (systemd user unit / XDG autostart on Linux; Registry Run key / Task Scheduler on Windows), Windows system-proxy control |
+| M3 | Control channel (loopback TCP + token, `control.json`), live traffic from sing-box's Clash API, animated Bubble Tea TUI (`vender tui`) |
+| **M4** | **Autostart** (systemd user unit / XDG autostart on Linux; Task Scheduler logon task / Run key on Windows), **Windows system proxy** (WinINET), **release packaging** and a per-user installer |
 | M5 | Subscription links and bulk import, server latency testing |
 | M6 | Hardening & release: health-based failover, log rotation, signed builds |
 
@@ -63,14 +66,37 @@ GOOS=windows GOARCH=amd64 go build -o vender.exe ./cmd/vender
 `scripts/build.sh` builds both targets into `dist/` with version metadata
 injected via `-ldflags`.
 
+### Release archives and the installer
+
+```sh
+scripts/package.sh              # dist/release/vender-<version>-{linux-amd64.tar.gz,windows-amd64.zip}
+scripts/package.sh linux-amd64  # one target
+scripts/install.sh              # install into ~/.local/bin (vender + sing-box)
+scripts/install.sh --autostart  # ... and register it to start at login
+scripts/install.sh --uninstall  # remove both, and the autostart entry
+```
+
+Each archive unpacks to `vender-<version>-<target>/` with the `vender` binary,
+the matching **sing-box** binary, `README.md`, `LICENSE`, `NOTICE` and
+`LICENSE.sing-box`. `package.sh` fetches the pinned sing-box automatically if
+`dist/sing-box/` is empty (it is 80 MB and git-ignored, so a fresh clone has to
+get it from somewhere).
+
+`install.sh` needs no root: it copies both binaries into `~/.local/bin` — side by
+side, which is one of the places vender looks for the engine — and can register
+start-at-login in the same step. See [Licence](#licence) for why the sing-box
+documentation travels with the binaries.
+
 Dependencies are deliberately few: `cobra` and `yaml.v3` for the CLI, plus
-`bubbletea`, `lipgloss` and `bubbles` for the TUI. The control channel uses
-only the standard library.
+`bubbletea`, `lipgloss` and `bubbles` for the TUI. The control channel,
+autostart and the Windows registry work use only the standard library.
 
 ## Installing sing-box
 
-`vender` does not embed the proxy engine; it runs a sing-box binary it finds at
-runtime. Fetch the pinned release:
+A vender **release archive already contains** the matching sing-box binary
+(`scripts/package.sh`), and `scripts/install.sh` copies it next to `vender`, so
+a normal install needs nothing else. When building from source, fetch the pinned
+release:
 
 ```sh
 scripts/fetch-sing-box.sh            # linux/amd64 + windows/amd64
@@ -114,6 +140,10 @@ If none is found, the error names all three locations.
 ./vender tui                   # attach the terminal UI to the running daemon
 ./vender proxy on              # also point the desktop's system proxy at vender
 ./vender proxy off             # restore the system proxy
+
+./vender autostart on          # run the daemon at login (systemd unit / Task Scheduler task)
+./vender autostart status      # what is registered, and where (exit code!)
+./vender autostart off         # remove the registration
 ```
 
 Every command accepts `--config-dir <path>` (configuration) and `--run-dir
@@ -122,6 +152,68 @@ the test suite stays away from your real setup.
 
 The first server imported also becomes the active one; removing the active
 server clears the selection.
+
+## System proxy
+
+```sh
+./vender proxy on     # point the desktop's proxy settings at 127.0.0.1:7897
+./vender proxy off    # and restore them
+```
+
+This is a convenience for applications that honour the desktop proxy settings
+but have no proxy option of their own. It only ever changes the *user's* proxy
+configuration — no TUN, no VPN, no daemon state — and vender still recommends
+configuring the proxy per application (or exporting `http_proxy` / `https_proxy`
+/ `all_proxy`, which `proxy on` prints).
+
+| Platform | What is written |
+|---|---|
+| Linux | the GNOME proxy schema through `gsettings` (`org.gnome.system.proxy.*`), with loopback in `ignore-hosts`; `off` restores `mode: none` |
+| Windows | the per-user WinINET settings `HKCU\...\Internet Settings` (`ProxyEnable`, `ProxyServer` = `http=...;https=...;socks=...`, `ProxyOverride`), then `InternetSetOption` to make running applications re-read them; `off` clears only `ProxyEnable` |
+
+Neither touches WinHTTP's own configuration (`netsh winhttp`), because a browser
+does not use it.
+
+## Start at login (autostart)
+
+```sh
+./vender autostart on          # register, and start it now
+./vender autostart status      # what is registered, and where
+./vender autostart status --json
+./vender autostart off         # remove it
+```
+
+`on` and `off` are idempotent, `status` exits non-zero when nothing is
+registered (so it drops straight into a health check), and the TUI's Settings
+screen has the same thing on the `a` key — including when no daemon is running,
+which is exactly when you tend to want it.
+
+| Platform | Mechanism | Artifact |
+|---|---|---|
+| Linux | `systemd --user` unit (primary) | `~/.config/systemd/user/vender.service`, `ExecStart=<abs vender> daemon`, `Restart=on-failure`, `RestartSec=3`, `WantedBy=default.target`; then `systemctl --user enable --now` |
+| Linux | XDG autostart desktop entry (fallback, used only when no systemd user manager answers) | `$XDG_CONFIG_HOME/autostart/vender.desktop` |
+| Windows | Task Scheduler **logon task** (primary) | `\vender\daemon`, registered from XML: logon trigger, `InteractiveToken`, `LeastPrivilege`, hidden, no time limit |
+| Windows | per-user Registry Run key (fallback when the task cannot be created) | `HKCU\...\CurrentVersion\Run`, value `vender` |
+
+Neither platform needs administrator rights.
+
+**Start at boot, not just at login** (Linux): the user manager is normally torn
+down when your last session ends. `autostart on` asks logind for lingering
+(`loginctl enable-linger`); if polkit refuses the non-interactive call the unit
+is still correct and `status` says so in its `detail` line — run
+`loginctl enable-linger` yourself to finish the job.
+
+**Windows caveat.** The task is registered hidden and at the least privilege,
+but vender is a *console-subsystem* executable, so Task Scheduler does not
+guarantee a fully invisible start — a console window can flash at logon. A
+windowless start needs a GUI-subsystem build or a `conhost --headless` launcher
+and is deferred to M6; the daemon itself does not need a console. The Windows
+paths are compile-checked (`GOOS=windows go build ./...`) and their XML, argument
+vectors and output parsing are unit-tested, but they cannot be *executed* on a
+Linux development host.
+
+The entry only ever runs `vender daemon`, which is headless: one daemon per run
+directory, a fresh control token per start, and a clean exit on `SIGTERM`.
 
 ## The terminal UI
 
@@ -136,11 +228,11 @@ An animated Bubble Tea interface with four screens:
 | `1` | **Dashboard** | daemon and engine state, the selected server, the mode, uptime, and a **live up/down traffic graph** with human-readable rates and session totals |
 | `2` | **Nodes** | every configured server with its type, protocol, endpoint and latency. `enter` makes one active (the daemon restarts the engine in place), `t` measures latency |
 | `3` | **Logs** | the engine's own output, streamed live, with follow mode (`f`) and a filter (`/`) |
-| `4` | **Settings** | the routing mode, the listener, and a read-only view of the **active built-in policy** |
+| `4` | **Settings** | the routing mode, the listener, a read-only view of the **active built-in policy**, and the **start-at-login registration** (`a` toggles it) |
 
 Other keys: `tab` / `shift+tab` between screens, `?` for help, `t` to test
 latency, `s` / `x` / `R` to start, stop and restart the engine, `m` to cycle
-the mode, `q` or Ctrl-C to quit.
+the mode, `a` on Settings to toggle start-at-login, `q` or Ctrl-C to quit.
 
 The TUI is a **client**: it never runs sing-box itself, it asks the daemon. So
 it can attach and detach at any time, and two of them can be open at once. It
@@ -377,6 +469,20 @@ configuration and restarts sing-box without the daemon itself going away.
 `vender status` reads the same lock, so its exit code means exactly "the proxy
 is up" and is safe to use in scripts or a health check.
 
-## License
+## Licence
 
-Personal project; not yet licensed for redistribution.
+`vender` is licensed under the **GNU General Public License, version 3 or
+later** — see [`LICENSE`](LICENSE). That choice keeps distribution simple,
+because vender runs and bundles the GPL-licensed [sing-box](https://github.com/SagerNet/sing-box)
+engine, and the two are then under the same terms.
+
+vender does not link sing-box as a library; it executes it as a separate
+process. Release archives still ship the engine next to the binary for a
+self-contained install, so they carry sing-box's own licence text as
+`LICENSE.sing-box` and a [`NOTICE`](NOTICE) that spells out the bundling, the
+upstream copyright, the one extra term upstream adds, the pinned version, and
+where the corresponding source lives. Nothing is silently dropped.
+
+No credential ever lives in the repository: `servers.yaml` is written `0600`,
+the generated `singbox.json` is `0600`, and the committed tests use only dummy
+values.

@@ -42,6 +42,7 @@ import (
 	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/ll-lite/vender/internal/autostart"
 	"github.com/ll-lite/vender/internal/config"
 	"github.com/ll-lite/vender/internal/control"
 	"github.com/ll-lite/vender/internal/core"
@@ -115,6 +116,11 @@ func runPlain(ctx context.Context, opts Options, w io.Writer) error {
 	fmt.Fprintf(w, "listen       %s\n", orDash(snap.Listen))
 	fmt.Fprintf(w, "mode         %s\n", orDash(snap.Mode))
 	fmt.Fprintf(w, "servers      %d configured\n", len(snap.Servers))
+	if st, err := autostart.Status(); err == nil {
+		fmt.Fprintf(w, "autostart    %s (%s)\n", enabledWord(st.Enabled), st.Mechanism)
+	} else {
+		fmt.Fprintf(w, "autostart    unknown (%v)\n", err)
+	}
 
 	cctx, cancel := context.WithTimeout(ctx, 5*1e9)
 	defer cancel()

@@ -26,7 +26,7 @@ Nodes and Settings keep working from the configuration files on disk.
   Dashboard  status, live up/down traffic, latency        1
   Nodes      configured servers, select one               2
   Logs       the engine's own log, follow and filter      3
-  Settings   routing mode, listener, the built-in policy  4
+  Settings   routing mode, listener, policy, autostart    4
 
   tab / shift+tab  switch screens        ?  help        q  quit`,
 		Args: cobra.NoArgs,

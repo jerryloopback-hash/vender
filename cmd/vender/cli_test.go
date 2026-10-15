@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ll-lite/vender/internal/autostart"
 	"github.com/ll-lite/vender/internal/config"
 )
 
@@ -69,44 +71,101 @@ func TestCLIVersionRejectsArgs(t *testing.T) {
 	}
 }
 
-func TestCLIMilestoneStubs(t *testing.T) {
-	tests := []struct {
-		args      []string
-		milestone string
-	}{
-		{args: []string{"autostart", "on"}, milestone: "M4"},
-		{args: []string{"autostart", "off"}, milestone: "M4"},
-		{args: []string{"autostart", "status"}, milestone: "M4"},
+// `autostart` writes to the real start-at-login configuration, so the CLI tests
+// substitute recorders for the three entry points: the command's output and exit
+// codes are exercised, and the host is never touched. The package's own tests
+// cover the real logic against an isolated HOME.
+func TestCLIAutostart(t *testing.T) {
+	restore := autostartEnable
+	restoreOff := autostartDisable
+	restoreStatus := autostartStatus
+	t.Cleanup(func() {
+		autostartEnable, autostartDisable, autostartStatus = restore, restoreOff, restoreStatus
+	})
+
+	enabled := false
+	autostartEnable = func() error { enabled = true; return nil }
+	autostartDisable = func() error { enabled = false; return nil }
+	autostartStatus = func() (autostart.State, error) {
+		if enabled {
+			return autostart.State{
+				Enabled:   true,
+				Mechanism: autostart.MechanismSystemdUser,
+				Target:    "/home/test/.config/systemd/user/vender.service",
+				Detail:    "systemd user unit installed",
+			}, nil
+		}
+		return autostart.State{
+			Enabled:   false,
+			Mechanism: autostart.MechanismSystemdUser,
+			Target:    "/home/test/.config/systemd/user/vender.service",
+			Detail:    "not registered",
+		}, nil
 	}
 
-	for _, tt := range tests {
-		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
-			out, err := runCLI(t, tt.args...)
-			if err == nil {
-				t.Fatalf("%v = nil error, want a not-implemented error (output: %q)", tt.args, out)
-			}
-			if !strings.Contains(err.Error(), "not implemented in this milestone") {
-				t.Errorf("error = %q, want it to say \"not implemented in this milestone\"", err)
-			}
-			if !strings.Contains(err.Error(), "("+tt.milestone+")") {
-				t.Errorf("error = %q, want it to name %s", err, tt.milestone)
-			}
-		})
+	// Disabled: the output explains itself and the exit code is non-zero.
+	out, err := runCLI(t, "autostart", "status")
+	if err == nil {
+		t.Fatalf("status when disabled = nil error, want a non-zero exit (output: %q)", out)
+	}
+	if !strings.Contains(err.Error(), "not registered") {
+		t.Errorf("error = %q", err)
+	}
+	for _, want := range []string{"state        disabled", "mechanism    systemd-user", "target       /home/test/.config/systemd/user/vender.service"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status output = %q, want %q", out, want)
+		}
+	}
+
+	// on registers, prints where, and is reflected by status (exit 0 now).
+	out, err = runCLI(t, "autostart", "on")
+	if err != nil {
+		t.Fatalf("autostart on: %v\n%s", err, out)
+	}
+	if !enabled {
+		t.Error("autostart on did not call Enable")
+	}
+	if !strings.Contains(out, "enabled") {
+		t.Errorf("on output = %q", out)
+	}
+	if out, err = runCLI(t, "autostart", "status"); err != nil {
+		t.Fatalf("status when enabled: %v\n%s", err, out)
+	}
+
+	// --json is machine-readable and carries the same state.
+	out, err = runCLI(t, "autostart", "status", "--json")
+	if err != nil {
+		t.Fatalf("status --json: %v\n%s", err, out)
+	}
+	var got struct {
+		Enabled   bool   `json:"enabled"`
+		Mechanism string `json:"mechanism"`
+		Target    string `json:"target"`
+		Action    string `json:"action"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("status --json is not JSON: %v\n%s", err, out)
+	}
+	if !got.Enabled || got.Mechanism != "systemd-user" || got.Action != "status" {
+		t.Errorf("json = %+v", got)
+	}
+
+	// off removes it and is idempotent at the CLI level.
+	if out, err = runCLI(t, "autostart", "off"); err != nil {
+		t.Fatalf("autostart off: %v\n%s", err, out)
+	}
+	if enabled {
+		t.Error("autostart off did not call Disable")
+	}
+	if _, err = runCLI(t, "autostart", "off"); err != nil {
+		t.Errorf("autostart off (again) = %v, want it to be idempotent", err)
 	}
 }
 
-// On Windows the system proxy is explicitly deferred to M4, so the same
-// assertion holds there but not on Linux (where it is implemented).
-func TestCLIProxyUnsupportedPlatformIsAMilestoneError(t *testing.T) {
-	if systemProxySupported() {
-		t.Skip("the system proxy is implemented on this platform")
-	}
-	out, err := runCLI(t, "proxy", "on", "--config-dir", t.TempDir())
-	if err == nil {
-		t.Fatalf("proxy on = nil error, want a milestone error (output: %q)", out)
-	}
-	if !strings.Contains(err.Error(), "not implemented") || !strings.Contains(err.Error(), "(M4)") {
-		t.Errorf("error = %q, want it to name the M4 milestone", err)
+// An argument to a subcommand is a usage error, not a silent no-op.
+func TestCLIAutostartRejectsArgs(t *testing.T) {
+	if _, err := runCLI(t, "autostart", "on", "extra"); err == nil {
+		t.Error("autostart on extra = nil error, want a usage error")
 	}
 }
 

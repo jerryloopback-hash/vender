@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/ll-lite/vender/internal/autostart"
 	"github.com/ll-lite/vender/internal/config"
 	"github.com/ll-lite/vender/internal/control"
 )
@@ -88,6 +89,15 @@ type (
 	// snapshotMsg is the offline view of the configuration, loaded from disk so
 	// the Nodes and Settings screens work with no daemon at all.
 	snapshotMsg struct{ snap configSnapshot }
+	// autostartMsg is the answer to a start-at-login probe or toggle. autostart
+	// state lives outside the daemon (it is a file in $XDG_CONFIG_HOME, or a
+	// registry value), so the TUI reads and writes it directly. note is set for
+	// a toggle so the result is worth a toast; it is empty for a plain refresh.
+	autostartMsg struct {
+		state autostart.State
+		err   error
+		note  string
+	}
 )
 
 // configSnapshot is what the TUI can show about a *stopped* vender: the files
@@ -159,6 +169,13 @@ type Model struct {
 
 	settingsCursor int
 
+	// startAtLogin is the start-at-login registration, read and written
+	// directly (it is not daemon state). autostartKnown is false until the
+	// first probe answers, which keeps View a pure function of the model.
+	startAtLogin   autostart.State
+	autostartErr   string
+	autostartKnown bool
+
 	spinner  spinner.Model
 	progress progress.Model
 	busy     string
@@ -213,6 +230,7 @@ func (m Model) Init() tea.Cmd {
 		m.spinner.Tick,
 		loadSnapshotCmd(m.opts),
 		attachCmd(m.ctx, m.opts),
+		autostartStatusCmd(),
 	)
 }
 
@@ -317,6 +335,37 @@ func readTrafficCmd(ctx context.Context, s *control.Stream) tea.Cmd {
 func loadSnapshotCmd(opts Options) tea.Cmd {
 	return func() tea.Msg {
 		return snapshotMsg{snap: loadSnapshot(opts)}
+	}
+}
+
+// autostartStatusCmd reads the start-at-login registration. It is a local call,
+// not a daemon command: the registration is a file (or a registry value) that
+// belongs to the user, and the daemon may not even be running when a user wants
+// to turn autostart on.
+func autostartStatusCmd() tea.Cmd {
+	return func() tea.Msg {
+		st, err := autostart.Status()
+		return autostartMsg{state: st, err: err}
+	}
+}
+
+// autostartToggleCmd enables or disables start-at-login and reports the
+// resulting state.
+func autostartToggleCmd(enable bool) tea.Cmd {
+	return func() tea.Msg {
+		note := "autostart off"
+		var err error
+		if enable {
+			note = "autostart on"
+			err = autostart.Enable()
+		} else {
+			err = autostart.Disable()
+		}
+		if err != nil {
+			return autostartMsg{err: err, note: note}
+		}
+		st, serr := autostart.Status()
+		return autostartMsg{state: st, err: serr, note: note}
 	}
 }
 
@@ -573,6 +622,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.rebuildRows()
 		return m, nil
 
+	case autostartMsg:
+		m.busy = ""
+		m.autostartKnown = true
+		if msg.err != nil {
+			m.autostartErr = errText(msg.err)
+			if msg.note != "" {
+				m.setToast(msg.note+": "+m.autostartErr, true)
+			}
+			return m, nil
+		}
+		m.autostartErr = ""
+		m.startAtLogin = msg.state
+		if msg.note != "" {
+			m.setToast(msg.note+": "+enabledWord(msg.state.Enabled), false)
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -769,6 +835,13 @@ func (m Model) handleSettingsKey(key string) (tea.Model, tea.Cmd) {
 		return m.applyMode(modes[m.settingsCursor])
 	case "m":
 		return m.cycleMode()
+	case "a":
+		// Toggle start-at-login. It is a local change (a systemd unit, an XDG
+		// entry, a registry value), so it does not need the daemon — which is
+		// often not running yet at the moment a user wants to enable it.
+		enable := !m.startAtLogin.Enabled
+		m.busy = "updating autostart…"
+		return m, autostartToggleCmd(enable)
 	}
 	return m, nil
 }
@@ -1003,6 +1076,15 @@ func errText(err error) string {
 		return "closed"
 	}
 	return err.Error()
+}
+
+// enabledWord renders a boolean the way the Settings screen and the autostart
+// toast say it.
+func enabledWord(enabled bool) string {
+	if enabled {
+		return "enabled"
+	}
+	return "disabled"
 }
 
 func indexOfMode(m config.ProxyMode) int {
