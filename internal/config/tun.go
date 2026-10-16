@@ -28,11 +28,13 @@ const (
 	// DefaultTunInterfaceName is the device name vender asks for. It is
 	// explicit rather than left to the engine so `ip link`, `ip route` and the
 	// cleanup after a crash all have one predictable name to look for.
-	//
-	// `address` is deliberately left empty by default instead: sing-box then
-	// picks its own private /30, which is known not to collide with the
-	// 198.18.0.0/15 range mihomo/clash uses for its own TUN.
 	DefaultTunInterfaceName = "vender0"
+	// DefaultTunAddress is the TUN's own address when the user did not choose
+	// one. sing-box 1.14 *requires* an address on a tun inbound — starting
+	// without one fails with "missing interface address" — so vender must
+	// always supply it. This is a private /30 outside 198.18.0.0/15 (the range
+	// mihomo/clash uses for its own TUN), so the two can coexist.
+	DefaultTunAddress = "172.19.0.1/30"
 )
 
 // ifNameMaxLen is Linux's IFNAMSIZ-1. Windows accepts longer adapter names, so
@@ -69,8 +71,9 @@ type TunConfig struct {
 	StrictRoute bool `yaml:"strict_route"`
 	// InterfaceName is the device name (vender0 by default).
 	InterfaceName string `yaml:"interface_name"`
-	// Address is the TUN's own address, as CIDR strings. Empty means the
-	// engine's default.
+	// Address is the TUN's own address, as CIDR strings. Empty is normalized
+	// to DefaultTunAddress: sing-box refuses to start a tun inbound without
+	// an interface address.
 	Address []string `yaml:"address,omitempty"`
 	// RouteExcludeAddress lists CIDRs that are *not* routed into the TUN —
 	// the usual use is sparing a LAN, another VPN (mihomo's 198.18.0.0/15), or
@@ -124,6 +127,9 @@ func (t *TunConfig) Normalize() {
 	t.Stack = strings.ToLower(strings.TrimSpace(t.Stack))
 	t.InterfaceName = strings.TrimSpace(t.InterfaceName)
 	t.Address = normalizeList(t.Address)
+	if t.Enabled && len(t.Address) == 0 {
+		t.Address = []string{DefaultTunAddress}
+	}
 	t.RouteExcludeAddress = normalizeList(t.RouteExcludeAddress)
 	t.RouteExcludeAddressSet = normalizeList(t.RouteExcludeAddressSet)
 }

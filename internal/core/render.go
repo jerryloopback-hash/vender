@@ -373,9 +373,10 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 //
 // Two choices are worth recording:
 //
-//   - `address` is always omitted when the user left it empty, so sing-box
-//     picks its own private /30. That default (172.19.0.1/30 in 1.14) does not
-//     collide with the 198.18.0.0/15 that mihomo/clash uses for its TUN.
+//   - `address` is normalized to config.DefaultTunAddress rather than left
+//     empty: sing-box 1.14 refuses to start a tun inbound without an interface
+//     address ("missing interface address"). The default is a private /30 that
+//     does not collide with the 198.18.0.0/15 mihomo/clash uses for its TUN.
 //   - `stack` is always emitted, even when it equals the engine default, so a
 //     change of default in a future sing-box cannot silently change vender's
 //     behaviour.
