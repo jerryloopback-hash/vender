@@ -445,8 +445,11 @@ func TestControllerRulesTracksMode(t *testing.T) {
 	if len(r.Actions) != 2 || len(r.Rules) < 3 {
 		t.Errorf("rule mode policy = %d actions, %d rules", len(r.Actions), len(r.Rules))
 	}
-	if r.Rules[0].Name != "private-dest-direct" {
-		t.Errorf("first rule = %q, want private-dest-direct (order is the policy)", r.Rules[0].Name)
+	if r.Rules[0].Name != "critical-direct" {
+		t.Errorf("first rule = %q, want the critical list first (order is the policy)", r.Rules[0].Name)
+	}
+	if r.Rules[1].Name != "private-dest-direct" {
+		t.Errorf("second rule = %q, want private-dest-direct", r.Rules[1].Name)
 	}
 	if len(r.RuleSets) == 0 || r.Source == "" {
 		t.Errorf("rule sets/source missing: %+v", r)
@@ -680,5 +683,53 @@ func TestKindOfDefaultsToInternal(t *testing.T) {
 	}
 	if got := KindOf(fmt.Errorf("wrapped: %w", Errorf(KindAuth, "nope"))); got != KindAuth {
 		t.Errorf("KindOf = %q, want auth", got)
+	}
+}
+
+// Proxies reports every configured server and marks exactly one active in
+// single-server mode, even with no engine running.
+func TestControllerProxiesSingleServer(t *testing.T) {
+	f := newFixture(t)
+	p := f.ctrl.Proxies(context.Background())
+	if p.Auto {
+		t.Error("single-server mode reported auto")
+	}
+	if len(p.Nodes) != 2 {
+		t.Fatalf("Proxies returned %d nodes, want 2", len(p.Nodes))
+	}
+	active := 0
+	for _, n := range p.Nodes {
+		if n.Active {
+			active++
+			if n.Name != "Node-A" {
+				t.Errorf("active node = %q, want Node-A", n.Name)
+			}
+		}
+	}
+	if active != 1 {
+		t.Errorf("%d active nodes, want exactly 1", active)
+	}
+}
+
+// Opting into auto failover is accepted through the control channel and flips
+// the reported mode; the engine is not running, so the group has no "now" yet.
+func TestControllerSelectAuto(t *testing.T) {
+	f := newFixture(t)
+	if err := f.ctrl.SelectServer(config.SelectedServerAuto); err != nil {
+		t.Fatalf("SelectServer(auto): %v", err)
+	}
+	p := f.ctrl.Proxies(context.Background())
+	if !p.Auto {
+		t.Error("Proxies().Auto = false after selecting auto")
+	}
+	if p.Group != "proxy" {
+		t.Errorf("group = %q, want the proxy tag", p.Group)
+	}
+	if len(p.Nodes) != 2 {
+		t.Errorf("auto mode reported %d nodes, want 2", len(p.Nodes))
+	}
+	st := f.ctrl.Status()
+	if st.Selected != config.SelectedServerAuto || st.SrvType != "auto" {
+		t.Errorf("status = %q / %q, want auto", st.Selected, st.SrvType)
 	}
 }

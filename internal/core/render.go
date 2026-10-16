@@ -15,6 +15,11 @@ import (
 // vender's contract with its own rules: internal/rules speaks in terms of
 // "proxy", "direct" and "block", and render.go is the single place that binds
 // those names to concrete outbound definitions.
+//
+// tagProxy is always the outbound the policy means by "the proxy". In single
+// mode it is the selected server; in auto mode (selected_server: "auto") it is
+// the URLTest failover group, so every rule and the route final keep working
+// without knowing which member is currently carrying traffic.
 const (
 	tagProxy  = "proxy"
 	tagDirect = "direct"
@@ -23,6 +28,21 @@ const (
 	tagMixed = "mixed-in"
 	// tagTun is the tag of the optional TUN inbound.
 	tagTun = "tun-in"
+)
+
+// Failover knobs for the URLTest group (selected_server: "auto").
+//
+//   - url is vender's usual "generate 204" probe, reached *through* the member,
+//     so a node that connects but cannot carry traffic is judged unhealthy.
+//   - interval of a minute is a compromise between reacting to a node going
+//     bad quickly and not re-testing so often that the probes themselves add
+//     load to a fragile link.
+//   - tolerance is raised above sing-box's 50 ms default to stop two nodes of
+//     similar latency from flapping back and forth on every jittery sample.
+const (
+	autoFailoverURL       = DefaultDelayTestURL
+	autoFailoverInterval  = "1m"
+	autoFailoverTolerance = 100
 )
 
 // singboxConfig is the subset of sing-box's configuration schema that vender
@@ -67,16 +87,26 @@ type singboxDNS struct {
 type singboxDNSServer struct {
 	Tag    string `json:"tag"`
 	Type   string `json:"type"`
-	Server string `json:"server"`
+	Server string `json:"server,omitempty"`
 	// Detour is the outbound the query leaves through. It is omitted for the
-	// domestic resolver, which is reached directly; sing-box 1.14 rejects a
+	// domestic and FakeIP resolvers, which are local; sing-box 1.14 rejects a
 	// detour to the empty `direct` outbound vender otherwise emits.
 	Detour string `json:"detour,omitempty"`
+	// Inet4Range/Inet6Range are the FakeIP pools (type "fakeip" only).
+	Inet4Range string `json:"inet4_range,omitempty"`
+	Inet6Range string `json:"inet6_range,omitempty"`
 }
 
 type singboxDNSRule struct {
-	RuleSet []string `json:"rule_set"`
-	Server  string   `json:"server"`
+	// Action is emitted explicitly ("route") even though sing-box defaults to
+	// it: `server` is deprecated as a bare rule field and moving to the route
+	// action now keeps the config forward-compatible.
+	Action       string   `json:"action"`
+	RuleSet      []string `json:"rule_set,omitempty"`
+	Domain       []string `json:"domain,omitempty"`
+	DomainSuffix []string `json:"domain_suffix,omitempty"`
+	QueryType    []string `json:"query_type,omitempty"`
+	Server       string   `json:"server,omitempty"`
 }
 
 type singboxLog struct {
@@ -199,6 +229,18 @@ type plainOutbound struct {
 	Tag  string `json:"tag"`
 }
 
+// urltestOutbound is the failover group rendered for selected_server: "auto".
+// It is tagged `proxy`, exactly like a single-server outbound, so nothing else
+// in the config has to change.
+type urltestOutbound struct {
+	Type      string   `json:"type"`
+	Tag       string   `json:"tag"`
+	Outbounds []string `json:"outbounds"`
+	URL       string   `json:"url"`
+	Interval  string   `json:"interval"`
+	Tolerance int      `json:"tolerance"`
+}
+
 type tlsConfig struct {
 	Enabled                    bool         `json:"enabled"`
 	ServerName                 string       `json:"server_name,omitempty"`
@@ -270,11 +312,20 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 	block := plainOutbound{Type: "block", Tag: tagBlock}
 
 	final := tagDirect
-	if rc.Config.Proxy.Mode == config.ModeDirect {
+	switch {
+	case rc.Config.Proxy.Mode == config.ModeDirect:
 		// Direct mode does not even reference a proxy outbound, so an
 		// unusable selected server cannot break "direct".
 		cfg.Outbounds = []any{direct, block}
-	} else {
+	case rc.Config.IsAutoServer():
+		// Auto mode renders every server plus a URLTest group tagged `proxy`.
+		outbounds, err := buildAutoOutbounds(rc)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Outbounds = append(outbounds, direct, block)
+		final = tagProxy
+	default:
 		proxy, err := buildOutbound(rc)
 		if err != nil {
 			return nil, err
@@ -313,13 +364,13 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 
 	switch rc.Config.Proxy.Mode {
 	case config.ModeRule:
-		dns, err := buildDNS(rules.BuiltinDNS())
+		dns, err := buildDNS(rules.RuleModeDNS(rc.UserRules))
 		if err != nil {
 			return nil, err
 		}
 		cfg.DNS = dns
 
-		routeRules, err := buildRules()
+		routeRules, err := buildRules(rc.UserRules)
 		if err != nil {
 			return nil, err
 		}
@@ -330,6 +381,8 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 			// the one that can answer for the names a direct outbound dials,
 			// and a proxied outbound never resolves locally at all (it passes
 			// the name to the server), so this cannot leak a proxied lookup.
+			// Crucially it is *not* the FakeIP resolver: a direct dial must get
+			// a real address, never a synthetic one.
 			DefaultDomainResolver: &singboxDomainResolver{Server: rules.DNSCN},
 			Rules:                 routeRules,
 			Final:                 final,
@@ -441,17 +494,66 @@ func validateTunRuleSets(cfg config.Config) error {
 
 // buildOutbound renders the selected server as the proxy outbound.
 func buildOutbound(rc RuntimeConfig) (any, error) {
-	srv := rc.Server
-	if srv == nil {
+	if rc.Server == nil {
 		return nil, errors.New("core: proxy mode requires a selected server")
 	}
+	return buildOutboundFor(rc, rc.Server, tagProxy)
+}
+
+// buildAutoOutbounds renders every configured server as its own outbound and
+// wraps them in a URLTest group tagged `proxy`. The group's own tag is the one
+// the policy refers to, so switching a server out for the group changes only
+// this function.
+func buildAutoOutbounds(rc RuntimeConfig) ([]any, error) {
+	out := make([]any, 0, len(rc.Servers)+1)
+	members := make([]string, 0, len(rc.Servers))
+	seen := make(map[string]bool, len(rc.Servers))
+	for i := range rc.Servers {
+		srv := &rc.Servers[i]
+		tag := ServerOutboundTag(srv)
+		if seen[tag] {
+			return nil, fmt.Errorf("core: two servers map to the outbound tag %q", tag)
+		}
+		seen[tag] = true
+		ob, err := buildOutboundFor(rc, srv, tag)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ob)
+		members = append(members, tag)
+	}
+	out = append(out, urltestOutbound{
+		Type:      "urltest",
+		Tag:       tagProxy,
+		Outbounds: members,
+		URL:       autoFailoverURL,
+		Interval:  autoFailoverInterval,
+		Tolerance: autoFailoverTolerance,
+	})
+	return out, nil
+}
+
+// ServerOutboundTag is the sing-box tag of one server's outbound in auto mode.
+// The server's own name is used, because that is what the Clash API reports and
+// what the TUI shows; reserved vender tags are prefixed so a server cannot
+// shadow them.
+func ServerOutboundTag(srv *config.Server) string {
+	switch srv.Name {
+	case tagProxy, tagDirect, tagBlock, tagMixed, tagTun:
+		return "server-" + srv.Name
+	}
+	return srv.Name
+}
+
+// buildOutboundFor renders one server as an outbound with the given tag.
+func buildOutboundFor(rc RuntimeConfig, srv *config.Server, tag string) (any, error) {
 	iface := rc.Config.Engine.BindInterface
 
 	switch srv.Type {
 	case config.TypeVLESS:
 		out := vlessOutbound{
 			Type:          "vless",
-			Tag:           tagProxy,
+			Tag:           tag,
 			Server:        srv.Address,
 			ServerPort:    srv.Port,
 			UUID:          srv.UUID,
@@ -468,7 +570,7 @@ func buildOutbound(rc RuntimeConfig) (any, error) {
 	case config.TypeHysteria2:
 		out := hysteria2Outbound{
 			Type:          "hysteria2",
-			Tag:           tagProxy,
+			Tag:           tag,
 			Server:        srv.Address,
 			ServerPort:    srv.Port,
 			Password:      srv.Password,
@@ -559,34 +661,53 @@ func buildDNS(policy rules.DNS) (*singboxDNS, error) {
 		Strategy: policy.Strategy,
 	}
 	for _, s := range policy.Servers {
-		if s.Tag == "" || s.Server == "" {
+		if s.Tag == "" {
 			return nil, fmt.Errorf("core: DNS server %q is incomplete", s.Tag)
 		}
+		// A fakeip server has no upstream address (it answers locally);
+		// every other transport needs one.
+		if s.Type != "fakeip" && s.Server == "" {
+			return nil, fmt.Errorf("core: DNS server %q has no address", s.Tag)
+		}
 		out.Servers = append(out.Servers, singboxDNSServer{
-			Tag:    s.Tag,
-			Type:   s.Type,
-			Server: s.Server,
-			Detour: s.Detour,
+			Tag:        s.Tag,
+			Type:       s.Type,
+			Server:     s.Server,
+			Detour:     s.Detour,
+			Inet4Range: s.Inet4Range,
+			Inet6Range: s.Inet6Range,
 		})
 	}
 	for _, r := range policy.Rules {
-		if len(r.RuleSets) == 0 {
-			return nil, fmt.Errorf("core: DNS rule %q matches no rule set", r.Name)
+		if len(r.RuleSets)+len(r.Domains)+len(r.DomainSuffixes)+len(r.QueryTypes) == 0 {
+			return nil, fmt.Errorf("core: DNS rule %q matches nothing", r.Name)
 		}
-		out.Rules = append(out.Rules, singboxDNSRule{RuleSet: r.RuleSets, Server: r.Server})
+		out.Rules = append(out.Rules, singboxDNSRule{
+			Action:       "route",
+			RuleSet:      r.RuleSets,
+			Domain:       r.Domains,
+			DomainSuffix: r.DomainSuffixes,
+			QueryType:    r.QueryTypes,
+			Server:       r.Server,
+		})
 	}
 	return out, nil
 }
 
-// buildRules converts the built-in policy into sing-box route rules: first the
-// actions (sniff, hijack-dns), then the destination rules in evaluation order.
+// buildRules converts the merged policy into sing-box route rules: first the
+// actions (sniff, hijack-dns), then the destination rules in evaluation order
+// (critical, user, built-in).
 //
 // DNS-only rules are still skipped: sing-box expresses DNS policy as the
 // `dns` section plus the hijack-dns action, not as destination matches, so a
-// DNSOnly rule here would silently misroute DNS. BuiltinRules returns none.
-func buildRules() ([]singboxRule, error) {
+// DNSOnly rule here would silently misroute DNS. Nothing emits one today.
+func buildRules(user *rules.UserRules) ([]singboxRule, error) {
+	policy, err := rules.EffectiveRules(user)
+	if err != nil {
+		return nil, err
+	}
 	out := buildActions()
-	for _, r := range rules.BuiltinRules() {
+	for _, r := range policy {
 		if err := r.Validate(); err != nil {
 			return nil, err
 		}

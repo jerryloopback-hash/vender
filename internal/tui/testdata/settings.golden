@@ -14,13 +14,13 @@
 │ config dir         /home/test/.config/vender   bind -                                            │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ built-in routing policy ────────────────────────────────────────────────────────────────────────╮
-│ actions  sniff, protocol=dns -> hijack-dns      final  proxy                                     │
-│  1  private-dest-direct     ip_is_private                                   direct               │
-│  2  ads-block               rule_set=[geosite-category-ads-all]             block                │
-│  3  service-overrides-pro…  rule_set=[geosite-steam geosite-onedrive geos…  proxy                │
-│  4  cn-direct               rule_set=[geosite-cn geoip-cn]                  direct               │
-│ dns      2 servers, 1 rule, final dns-remote      sets  12 embedded, 494 KiB                     │
-│ source   MetaCubeX/meta-rules-dat @ d1c433471f (2026-10-15)                                      │
+│ actions  sniff, protocol=dns -> hijack-dns   final  proxy   selected  Interserver-LA             │
+│  1  critical-direct         domain_suffix=[opencode.ai api.tavily.com]    direct                 │
+│  2  private-dest-direct     ip_is_private                                 direct                 │
+│  3  ads-block               rule_set=[geosite-category-ads-all]           block                  │
+│  4  service-overrides-pro…  rule_set=[geosite-steam geosite-onedrive ge…  proxy                  │
+│  5  cn-direct               rule_set=[geosite-cn geoip-cn]                direct                 │
+│ dns      2 servers, 3 rules, final dns-cn   user rules  none   sets  12, 494 KiB                 │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ autostart ──────────────────────────────────────────────────────────────────────────────────────╮
 │ start at login  checking…                                                                        │

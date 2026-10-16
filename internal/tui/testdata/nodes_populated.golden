@@ -1,9 +1,9 @@
  Dashboard   Nodes       Logs        Settings                                             vender M6
- servers  2   ↑/↓ move · enter select · t latency · r reload
+ servers  2   ↑/↓ move · enter select · A auto · t latency · r reload
 ╭─ servers.yaml ───────────────────────────────────────────────────────────────────────────────────╮
 │   NAME                  TYPE      PROTOCOL           ENDPOINT               ACTIVE LATENCY       │
 │ ▸ Interserver-LA        vless     reality/xtls-rprx… 162.35.170.235:443     ●      924 ms        │
 │   Interserver-LA-Hy2    hysteria2 obfs=salamander s… 162.35.170.235:8443           38 ms (tcp)   │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
  ● daemon pid 4821  attached to the daemon at 127.0.0.1:41234
- ↑/↓ move • enter select • t latency • r reload • tab screens • ? help
+ ↑/↓ move • enter select • A auto • t latency • r reload • tab screens • ? help

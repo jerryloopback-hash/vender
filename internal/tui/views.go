@@ -257,6 +257,13 @@ func (m Model) nodesPanel(w int) string {
 	if len(m.servers) == 0 {
 		label = "none configured"
 	}
+	if m.proxies.Auto {
+		cur := m.activeNode()
+		if cur == "" {
+			cur = "waiting for the first URL test"
+		}
+		label = fmt.Sprintf("%d configured, auto failover → %s", len(m.servers), cur)
+	}
 	return m.theme.panel("nodes", w,
 		m.theme.value.Render(label)+m.theme.subtle.Render("   ·   press 2 or tab for the list"),
 	)
@@ -321,6 +328,14 @@ func (m Model) serverText() string {
 	if m.currentMode() == string(config.ModeDirect) {
 		return m.theme.dim.Render("(not used in direct mode)")
 	}
+	if m.proxies.Auto {
+		cur := m.activeNode()
+		if cur == "" {
+			return m.theme.accent.Render("auto") + m.theme.subtle.Render("  failover over "+fmt.Sprint(len(m.servers))+" servers")
+		}
+		return m.theme.accent.Render("auto") + m.theme.subtle.Render("  → ") + m.theme.value.Render(cur) +
+			m.theme.dim.Render(fmt.Sprintf("   (%d candidates)", len(m.servers)))
+	}
 	name := m.selectedName()
 	if name == "" {
 		return m.theme.bad.Render("(none selected)")
@@ -334,6 +349,16 @@ func (m Model) serverText() string {
 }
 
 func (m Model) latencyBadge() string {
+	if m.proxies.Auto {
+		cur := m.activeNode()
+		if cur == "" {
+			return m.theme.dim.Render("auto: waiting for a URL test")
+		}
+		if n, ok := m.nodeHealth(cur); ok && n.Alive && n.DelayMs > 0 {
+			return latencyStyle(m.theme, n.DelayMs) + m.theme.dim.Render("  "+cur)
+		}
+		return m.theme.bad.Render("auto: " + cur + " unmeasured")
+	}
 	name := m.selectedName()
 	d, ok := m.latency[name]
 	if name == "" || !ok {
@@ -342,14 +367,19 @@ func (m Model) latencyBadge() string {
 	if d.Ms == 0 {
 		return m.theme.bad.Render("failed" + errSuffix(d.Err))
 	}
-	text := humanMillis(d.Ms)
+	return latencyStyle(m.theme, d.Ms)
+}
+
+// latencyStyle colours a millisecond figure by how usable it is.
+func latencyStyle(th theme, ms int) string {
+	text := humanMillis(ms)
 	switch {
-	case d.Ms < 200:
-		return m.theme.ok.Render("● " + text)
-	case d.Ms < 600:
-		return m.theme.warn.Render("● " + text)
+	case ms < 200:
+		return th.ok.Render("● " + text)
+	case ms < 600:
+		return th.warn.Render("● " + text)
 	default:
-		return m.theme.bad.Render("● " + text)
+		return th.bad.Render("● " + text)
 	}
 }
 
@@ -400,8 +430,19 @@ func (m Model) shortVersion(v string) string {
 func (m Model) nodesView() string {
 	w := m.panelWidth()
 	title := fmt.Sprintf("servers  %d", len(m.servers))
+	if m.proxies.Auto {
+		title = fmt.Sprintf("servers  %d   auto failover", len(m.servers))
+	}
 	head := " " + m.theme.title.Render(title) + "   " +
-		m.theme.subtle.Render("↑/↓ move · enter select · t latency · r reload")
+		m.theme.subtle.Render("↑/↓ move · enter select · A auto · t latency · r reload")
+	if m.proxies.Auto {
+		cur := m.activeNode()
+		if cur == "" {
+			cur = "(waiting for the first URL test)"
+		}
+		head += "\n  " + m.theme.subtle.Render("active member  ") + m.theme.value.Render(cur) +
+			m.theme.dim.Render("   (the engine picks the fastest reachable node)")
+	}
 	if len(m.servers) == 0 {
 		lines := []string{
 			m.theme.warn.Render("No servers configured."),
@@ -736,8 +777,10 @@ func modeDescription(pm config.ProxyMode) string {
 	}
 }
 
-// policyLines renders the built-in routing policy from internal/rules, so the
-// Settings screen is informative even with no daemon running.
+// policyLines renders the routing policy from internal/rules, so the Settings
+// screen is informative even with no daemon running. It shows the *merged*
+// policy: the built-in critical list, the user's rules.yaml, and the built-in
+// lists, in evaluation order.
 func (m Model) policyLines(mode string) []string {
 	if mode != string(config.ModeRule) {
 		if mode == string(config.ModeDirect) {
@@ -745,24 +788,58 @@ func (m Model) policyLines(mode string) []string {
 		}
 		return []string{m.theme.dim.Render("global mode sends everything through the proxy, so no routing rules are applied")}
 	}
+	policy, err := rules.EffectiveRules(m.snap.UserRules)
+	if err != nil {
+		return []string{m.theme.bad.Render("rules.yaml: " + err.Error())}
+	}
 	lines := []string{
 		m.theme.subtle.Render("actions  ") + m.theme.value.Render(joinSummaries(rules.BuiltinActions())) +
-			m.theme.subtle.Render("      final  ") + m.theme.accent.Render(string(rules.OutProxy)),
+			m.theme.subtle.Render("   final  ") + m.theme.accent.Render(string(rules.OutProxy)) +
+			m.theme.subtle.Render("   selected  ") + m.selectedText(),
 	}
-	for i, r := range rules.BuiltinRules() {
+	for i, r := range policy {
 		lines = append(lines, fmt.Sprintf("%2d  %s  %s  %s",
 			i+1,
 			m.theme.value.Render(pad(r.Name, 22)),
-			m.theme.subtle.Render(pad(r.Summary(), 46)),
+			m.theme.subtle.Render(pad(r.Summary(), 44)),
 			m.theme.accent.Render(string(r.Outbound))))
 	}
-	d := rules.BuiltinDNS()
+	d := rules.RuleModeDNS(m.snap.UserRules)
 	lines = append(lines,
 		m.theme.subtle.Render("dns      ")+m.theme.value.Render(fmt.Sprintf("%d servers, %s, final %s", len(d.Servers), plural(len(d.Rules), "rule"), d.Final))+
-			m.theme.subtle.Render("      sets  ")+m.theme.value.Render(fmt.Sprintf("%d embedded, %s", len(rules.ReferencedRuleSets()), humanBytes(float64(totalRuleSetSize())))),
-		m.theme.dim.Render(fmt.Sprintf("source   %s @ %s (2026-10-15)", rules.RuleSetSourceRepo, shortCommit(rules.RuleSetSourceCommit))),
+			m.theme.subtle.Render("   user rules  ")+m.rulesSummaryText()+
+			m.theme.subtle.Render("   sets  ")+m.theme.value.Render(fmt.Sprintf("%d, %s", len(rules.ReferencedRuleSets()), humanBytes(float64(totalRuleSetSize())))),
 	)
 	return lines
+}
+
+// rulesSummaryText is the compact "user rules" indicator for the policy panel.
+func (m Model) rulesSummaryText() string {
+	switch {
+	case m.snap.UserRulesErr != "":
+		return m.theme.bad.Render("error: " + truncate(m.snap.UserRulesErr, 30))
+	case m.snap.UserRules == nil:
+		return m.theme.dim.Render("none")
+	}
+	u := m.snap.UserRules
+	return m.theme.value.Render(fmt.Sprintf("direct %d, proxy %d, block %d", len(u.Direct), len(u.Proxy), len(u.Block)))
+}
+
+// selectedText renders the selected_server setting, including the auto
+// sentinel and the member currently carrying traffic.
+func (m Model) selectedText() string {
+	sel := m.selectedName()
+	if m.proxies.Auto || strings.EqualFold(sel, config.SelectedServerAuto) {
+		cur := m.activeNode()
+		if cur == "" {
+			return m.theme.accent.Render("auto") + m.theme.dim.Render("  (failover; waiting for the first URL test)")
+		}
+		return m.theme.accent.Render("auto") + m.theme.subtle.Render("  → "+cur)
+	}
+	if sel == "" {
+		return m.theme.bad.Render("(none)")
+	}
+	return m.theme.value.Render(sel)
 }
 
 func plural(n int, word string) string {
@@ -826,6 +903,7 @@ func (m Model) helpOverlay() string {
 		{
 			"Nodes",
 			"  ↑/↓, j/k   move      enter  select (restarts the engine)",
+			"  A          switch to auto failover (the engine picks the fastest node)",
 			"  t          latency for the highlighted server",
 			"  r          reload servers.yaml from disk",
 		},
@@ -872,7 +950,7 @@ func (m Model) keyMap() help.KeyMap {
 	switch m.screen {
 	case screenNodes:
 		return km{short: append([]key.Binding{
-			b("↑/↓", "move"), b("enter", "select"), b("t", "latency"), b("r", "reload"),
+			b("↑/↓", "move"), b("enter", "select"), b("A", "auto"), b("t", "latency"), b("r", "reload"),
 		}, common...)}
 	case screenLogs:
 		var f key.Binding

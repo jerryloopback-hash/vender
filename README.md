@@ -21,21 +21,24 @@ The pinned engine is **sing-box 1.14.3** (see `scripts/fetch-sing-box.sh`).
 
 ## Status
 
-`vender` is at **M6**: the configuration layer and share-link parser (M0), the
-engine (M1), **smart routing out of the box** (M2), an **animated terminal UI**
-(M3), **start at login on Linux and Windows 11**, **Windows system-proxy
-control** and **release packaging** (M4), and now an optional **TUN mode** —
-transparent, system-wide capture on top of the same engine and the same policy.
-The rule sets the default policy matches against are **embedded in the binary**,
-so a working default needs no download at runtime; the TUI attaches to the
-running daemon over a local control channel and can switch servers, change mode,
-turn TUN mode on and off, start and stop the engine, tail its log, show live
-traffic and toggle start-at-login.
+`vender` is at **M6 + M5 (robustness)**: the configuration layer and share-link
+parser (M0), the engine (M1), **smart routing out of the box** (M2), an
+**animated terminal UI** (M3), **start at login on Linux and Windows 11**,
+**Windows system-proxy control** and **release packaging** (M4), and an optional
+**TUN mode** — transparent, system-wide capture on top of the same engine and the
+same policy (M6). M5 hardens the whole thing against a bad link: a tiny
+**critical list** and an optional **`rules.yaml`** that no proxy can cut off, a
+**DNS split that never depends on the proxy** (FakeIP for proxied names, direct
+resolution for direct ones), and **`selected_server: auto`** node failover. The
+rule sets the default policy matches against are **embedded in the binary**, so a
+working default needs no download at runtime; the TUI attaches to the running
+daemon over a local control channel and can switch servers, change mode, turn TUN
+mode on and off, start and stop the engine, tail its log, show live traffic and
+toggle start-at-login.
 
 Everything the CLI offers is implemented; there are no `not implemented` stubs
-left. (The subscription/latency milestone, M5, is not part of this line: `import`
-takes one link at a time and latency is measured by `vender tui` and the control
-channel rather than by a dedicated command.)
+left. (Subscription URLs and bulk import are not part of this line: `import`
+takes one link at a time.)
 
 ## Roadmap
 
@@ -45,10 +48,10 @@ channel rather than by a dedicated command.)
 | M1 | Engine: generate the sing-box config, supervise the child process, `daemon`, `status`, `proxy on\|off` |
 | M2 | Built-in routing rules (CN direct, ad block, private IPs), split DNS, embedded rule sets, `rules list` |
 | M3 | Control channel (loopback TCP + token, `control.json`), live traffic from sing-box's Clash API, animated Bubble Tea TUI (`vender tui`) |
-| **M4** | **Autostart** (systemd user unit / XDG autostart on Linux; Task Scheduler logon task / Run key on Windows), **Windows system proxy** (WinINET), **release packaging** and a per-user installer |
-| M5 | Subscription links and bulk import, server latency testing — *not in this line* |
+| M4 | **Autostart** (systemd user unit / XDG autostart on Linux; Task Scheduler logon task / Run key on Windows), **Windows system proxy** (WinINET), **release packaging** and a per-user installer |
+| **M5** | **Robustness**: critical "must survive a dead proxy" list, user `rules.yaml`, proxy-independent split DNS (FakeIP), `selected_server: auto` failover and node health in the TUI |
 | **M6** | **Optional TUN mode** (transparent system-wide capture, `vender tun on\|off\|status`, TUN-aware autostart) |
-| M7 | Hardening & release: health-based failover, log rotation, signed builds |
+| M7 | Hardening & release: subscription import, latency ranking, log rotation, signed builds |
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and the
 interfaces between milestones.
@@ -138,8 +141,11 @@ If none is found, the error names all three locations.
 
 ./vender servers list          # table of configured servers, * marks the active one
 ./vender servers list --links  # print the share link of every server (contains secrets)
+./vender servers use My-Node   # make a server active (restarts a running daemon)
+./vender servers use auto      # or fail over automatically across all of them
 ./vender servers rm My-Node    # remove a server by name
-./vender rules list            # the built-in routing policy and the embedded rule sets
+./vender rules list            # the merged routing policy and the embedded rule sets
+./vender rules init            # write a commented per-user rules.yaml
 ./vender version               # build information
 
 ./vender daemon                # run the proxy (foreground; Ctrl-C to stop)
@@ -428,7 +434,7 @@ editable configuration:
 | Linux | `~/.cache/vender/` (or `$XDG_CACHE_HOME/vender`) |
 | Windows | `%LocalAppData%\vender\` |
 
-Two files live in the config directory:
+Two files live in the config directory, plus an optional third:
 
 - `config.yaml` — global settings (world-readable, no secrets):
 
@@ -450,7 +456,7 @@ Two files live in the config directory:
           # address: []                       # the device's own address
           # route_exclude_address: []         # CIDRs kept out of the tunnel
           # route_exclude_address_set: []     # rule-set tags kept out (e.g. geoip-cn)
-  selected_server: ""
+  selected_server: ""     # a name in servers.yaml, or "auto" for failover
   ```
 
   A disabled `engine.tun` block is inert: it is not validated and nothing is
@@ -481,6 +487,28 @@ Two files live in the config directory:
 Hand-edited files are validated on load, and problems are reported all at once
 with the field that is wrong.
 
+- `rules.yaml` — **optional** user routing rules. It is merged *before* the
+  built-in policy, so an entry here always wins; only the built-in critical list
+  (below) is evaluated before it. vender never creates it on its own:
+
+  ```yaml
+  # one entry per line; a bare name means "this domain and all subdomains"
+  direct:
+      - internal.corp
+      - =exact.example      # this exact name only (no subdomains)
+      - 10.0.0.0/8          # an IP range
+  proxy:
+      - blocked.example
+  block:
+      - ads.example
+  ```
+
+  ```sh
+  vender rules init      # write a commented rules.yaml (refuses to overwrite)
+  vender rules path      # where it lives
+  vender rules list      # the merged policy, in evaluation order
+  ```
+
 ## Routing rules
 
 `proxy.mode: rule` (the default) applies a small, built-in policy. It is derived
@@ -493,14 +521,23 @@ The policy, in evaluation order (first match wins):
 
 | # | Rule | Matches | Goes to |
 |---|---|---|---|
-| 1 | `private-dest-direct` | `ip_is_private` (RFC1918, loopback, link-local) | `direct` |
-| 2 | `ads-block` | `geosite-category-ads-all` | `block` |
-| 3 | `service-overrides-proxy` | Steam, OneDrive, Microsoft, Google, YouTube, Telegram, Netflix, OpenAI, Bahamut | `proxy` |
-| 4 | `cn-direct` | `geosite-cn`, `geoip-cn` | `direct` |
+| 1 | `critical-direct` | `opencode.ai`, `api.tavily.com` | `direct` |
+| 2 | `user-direct` | `rules.yaml` `direct:` (if any) | `direct` |
+| 3 | `user-proxy` | `rules.yaml` `proxy:` | `proxy` |
+| 4 | `user-block` | `rules.yaml` `block:` | `block` |
+| 5 | `private-dest-direct` | `ip_is_private` (RFC1918, loopback, link-local) | `direct` |
+| 6 | `ads-block` | `geosite-category-ads-all` | `block` |
+| 7 | `service-overrides-proxy` | Steam, OneDrive, Microsoft, Google, YouTube, Telegram, Netflix, OpenAI, Bahamut | `proxy` |
+| 8 | `cn-direct` | `geosite-cn`, `geoip-cn` | `direct` |
 | — | `route.final` | everything else | `proxy` |
 
 Two things about the order are load-bearing:
 
+- **The critical list is first, and tiny.** It holds the domains whose loss would
+  make the machine unmanageable rather than merely inconvenient — the coding
+  agent's own model/API plane and the research API it uses. They are resolved
+  and dialled directly, so a dead proxy can never cut them off; nothing, not even
+  a `rules.yaml` entry, can route them through the proxy.
 - **The service overrides must come before the China rule.** Several of those
   services have China-facing entries in `geosite-cn`; if the China rule ran
   first, a Steam store page or a Microsoft sign-in would be dialled directly and
@@ -513,21 +550,51 @@ Two things about the order are load-bearing:
   traffic direct.
 
 Sniffing is what makes domain rules work for connections that arrive as bare
-IPs, and DNS is resolved along the same split as the traffic:
+IPs. DNS is split so that **name resolution never depends on the proxy**:
 
 ```
-geosite-cn            -> dns-cn      223.5.5.5 over UDP, direct
-everything else       -> dns-remote  Cloudflare DoH, through the proxy
+critical list         -> dns-cn      223.5.5.5 over UDP, direct   -> real address
+rules.yaml direct:    -> dns-cn      direct                        -> real address
+geosite-cn            -> dns-cn      direct                        -> real address
+everything else, A/AAAA -> dns-fakeip  local, no upstream          -> fake address
+everything else, other  -> dns-cn      direct                        -> real address
 ```
 
-Both are emitted as sing-box 1.14 *actions* (`{"action":"sniff"}`,
+The proxied side is answered by a local **FakeIP** resolver: it hands out a
+synthetic `198.18.0.0/15` address in microseconds, with no query to anyone, and
+the engine maps it back to the real name before the proxy dials it. That is the
+whole fix for "a slow proxy stalls DNS for everything": there is no longer a
+resolver reached *through* the proxy. The one trade-off, stated plainly: a
+non-address query (HTTPS/SVCB, TXT) for a foreign name is answered by the
+domestic resolver, so the *name* is visible to it. Address queries — the ones
+connections actually use — never leave the machine for a proxied domain. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §7.3 for the full reasoning.
+
+The split is emitted as sing-box 1.14 *actions* (`{"action":"sniff"}`,
 `{"action":"hijack-dns"}`) plus a `dns` block; the legacy inbound `sniff` field
-the pinned engine removed is never written. The proxied resolver is addressed by
-IP and reached through the proxy outbound, so a foreign query never appears on
-the local network.
+the pinned engine removed is never written.
 
-`vender rules list` prints exactly this policy, the DNS split and the rule sets
-below.
+`vender rules list` prints exactly this merged policy, the DNS split and the rule
+sets below.
+
+### Automatic failover (`selected_server: auto`)
+
+Point `selected_server` at `auto` and vender renders **every** server in
+`servers.yaml` as a member of a sing-box `urltest` group, instead of pinning one.
+The engine then re-tests each node against a "generate 204" URL every minute and
+carries traffic over the fastest reachable one, so a degraded node is bypassed
+without anyone touching anything:
+
+```sh
+vender servers use auto     # turn failover on (a running daemon restarts)
+vender servers use My-Node  # pin a single server again
+```
+
+The group reuses the `proxy` tag, so the routing policy, `route.final` and the
+global-mode DNS resolver are all unchanged. In the **Nodes** screen the header
+shows which member is carrying traffic and the latency column is filled from the
+engine's own URL-test results; `A` switches to auto. Single-server setups are
+completely unaffected — the generated config is byte-identical to before.
 
 ### Embedded rule sets ("全部内置")
 
@@ -579,14 +646,14 @@ scripts/fetch-rules.sh --print-size # the embedded total
 
 ### What is deliberately not here yet
 
-- **One outbound.** There is a single `proxy` outbound. Proxy groups, node
-  selection by rule and per-rule outbound choice are a later milestone.
-- **No per-user rules file.** A file to add or override entries would slot in
-  exactly where `rules.BuiltinRules()` returns its slice; the ordering, the
-  conversion and the CLI listing already work off that slice.
+- **No per-rule outbound choice.** The proxy is either the selected server or,
+  in auto mode, one URLTest group over all of them; there is no "Chinese traffic
+  through node A, the rest through node B".
+- **No subscription URLs or bulk import.** Servers are added one share link at a
+  time (`vender import`).
 - **No `mode: global` rules.** `global` means everything through the proxy, so
-  it emits no routing rules at all — only a proxied DNS resolver. `direct`
-  emits no proxy outbound and no DNS block.
+  it emits no routing rules at all — only a proxied DNS resolver. `direct` emits
+  no proxy outbound and no DNS block.
 
 ## What the daemon does
 

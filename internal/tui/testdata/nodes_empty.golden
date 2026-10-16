@@ -1,5 +1,5 @@
  Dashboard   Nodes       Logs        Settings                                             vender M6
- servers  0   ↑/↓ move · enter select · t latency · r reload
+ servers  0   ↑/↓ move · enter select · A auto · t latency · r reload
 ╭─ configuration ──────────────────────────────────────────────────────────────────────────────────╮
 │ No servers configured.                                                                           │
 │                                                                                                  │
@@ -8,4 +8,4 @@
 │   then press       r to reload                                                                   │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
  ○ daemon not running — start it with `vender daemon`  (waiting)
- ↑/↓ move • enter select • t latency • r reload • tab screens • ? help
+ ↑/↓ move • enter select • A auto • t latency • r reload • tab screens • ? help

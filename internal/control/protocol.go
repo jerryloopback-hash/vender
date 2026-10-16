@@ -73,6 +73,9 @@ const (
 	CmdStop    = "stop"
 	CmdRestart = "restart"
 	CmdRules   = "rules"
+	// CmdProxies reports the engine's outbound table: which failover member is
+	// active and how each one is measuring.
+	CmdProxies = "proxies"
 )
 
 // Streams. A subscription request takes over its connection.
@@ -185,6 +188,36 @@ type TunStatus struct {
 	// is what makes them trustworthy: a client's own privileges may differ.
 	PrivilegesOK    bool   `json:"privilegesOk"`
 	PrivilegeDetail string `json:"privilegeDetail,omitempty"`
+}
+
+// NodeHealth is one failover member's state, as the engine reports it.
+type NodeHealth struct {
+	// Name is the outbound tag, which for a server is the server's own name.
+	Name string `json:"name"`
+	// Active reports whether this member is the one currently carrying traffic.
+	Active bool `json:"active"`
+	// DelayMs is the engine's last measured round trip through this member, or
+	// 0 when it has not been measured (or the measurement failed).
+	DelayMs int `json:"delayMs,omitempty"`
+	// Alive reports whether the last measurement succeeded.
+	Alive bool `json:"alive"`
+}
+
+// ProxiesData is the reply to CmdProxies: the failover group's state, plus one
+// row per configured server. Nodes is empty (never nil, for JSON friendliness)
+// when the daemon is not running or the engine has no Clash API.
+type ProxiesData struct {
+	// Auto reports whether selected_server is "auto", i.e. whether a failover
+	// group is in play at all.
+	Auto bool `json:"auto"`
+	// Group is the proxy tag the policy uses, when there is a group.
+	Group string `json:"group,omitempty"`
+	// Current is the active member's tag (auto mode only).
+	Current string `json:"current,omitempty"`
+	// Nodes lists every configured server with its measured health.
+	Nodes []NodeHealth `json:"nodes"`
+	// Err is a non-fatal explanation (typically "the engine is not running").
+	Err string `json:"err,omitempty"`
 }
 
 // ServerInfo is one row of the server list, as the daemon sees it.

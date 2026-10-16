@@ -436,3 +436,33 @@ func TestEnsureDirCreatesParents(t *testing.T) {
 		t.Errorf("%s is not a directory", dir)
 	}
 }
+
+// selected_server may also be the "auto" sentinel, and SelectServer accepts it
+// without requiring a matching entry in servers.yaml.
+func TestStoreSelectAuto(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreAt(dir)
+	if err := store.SaveServers(NewServerSet()); err != nil {
+		t.Fatal(err)
+	}
+	// Auto with no servers is refused (there is nothing to fail over between).
+	if err := store.SelectServer(SelectedServerAuto); err == nil {
+		t.Error("SelectServer(auto) with no servers = nil, want an error")
+	}
+	if _, err := store.AddServer(Server{Name: "n1", Type: TypeHysteria2, Address: testHost, Port: 8443, Password: testPW}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SelectServer("AUTO"); err != nil {
+		t.Fatalf("SelectServer(AUTO): %v", err)
+	}
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.IsAutoServer() {
+		t.Errorf("selected_server = %q, want auto", cfg.SelectedServer)
+	}
+	if store.RulesPath() != filepath.Join(dir, RulesFileName) {
+		t.Errorf("RulesPath = %q", store.RulesPath())
+	}
+}

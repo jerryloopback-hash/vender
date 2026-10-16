@@ -30,6 +30,11 @@ func holdLock(t *testing.T, runDir string) {
 func TestCLIStatusFailsWhenNoDaemonRuns(t *testing.T) {
 	cfgDir := t.TempDir()
 	runDir := t.TempDir()
+	// Pin the listen address to a port nothing is using: the default (7897) is
+	// the conventional clash mixed port, and on a developer's machine a real
+	// proxy (or vender itself) may legitimately be listening on it, which would
+	// make this "nothing is accepting" assertion depend on the host.
+	writeConfig(t, cfgDir, "127.0.0.1:"+strconv.Itoa(freePort(t)))
 
 	out, err := runCLIIn(t, runDir, "status", "--config-dir", cfgDir)
 	if err == nil {

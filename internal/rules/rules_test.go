@@ -92,17 +92,11 @@ func TestBuiltinActions(t *testing.T) {
 
 func TestBuiltinDNSIsSplit(t *testing.T) {
 	dns := BuiltinDNS()
-	if dns.Final != DNSRemote {
-		t.Errorf("BuiltinDNS().Final = %q, want the proxied resolver %q", dns.Final, DNSRemote)
+	if dns.Final != DNSCN {
+		t.Errorf("BuiltinDNS().Final = %q, want the direct domestic resolver %q", dns.Final, DNSCN)
 	}
 	if dns.Strategy != "prefer_ipv4" {
 		t.Errorf("BuiltinDNS().Strategy = %q, want prefer_ipv4", dns.Strategy)
-	}
-	if len(dns.Rules) != 1 || dns.Rules[0].Server != DNSCN {
-		t.Fatalf("BuiltinDNS().Rules = %+v, want exactly the geosite-cn -> dns-cn split", dns.Rules)
-	}
-	if got := strings.Join(dns.Rules[0].RuleSets, ","); got != "geosite-cn" {
-		t.Errorf("DNS rule matches %q, want geosite-cn", got)
 	}
 
 	byTag := map[string]DNSServer{}
@@ -116,22 +110,209 @@ func TestBuiltinDNSIsSplit(t *testing.T) {
 	if cn.Detour != "" {
 		t.Errorf("%s must be reached directly, got detour %q", DNSCN, cn.Detour)
 	}
-	remote, ok := byTag[DNSRemote]
-	if !ok {
-		t.Fatalf("BuiltinDNS() has no %s server", DNSRemote)
+	if cn.Server == "" || cn.Type != "udp" {
+		t.Errorf("%s must be a domestic UDP resolver, got %+v", DNSCN, cn)
 	}
-	if remote.Detour != string(OutProxy) {
-		t.Errorf("%s detour = %q, want the proxy outbound: a foreign resolver reached directly is a leak", DNSRemote, remote.Detour)
+	fake, ok := byTag[DNSFakeIP]
+	if !ok {
+		t.Fatalf("BuiltinDNS() has no %s server", DNSFakeIP)
+	}
+	if fake.Type != "fakeip" || fake.Server != "" {
+		t.Errorf("%s must be a local FakeIP server with no upstream, got %+v", DNSFakeIP, fake)
+	}
+	if fake.Inet4Range == "" {
+		t.Errorf("%s has no inet4_range", DNSFakeIP)
+	}
+
+	// No DNS server may be reached through the proxy in rule mode: that is the
+	// exact design failure M5 fixes.
+	for _, s := range dns.Servers {
+		if s.Detour == string(OutProxy) {
+			t.Errorf("rule-mode DNS server %q is reached through the proxy", s.Tag)
+		}
+	}
+
+	// The rules mirror the routing split: real resolution for what goes direct,
+	// FakeIP for what is proxied.
+	var cnRule, fakeRule *DNSRule
+	for i := range dns.Rules {
+		r := &dns.Rules[i]
+		switch r.Name {
+		case "critical-direct-real":
+			if len(r.DomainSuffixes) == 0 {
+				t.Error("the critical rule matches no domain")
+			}
+			if r.Server != DNSCN {
+				t.Errorf("the critical rule resolves via %q, want the direct resolver", r.Server)
+			}
+		case "cn-domains-real":
+			cnRule = r
+		case "proxied-fakeip":
+			fakeRule = r
+		}
+	}
+	if cnRule == nil || cnRule.Server != DNSCN {
+		t.Fatalf("no geosite-cn -> %s DNS rule: %+v", DNSCN, dns.Rules)
+	}
+	if got := strings.Join(cnRule.RuleSets, ","); got != "geosite-cn" {
+		t.Errorf("the CN rule matches %q, want geosite-cn", got)
+	}
+	if fakeRule == nil || fakeRule.Server != DNSFakeIP {
+		t.Fatalf("no address-query -> %s DNS rule: %+v", DNSFakeIP, dns.Rules)
+	}
+	if got := strings.Join(fakeRule.QueryTypes, ","); got != "A,AAAA" {
+		t.Errorf("the FakeIP rule restricts query types to %q, want A,AAAA", got)
+	}
+	// Rule order is the policy: the FakeIP catch-all must be last so the
+	// specific (direct) rules win.
+	if dns.Rules[len(dns.Rules)-1].Name != "proxied-fakeip" {
+		t.Errorf("the FakeIP rule is not last: %+v", dns.Rules)
 	}
 
 	// Global mode has no split to make, but it must still resolve through the
-	// proxy.
+	// proxy, because in global mode everything is proxied anyway.
 	g := GlobalDNS()
 	if len(g.Rules) != 0 {
 		t.Errorf("GlobalDNS() carries rules %+v, want none", g.Rules)
 	}
 	if len(g.Servers) != 1 || g.Servers[0].Detour != string(OutProxy) {
 		t.Errorf("GlobalDNS() = %+v, want a single proxied resolver", g.Servers)
+	}
+}
+
+func TestCriticalListIsTinyAndDirect(t *testing.T) {
+	suffixes := CriticalDirectSuffixes()
+	if len(suffixes) == 0 || len(suffixes) > 5 {
+		t.Fatalf("CriticalDirectSuffixes() = %v, want a tiny list", suffixes)
+	}
+	for _, want := range []string{"opencode.ai", "api.tavily.com"} {
+		found := false
+		for _, s := range suffixes {
+			if s == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("the critical list does not contain %q", want)
+		}
+	}
+	rules := CriticalRules()
+	if len(rules) != 1 || rules[0].Outbound != OutDirect {
+		t.Fatalf("CriticalRules() = %+v, want one direct rule", rules)
+	}
+	if err := rules[0].Validate(); err != nil {
+		t.Errorf("the critical rule does not validate: %v", err)
+	}
+}
+
+func TestEffectiveRulesOrder(t *testing.T) {
+	user := &UserRules{
+		Direct: []string{"always.direct.example"},
+		Proxy:  []string{"force.proxy.example"},
+		Block:  []string{"block.this.example"},
+	}
+	policy, err := EffectiveRules(user)
+	if err != nil {
+		t.Fatalf("EffectiveRules: %v", err)
+	}
+	if policy[0].Name != "critical-direct" {
+		t.Errorf("policy[0] = %q, want the critical list first", policy[0].Name)
+	}
+	// The user rules come next, in direct/proxy/block order, then the built-in
+	// policy.
+	want := []string{"critical-direct", "user-direct", "user-proxy", "user-block"}
+	for i, name := range want {
+		if i >= len(policy) {
+			t.Fatalf("policy has %d rules, want at least %d", len(policy), len(want))
+		}
+		if policy[i].Name != name {
+			t.Errorf("policy[%d] = %q, want %q", i, policy[i].Name, name)
+		}
+	}
+	builtin := len(policy) - len(BuiltinRules())
+	if builtin < len(want) {
+		t.Fatalf("the built-in policy is not at the end: %+v", policy)
+	}
+	for i, r := range BuiltinRules() {
+		if policy[builtin+i].Name != r.Name {
+			t.Errorf("built-in rule %q is not at index %d", r.Name, builtin+i)
+		}
+	}
+}
+
+func TestUserRulesParseAndCompile(t *testing.T) {
+	data := []byte(`
+direct:
+  - opencode.ai
+  - =exact.example
+  - .tld
+  - 10.0.0.0/8
+proxy:
+  - force.proxy
+block:
+  - cidr:192.0.2.0/24
+`)
+	u, err := ParseUserRules(data)
+	if err != nil {
+		t.Fatalf("ParseUserRules: %v", err)
+	}
+	if err := u.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	got, err := u.Rules()
+	if err != nil {
+		t.Fatalf("Rules: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("Rules() = %+v, want direct, proxy and block", got)
+	}
+	if got[0].Name != "user-direct" || got[0].Outbound != OutDirect {
+		t.Errorf("direct rule = %+v", got[0])
+	}
+	// Bare and .prefixed entries are suffixes; = is an exact domain; a slash
+	// is a CIDR.
+	if strings.Join(got[0].DomainSuffixes, ",") != "opencode.ai,tld" {
+		t.Errorf("direct suffixes = %v", got[0].DomainSuffixes)
+	}
+	if strings.Join(got[0].Domains, ",") != "exact.example" {
+		t.Errorf("direct domains = %v", got[0].Domains)
+	}
+	if strings.Join(got[0].IPCIDRs, ",") != "10.0.0.0/8" {
+		t.Errorf("direct cidrs = %v", got[0].IPCIDRs)
+	}
+	if strings.Join(got[2].IPCIDRs, ",") != "192.0.2.0/24" {
+		t.Errorf("block cidrs = %v", got[2].IPCIDRs)
+	}
+
+	if err := (&UserRules{Direct: []string{"has space.example"}}).Validate(); err == nil {
+		t.Error("a domain with a space validated")
+	}
+	if err := (&UserRules{Proxy: []string{"10.0.0.0/99"}}).Validate(); err == nil {
+		t.Error("a bad CIDR validated")
+	}
+}
+
+func TestRuleModeDNSMirrorsUserDirectList(t *testing.T) {
+	user := &UserRules{Direct: []string{"internal.corp"}}
+	dns := RuleModeDNS(user)
+	var found bool
+	for _, r := range dns.Rules {
+		if r.Name == "user-direct-real" {
+			found = true
+			if r.Server != DNSCN {
+				t.Errorf("user direct rule resolves via %q, want %s", r.Server, DNSCN)
+			}
+			if strings.Join(r.DomainSuffixes, ",") != "internal.corp" {
+				t.Errorf("user direct suffixes = %v", r.DomainSuffixes)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("RuleModeDNS did not add a user direct rule: %+v", dns.Rules)
+	}
+	// Without user rules the policy is exactly the built-in one.
+	if len(BuiltinDNS().Rules) != len(RuleModeDNS(nil).Rules) {
+		t.Error("BuiltinDNS is not RuleModeDNS(nil)")
 	}
 }
 

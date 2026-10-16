@@ -174,6 +174,56 @@ func TestConfigValidateAgainst(t *testing.T) {
 	}
 }
 
+// The "auto" sentinel is accepted with at least one server, and rejected with
+// none; Selection resolves it to the whole list.
+func TestConfigSelectionAuto(t *testing.T) {
+	ss := NewServerSet()
+	for _, name := range []string{"node-a", "node-b"} {
+		if err := ss.Add(Server{Name: name, Type: TypeHysteria2, Address: testHost, Port: 8443, Password: testPW}, false); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+	single := NewServerSet()
+	if err := single.Add(Server{Name: "only", Type: TypeHysteria2, Address: testHost, Port: 8443, Password: testPW}, false); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	cfg := Default()
+	cfg.SelectedServer = SelectedServerAuto
+	if !cfg.IsAutoServer() {
+		t.Error("IsAutoServer() = false for the auto sentinel")
+	}
+	if err := cfg.ValidateAgainst(ss); err != nil {
+		t.Errorf("ValidateAgainst(auto) = %v, want nil", err)
+	}
+	srv, all, err := cfg.Selection(ss)
+	if err != nil {
+		t.Fatalf("Selection(auto): %v", err)
+	}
+	if srv != nil || len(all) != 2 {
+		t.Errorf("Selection(auto) = (%v, %d servers), want (nil, 2)", srv, len(all))
+	}
+
+	// Auto with no servers is a mistake worth reporting.
+	if err := cfg.ValidateAgainst(NewServerSet()); err == nil {
+		t.Error("ValidateAgainst(auto) with no servers = nil, want an error")
+	}
+	if _, _, err := cfg.Selection(NewServerSet()); err == nil {
+		t.Error("Selection(auto) with no servers = nil error")
+	}
+	// The single case still resolves by name.
+	cfg.SelectedServer = "only"
+	srv, all, err = cfg.Selection(single)
+	if err != nil || srv == nil || srv.Name != "only" || all != nil {
+		t.Errorf("Selection(only) = (%v, %v, %v)", srv, all, err)
+	}
+	// Direct mode uses no server at all, even auto.
+	cfg.Proxy.Mode = ModeDirect
+	if srv, all, err := cfg.Selection(ss); err != nil || srv != nil || all != nil {
+		t.Errorf("Selection(direct) = (%v, %v, %v), want all nil", srv, all, err)
+	}
+}
+
 func TestSaveConfigRejectsInvalid(t *testing.T) {
 	store := NewStoreAt(t.TempDir())
 	bad := Default()

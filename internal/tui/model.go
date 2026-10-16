@@ -17,6 +17,7 @@ import (
 	"github.com/ll-lite/vender/internal/config"
 	"github.com/ll-lite/vender/internal/control"
 	"github.com/ll-lite/vender/internal/core"
+	"github.com/ll-lite/vender/internal/rules"
 )
 
 // screen identifies one of the TUI's four screens.
@@ -65,11 +66,16 @@ type (
 	tickMsg time.Time
 
 	daemonUpMsg struct {
-		cli *control.Client
-		st  control.StatusData
+		cli     *control.Client
+		st      control.StatusData
+		proxies control.ProxiesData
 	}
-	daemonDownMsg   struct{ err error }
-	statusMsg       struct{ st control.StatusData }
+	daemonDownMsg struct{ err error }
+	statusMsg     struct {
+		st      control.StatusData
+		proxies control.ProxiesData
+	}
+	proxiesMsg      struct{ data control.ProxiesData }
 	statusFailedMsg struct{ err error }
 	streamReadyMsg  struct {
 		name   string
@@ -113,6 +119,7 @@ type (
 type configSnapshot struct {
 	ConfigDir     string
 	ServersPath   string
+	RulesPath     string
 	Listen        string
 	Mode          string
 	LogLevel      string
@@ -121,7 +128,12 @@ type configSnapshot struct {
 	BindInterface string
 	Selected      string
 	Servers       []config.Server
-	Err           string
+	// UserRules is the parsed rules.yaml (nil when the file is absent), and
+	// UserRulesErr says why it could not be read. They let the Settings screen
+	// show the *merged* policy with no daemon running.
+	UserRules    *rules.UserRules
+	UserRulesErr string
+	Err          string
 
 	// Tun is the configured TUN block, and TunPriv is the local verdict on
 	// whether this machine could create a TUN. Both are read from disk, so the
@@ -165,6 +177,7 @@ type Model struct {
 	servers   []serverRow
 	selected  string
 	latency   map[string]control.LatencyData
+	proxies   control.ProxiesData
 	upRates   []float64
 	downRates []float64
 	totalUp   int64
@@ -208,6 +221,9 @@ type serverRow struct {
 	Endpoint string
 	Active   bool
 	Latency  string
+	// Health is the engine's verdict on this node (auto mode): "up"/"down"/
+	// "" (not measured yet). It is what tells a user *why* a member is active.
+	Health string
 }
 
 // newModel builds the initial model. It performs no I/O: everything that
@@ -282,7 +298,14 @@ func attachCmd(ctx context.Context, opts Options) tea.Cmd {
 			_ = cli.Close()
 			return daemonDownMsg{err: err}
 		}
-		return daemonUpMsg{cli: cli, st: st}
+		// The failover state is a second cheap call on the same connection; a
+		// failure there must not make the whole poll look failed, since the
+		// status itself is still valid.
+		var proxies control.ProxiesData
+		if p, perr := cli.Proxies(cctx); perr == nil {
+			proxies = p
+		}
+		return daemonUpMsg{cli: cli, st: st, proxies: proxies}
 	}
 }
 
@@ -294,7 +317,14 @@ func pollStatusCmd(ctx context.Context, cli *control.Client) tea.Cmd {
 		if err != nil {
 			return statusFailedMsg{err: err}
 		}
-		return statusMsg{st: st}
+		// The failover state is a second cheap call on the same connection; a
+		// failure there must not make the whole poll look failed, since the
+		// status itself is still valid.
+		var proxies control.ProxiesData
+		if p, perr := cli.Proxies(cctx); perr == nil {
+			proxies = p
+		}
+		return statusMsg{st: st, proxies: proxies}
 	}
 }
 
@@ -407,6 +437,7 @@ func loadSnapshot(opts Options) configSnapshot {
 	snap := configSnapshot{ConfigDir: opts.ConfigDir}
 	store := config.NewStoreAt(opts.ConfigDir)
 	snap.ServersPath = store.ServersPath()
+	snap.RulesPath = store.RulesPath()
 
 	if cfg, err := store.LoadConfig(); err != nil {
 		snap.Err = err.Error()
@@ -424,6 +455,11 @@ func loadSnapshot(opts Options) configSnapshot {
 		engine, _ := core.ResolveBinary(*cfg)
 		snap.EnginePath = engine
 		snap.TunPriv = core.CheckTUNPrivilege(engine)
+	}
+	if user, err := rules.LoadUserRules(store.RulesPath()); err != nil {
+		snap.UserRulesErr = err.Error()
+	} else {
+		snap.UserRules = user
 	}
 	if ss, err := store.LoadServers(); err != nil {
 		if snap.Err == "" {
@@ -573,6 +609,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.attached = true
 		m.cli = msg.cli
 		m.status = msg.st
+		m.proxies = msg.proxies
 		m.syncRowsFromStatus()
 		return m, tea.Batch(
 			streamCmd(m.ctx, m.opts, control.StreamLogs),
@@ -590,10 +627,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		wasAttached := m.attached
 		m.attached = true
 		m.status = msg.st
+		m.proxies = msg.proxies
 		m.syncRowsFromStatus()
 		if !wasAttached {
 			return m, nil
 		}
+		return m, nil
+
+	case proxiesMsg:
+		m.proxies = msg.data
+		m.rebuildRows()
 		return m, nil
 
 	case statusFailedMsg:
@@ -836,6 +879,19 @@ func (m Model) handleNodesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.busy = "switching to " + row.Name + "…"
 		return m, selectServerCmd(m.ctx, m.opts, row.Name)
+	case "A":
+		// Switch to automatic failover: the engine then picks the fastest
+		// reachable node instead of pinning one.
+		if !m.attached {
+			m.setToast("daemon not running: start it with `vender daemon`", true)
+			return m, nil
+		}
+		if m.proxies.Auto {
+			m.setToast("already in auto failover", false)
+			return m, nil
+		}
+		m.busy = "enabling auto failover…"
+		return m, selectServerCmd(m.ctx, m.opts, config.SelectedServerAuto)
 	case "t":
 		row := m.currentRow()
 		if row == nil {
@@ -945,6 +1001,11 @@ func (m Model) startLatency(name string) (tea.Model, tea.Cmd) {
 	if !m.attached {
 		m.setToast("daemon not running: start it with `vender daemon`", true)
 		return m, nil
+	}
+	if name == "" && m.proxies.Auto {
+		// The active server is the failover group's current member, which the
+		// daemon names by its tag (the server name).
+		name = m.activeNode()
 	}
 	label := name
 	if label == "" {
@@ -1136,19 +1197,35 @@ func (m *Model) syncRowsFromStatus() {
 }
 
 // rebuildRows merges the two sources of truth: servers.yaml (always available)
-// and the daemon's status (which server is active, what it is doing).
+// and the daemon's status (which server is active, what it is doing). In auto
+// mode the daemon's failover state (ProxiesData) overrides both the "active"
+// marker and the latency column, because the engine is the only component that
+// knows which member is carrying traffic right now.
 func (m *Model) rebuildRows() {
 	rows := make([]serverRow, 0, len(m.snap.Servers))
 	for i := range m.snap.Servers {
 		srv := &m.snap.Servers[i]
-		rows = append(rows, serverRow{
+		row := serverRow{
 			Name:     srv.Name,
 			Type:     string(srv.Type),
 			Protocol: srv.Detail(),
 			Endpoint: srv.Endpoint(),
 			Active:   strings.EqualFold(srv.Name, m.selectedName()),
 			Latency:  m.latencyText(srv.Name),
-		})
+		}
+		if n, ok := m.nodeHealth(srv.Name); ok {
+			row.Active = n.Active
+			row.Health = nodeHealthWord(n)
+			if n.Alive && n.DelayMs > 0 {
+				row.Latency = humanMillis(n.DelayMs)
+			} else if m.proxies.Auto && row.Latency == "" {
+				row.Latency = nodeHealthWord(n)
+			}
+		} else if m.proxies.Auto {
+			// Auto mode with no engine answer yet: nothing is reliably active.
+			row.Active = false
+		}
+		rows = append(rows, row)
 	}
 	m.servers = rows
 	m.nodes.SetRows(m.nodeTableRows())
@@ -1156,6 +1233,36 @@ func (m *Model) rebuildRows() {
 	// (cursor -1) would never move on its own; SetCursor clamps both ways.
 	m.nodes.SetCursor(max(0, m.nodes.Cursor()))
 	m.nodes.SetHeight(max(3, min(len(m.servers)+1, max(4, m.height-8))))
+}
+
+// nodeHealth returns the engine's health record for a server, if auto mode is
+// reporting one.
+func (m *Model) nodeHealth(name string) (control.NodeHealth, bool) {
+	if !m.proxies.Auto {
+		return control.NodeHealth{}, false
+	}
+	for _, n := range m.proxies.Nodes {
+		if strings.EqualFold(n.Name, name) {
+			return n, true
+		}
+	}
+	return control.NodeHealth{}, false
+}
+
+// nodeHealthWord renders a node's health as one word, for the table.
+func nodeHealthWord(n control.NodeHealth) string {
+	if n.Alive {
+		return "up"
+	}
+	return "down"
+}
+
+// activeNode returns the member the failover group is currently using, or "".
+func (m *Model) activeNode() string {
+	if !m.proxies.Auto {
+		return ""
+	}
+	return m.proxies.Current
 }
 
 func (m *Model) selectedName() string {

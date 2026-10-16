@@ -114,6 +114,23 @@ func goldenCases(t *testing.T) []goldenCase {
 			},
 		},
 
+		{
+			// M5: automatic failover. Every configured server becomes its own
+			// outbound and is wrapped in a URLTest group tagged `proxy`, so
+			// every rule and the route final keep referring to "proxy".
+			name: "auto-failover",
+			file: "auto_failover.golden",
+			rc: RuntimeConfig{
+				Config: func() config.Config {
+					c := *config.Default()
+					c.SelectedServer = config.SelectedServerAuto
+					return c
+				}(),
+				Servers: []config.Server{*reality, *hy2},
+				RunDir:  "/run/vender",
+			},
+		},
+
 		// M6: the optional TUN inbound, one case per mode (the mode decides the
 		// rules, the DNS section and the final outbound, and TUN has to be
 		// correct in all three), plus one case that exercises every knob.
@@ -401,8 +418,8 @@ func TestRuleModeDeclaresExactlyTheReferencedRuleSets(t *testing.T) {
 			continue
 		}
 		if len(r.RuleSet) == 0 {
-			// The one destination rule without a rule set is the
-			// private-address match, which uses ip_is_private instead.
+			// The destination rules without a rule set are the critical domain
+			// list and the private-address match (which uses ip_is_private).
 			ipRules++
 			continue
 		}
@@ -412,8 +429,8 @@ func TestRuleModeDeclaresExactlyTheReferencedRuleSets(t *testing.T) {
 			}
 		}
 	}
-	if ipRules != 1 {
-		t.Errorf("%d destination rules match without a rule set, want exactly the private one", ipRules)
+	if ipRules != 2 {
+		t.Errorf("%d destination rules match without a rule set, want the critical list and the private one", ipRules)
 	}
 	if len(cfg.DNS.Rules) == 0 {
 		t.Fatal("rule mode emitted no DNS rules, so the split DNS policy is gone")
@@ -867,5 +884,110 @@ func TestTunValidation(t *testing.T) {
 				t.Errorf("error = %v, want it to mention %q", err, tt.wantSub)
 			}
 		})
+	}
+}
+
+// --- M5: failover (selected_server: auto) -----------------------------------
+
+// Auto mode must render the whole server list as member outbounds plus a
+// URLTest group tagged `proxy`, so the policy (which names "proxy") and the
+// route final are unchanged.
+func TestAutoModeRendersURLTestGroup(t *testing.T) {
+	cfg := *config.Default()
+	cfg.SelectedServer = config.SelectedServerAuto
+	rc := RuntimeConfig{
+		Config: cfg,
+		Servers: []config.Server{
+			*testVLESS(),
+			{Name: "Second-Hy2", Type: config.TypeHysteria2, Address: testHost, Port: 8443, Password: testPW, SNI: "www.bing.com", Insecure: true},
+		},
+		RunDir: "/run/vender",
+	}
+	data, err := BuildConfig(rc)
+	if err != nil {
+		t.Fatalf("BuildConfig: %v", err)
+	}
+	var got struct {
+		Outbounds []struct {
+			Type      string   `json:"type"`
+			Tag       string   `json:"tag"`
+			Outbounds []string `json:"outbounds"`
+			URL       string   `json:"url"`
+			Interval  string   `json:"interval"`
+			Tolerance int      `json:"tolerance"`
+		} `json:"outbounds"`
+		Route struct {
+			Final string `json:"final"`
+		} `json:"route"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	tags := map[string]string{}
+	for _, o := range got.Outbounds {
+		tags[o.Tag] = o.Type
+	}
+	if tags["proxy"] != "urltest" {
+		t.Errorf("the proxy outbound is %q, want the urltest group", tags["proxy"])
+	}
+	if tags[tagDirect] != "direct" || tags[tagBlock] != "block" {
+		t.Errorf("direct/block outbounds missing: %v", tags)
+	}
+	if tags["Test-VLESS"] != "vless" || tags["Second-Hy2"] != "hysteria2" {
+		t.Errorf("member outbounds are not tagged by server name: %v", tags)
+	}
+	if got.Route.Final != tagProxy {
+		t.Errorf("route.final = %q, want the group tag", got.Route.Final)
+	}
+
+	var group *struct {
+		Type      string   `json:"type"`
+		Tag       string   `json:"tag"`
+		Outbounds []string `json:"outbounds"`
+		URL       string   `json:"url"`
+		Interval  string   `json:"interval"`
+		Tolerance int      `json:"tolerance"`
+	}
+	for i := range got.Outbounds {
+		if got.Outbounds[i].Type == "urltest" {
+			group = &got.Outbounds[i]
+		}
+	}
+	if group == nil {
+		t.Fatal("no urltest group")
+	}
+	if len(group.Outbounds) != 2 || group.Outbounds[0] != "Test-VLESS" || group.Outbounds[1] != "Second-Hy2" {
+		t.Errorf("group members = %v", group.Outbounds)
+	}
+	if group.URL == "" || group.Interval == "" || group.Tolerance <= 0 {
+		t.Errorf("group knobs are incomplete: %+v", group)
+	}
+}
+
+// A server name that collides with a reserved vender tag must not shadow it.
+func TestServerOutboundTagAvoidsReservedTags(t *testing.T) {
+	for _, reserved := range []string{tagProxy, tagDirect, tagBlock} {
+		srv := &config.Server{Name: reserved}
+		if got := ServerOutboundTag(srv); got == reserved {
+			t.Errorf("a server named %q kept the reserved tag", reserved)
+		}
+	}
+	if got := ServerOutboundTag(&config.Server{Name: "UpCloud-SJ"}); got != "UpCloud-SJ" {
+		t.Errorf("ServerOutboundTag = %q, want the plain name", got)
+	}
+}
+
+// Auto mode with no servers is a configuration error, and single-server mode
+// still requires a server.
+func TestAutoModeValidation(t *testing.T) {
+	cfg := *config.Default()
+	cfg.SelectedServer = config.SelectedServerAuto
+	if _, err := BuildConfig(RuntimeConfig{Config: cfg, RunDir: "/run/vender"}); err == nil {
+		t.Error("auto mode with no servers did not fail")
+	}
+	cfg2 := *config.Default()
+	if _, err := BuildConfig(RuntimeConfig{Config: cfg2, RunDir: "/run/vender"}); err == nil {
+		t.Error("single-server mode with no server did not fail")
 	}
 }

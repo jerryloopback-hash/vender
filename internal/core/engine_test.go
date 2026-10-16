@@ -251,7 +251,7 @@ func TestSplitListenRejectsGarbage(t *testing.T) {
 // what turns an IP-addressed connection back into a domain, and hijack-dns
 // only fires on a protocol sniffing has already identified.
 func TestBuildRulesActionsComeFirst(t *testing.T) {
-	got, err := buildRules()
+	got, err := buildRules(nil)
 	if err != nil {
 		t.Fatalf("buildRules: %v", err)
 	}
@@ -264,10 +264,14 @@ func TestBuildRulesActionsComeFirst(t *testing.T) {
 	if got[1].Action != string(rules.ActionHijackDNS) || len(got[1].Protocol) != 1 || got[1].Protocol[0] != "dns" {
 		t.Errorf("second entry = %+v, want hijack-dns for the sniffed dns protocol", got[1])
 	}
-	// The destination rules follow, in the order the policy declares them, and
-	// every one of them names an outbound.
+	// The destination rules follow, in the order the merged policy declares
+	// them, and every one of them names an outbound.
+	policy, err := rules.EffectiveRules(nil)
+	if err != nil {
+		t.Fatalf("EffectiveRules: %v", err)
+	}
 	wantOrder := make([]string, 0, len(got)-2)
-	for _, r := range rules.BuiltinRules() {
+	for _, r := range policy {
 		if r.DNSOnly {
 			continue
 		}
@@ -288,9 +292,13 @@ func TestBuildRulesActionsComeFirst(t *testing.T) {
 			t.Errorf("destination rule %d carries action %q and an outbound", i, got[i+2].Action)
 		}
 	}
-	// The private-destination rule must be the first destination rule.
-	if !got[2].IPIsPrivate || got[2].Outbound != tagDirect {
-		t.Errorf("first destination rule = %+v, want ip_is_private -> direct", got[2])
+	// The critical list is the first destination rule, and the private
+	// destination rule follows it.
+	if got[2].Outbound != tagDirect || len(got[2].DomainSuffix) == 0 {
+		t.Errorf("first destination rule = %+v, want the critical domain list -> direct", got[2])
+	}
+	if !got[3].IPIsPrivate || got[3].Outbound != tagDirect {
+		t.Errorf("second destination rule = %+v, want ip_is_private -> direct", got[3])
 	}
 }
 

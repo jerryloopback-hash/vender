@@ -49,6 +49,17 @@ const (
 // ProxyModes lists every accepted mode, in documentation order.
 func ProxyModes() []ProxyMode { return []ProxyMode{ModeRule, ModeGlobal, ModeDirect} }
 
+// SelectedServerAuto is the sentinel value of selected_server that asks vender
+// to choose a server automatically: it renders a URLTest outbound group over
+// every server in servers.yaml, so a degraded node is bypassed without a human
+// switching anything. It is accepted wherever a server name is.
+const SelectedServerAuto = "auto"
+
+// IsAutoServer reports whether selected_server asks for automatic failover.
+func (c *Config) IsAutoServer() bool {
+	return strings.EqualFold(strings.TrimSpace(c.SelectedServer), SelectedServerAuto)
+}
+
 // Valid reports whether m is a known proxy mode.
 func (m ProxyMode) Valid() bool {
 	switch m {
@@ -127,6 +138,9 @@ func (c *Config) Normalize() {
 	c.Engine.BindInterface = strings.TrimSpace(c.Engine.BindInterface)
 	c.Engine.Tun.Normalize()
 	c.SelectedServer = strings.TrimSpace(c.SelectedServer)
+	if c.IsAutoServer() {
+		c.SelectedServer = SelectedServerAuto
+	}
 }
 
 // Validate checks the config in isolation, without consulting servers.yaml.
@@ -159,10 +173,20 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// ValidateAgainst additionally checks that SelectedServer exists.
+// ValidateAgainst additionally checks that SelectedServer exists (or is the
+// "auto" sentinel, which requires at least one server to choose from).
 func (c *Config) ValidateAgainst(ss *ServerSet) error {
 	if err := c.Validate(); err != nil {
 		return err
+	}
+	if c.IsAutoServer() {
+		if c.Proxy.Mode != ModeDirect && (ss == nil || ss.Len() == 0) {
+			return &ValidationError{
+				Subject:  "config.yaml",
+				Problems: []string{fmt.Sprintf("selected_server %q needs at least one server in servers.yaml", SelectedServerAuto)},
+			}
+		}
+		return nil
 	}
 	if c.SelectedServer != "" {
 		if _, ok := ss.Get(c.SelectedServer); !ok {
@@ -173,6 +197,39 @@ func (c *Config) ValidateAgainst(ss *ServerSet) error {
 		}
 	}
 	return nil
+}
+
+// Selection resolves selected_server against the server set:
+//
+//   - direct mode uses no server at all: (nil, nil, nil);
+//   - the "auto" sentinel returns the whole list as failover candidates,
+//     with a nil single server;
+//   - otherwise the named server is returned with a nil list.
+//
+// It is the single place the daemon and the controller agree on what
+// selected_server means, so `core` never has to know about the sentinel.
+func (c *Config) Selection(ss *ServerSet) (*Server, []Server, error) {
+	if c.Proxy.Mode == ModeDirect {
+		return nil, nil, nil
+	}
+	if c.IsAutoServer() {
+		if ss == nil || ss.Len() == 0 {
+			return nil, nil, fmt.Errorf("selected_server %q needs at least one server in servers.yaml", SelectedServerAuto)
+		}
+		all := make([]Server, len(ss.Servers))
+		copy(all, ss.Servers)
+		return nil, all, nil
+	}
+	if c.SelectedServer == "" {
+		return nil, nil, fmt.Errorf("no server selected for proxy mode %q:\n"+
+			"  import one with `vender import '<share-link>'`\n"+
+			"  or pick one (or %q) in config.yaml", c.Proxy.Mode, SelectedServerAuto)
+	}
+	srv, ok := ss.Get(c.SelectedServer)
+	if !ok {
+		return nil, nil, fmt.Errorf("%w: %q (import it, or fix selected_server in config.yaml)", ErrNotFound, c.SelectedServer)
+	}
+	return srv, nil, nil
 }
 
 // Clone returns a deep copy (the TUN block owns a pointer and three slices, so

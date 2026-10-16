@@ -19,6 +19,10 @@ const (
 	ConfigFileName = "config.yaml"
 	// ServersFileName holds the server list and its secrets.
 	ServersFileName = "servers.yaml"
+	// RulesFileName holds the optional per-user routing rules. Unlike the
+	// other two it is not created at first run: an absent file means "the
+	// built-in policy, unmodified".
+	RulesFileName = "rules.yaml"
 
 	// secretFileMode protects servers.yaml, which contains uuids, passwords
 	// and REALITY public keys.
@@ -74,6 +78,9 @@ func (s *Store) ConfigPath() string { return filepath.Join(s.dir, ConfigFileName
 
 // ServersPath returns the path of servers.yaml.
 func (s *Store) ServersPath() string { return filepath.Join(s.dir, ServersFileName) }
+
+// RulesPath returns the path of the optional rules.yaml.
+func (s *Store) RulesPath() string { return filepath.Join(s.dir, RulesFileName) }
 
 // EnsureDir creates the config directory (mode 0700) if it does not exist.
 func (s *Store) EnsureDir() error {
@@ -231,8 +238,25 @@ func (s *Store) RemoveServer(name string) (*Server, error) {
 }
 
 // SelectServer sets config.yaml's selected_server to a name present in
-// servers.yaml.
+// servers.yaml, or to the "auto" sentinel (automatic failover over every
+// server).
 func (s *Store) SelectServer(name string) error {
+	name = strings.TrimSpace(name)
+	cfg, err := s.LoadConfig()
+	if err != nil {
+		return err
+	}
+	if strings.EqualFold(name, SelectedServerAuto) {
+		ss, err := s.LoadServers()
+		if err != nil {
+			return err
+		}
+		if ss.Len() == 0 {
+			return fmt.Errorf("%w: cannot select %q with no servers configured", ErrNotFound, SelectedServerAuto)
+		}
+		cfg.SelectedServer = SelectedServerAuto
+		return s.SaveConfig(cfg)
+	}
 	ss, err := s.LoadServers()
 	if err != nil {
 		return err
@@ -240,10 +264,6 @@ func (s *Store) SelectServer(name string) error {
 	srv, ok := ss.Get(name)
 	if !ok {
 		return fmt.Errorf("%w: %q", ErrNotFound, name)
-	}
-	cfg, err := s.LoadConfig()
-	if err != nil {
-		return err
 	}
 	cfg.SelectedServer = srv.Name
 	return s.SaveConfig(cfg)

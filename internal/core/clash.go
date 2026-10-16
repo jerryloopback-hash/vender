@@ -209,8 +209,45 @@ func (c *ClashClient) TrafficStream(ctx context.Context, fn func(up, down float6
 	}
 }
 
-// --- plumbing --------------------------------------------------------------
+// ClashProxy is one entry of the Clash API's /proxies map. Only the fields
+// vender uses are decoded; a URLTest/selector group additionally carries Now
+// (the member currently carrying traffic) and All (its members).
+type ClashProxy struct {
+	Type    string   `json:"type"`
+	Name    string   `json:"name"`
+	Now     string   `json:"now"`
+	All     []string `json:"all"`
+	History []struct {
+		Time  string `json:"time"`
+		Delay int    `json:"delay"`
+	} `json:"history"`
+}
 
+// LastDelay returns the most recent measured delay in milliseconds, or 0 when
+// the engine has never successfully tested this outbound.
+func (p ClashProxy) LastDelay() int {
+	for i := len(p.History) - 1; i >= 0; i-- {
+		if p.History[i].Delay > 0 {
+			return p.History[i].Delay
+		}
+	}
+	return 0
+}
+
+// Proxies reads the engine's outbound table. It is how the TUI learns which
+// member of a failover group is currently active and how healthy each member
+// is, without vender having to track the failover itself.
+func (c *ClashClient) Proxies(ctx context.Context) (map[string]ClashProxy, error) {
+	var out struct {
+		Proxies map[string]ClashProxy `json:"proxies"`
+	}
+	if err := c.getJSON(ctx, "/proxies", &out); err != nil {
+		return nil, err
+	}
+	return out.Proxies, nil
+}
+
+// --- plumbing --------------------------------------------------------------
 func (c *ClashClient) getJSON(ctx context.Context, path string, out any) error {
 	cctx, cancel := context.WithTimeout(ctx, c.requestTimeout)
 	defer cancel()

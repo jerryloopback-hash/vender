@@ -274,6 +274,13 @@ func (c *Client) Rules(ctx context.Context) (RulesData, error) {
 	return out, err
 }
 
+// Proxies reports the engine's failover state and per-server health.
+func (c *Client) Proxies(ctx context.Context) (ProxiesData, error) {
+	var out ProxiesData
+	err := c.Call(ctx, CmdProxies, nil, &out)
+	return out, err
+}
+
 // StartEngine starts the engine inside the daemon.
 func (c *Client) StartEngine(ctx context.Context) (ApplyData, error) {
 	var out ApplyData

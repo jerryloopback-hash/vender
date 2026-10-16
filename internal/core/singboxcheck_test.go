@@ -119,6 +119,53 @@ func boolText(b bool) string {
 	return "off"
 }
 
+// checkTestHy2 is a Hysteria2 server the engine accepts, used as the second
+// member of an auto-failover group.
+func checkTestHy2() *config.Server {
+	return &config.Server{
+		Name: "Check-Hy2", Type: config.TypeHysteria2, Address: testHost, Port: 8443,
+		Password: "check-test-password", SNI: "www.example.com", Insecure: true,
+	}
+}
+
+// TestAutoConfigPassesSingBoxCheck pins the failover group: every server becomes
+// its own outbound, wrapped in a URLTest group tagged `proxy`, and the route
+// final still names `proxy`. It covers rule and global mode, because in global
+// mode the DNS resolver is reached *through* the group, which is the combination
+// most likely to be rejected.
+func TestAutoConfigPassesSingBoxCheck(t *testing.T) {
+	singbox := findSingBox()
+	if singbox == "" {
+		t.Skip("no sing-box binary (set VENDER_TEST_SINGBOX, or run scripts/fetch-sing-box.sh)")
+	}
+
+	for _, mode := range []config.ProxyMode{config.ModeRule, config.ModeGlobal} {
+		t.Run(string(mode), func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := *config.Default()
+			cfg.Proxy.Mode = mode
+			cfg.SelectedServer = config.SelectedServerAuto
+			rc := RuntimeConfig{
+				Config:     cfg,
+				Servers:    []config.Server{*checkTestServer(), *checkTestHy2()},
+				BinaryPath: singbox,
+				RunDir:     dir,
+			}
+			eng, err := New(rc)
+			if err != nil {
+				t.Fatalf("New (auto): %v", err)
+			}
+			if err := eng.WriteConfig(rc); err != nil {
+				t.Fatalf("WriteConfig (auto): %v", err)
+			}
+			out, err := exec.Command(singbox, "check", "-c", ConfigPath(dir)).CombinedOutput()
+			if err != nil {
+				t.Fatalf("sing-box check rejected the auto %s config: %v\n%s", mode, err, out)
+			}
+		})
+	}
+}
+
 // checkTestServer is a REALITY server whose fields the engine accepts. The
 // golden fixtures use obviously fake values ("DUMMY-PUBLIC-KEY") because they
 // never leave vender, but sing-box validates the REALITY public key, so this

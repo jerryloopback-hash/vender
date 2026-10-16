@@ -15,6 +15,7 @@ import (
 	"github.com/ll-lite/vender/internal/config"
 	"github.com/ll-lite/vender/internal/control"
 	"github.com/ll-lite/vender/internal/core"
+	"github.com/ll-lite/vender/internal/rules"
 )
 
 func (a *app) newDaemonCmd() *cobra.Command {
@@ -71,7 +72,11 @@ func (a *app) runDaemon(cmd *cobra.Command) error {
 	if err := cfg.ValidateAgainst(servers); err != nil {
 		return err
 	}
-	srv, err := resolveSelectedServer(cfg, servers)
+	srv, allServers, err := cfg.Selection(servers)
+	if err != nil {
+		return err
+	}
+	userRules, err := rules.LoadUserRules(store.RulesPath())
 	if err != nil {
 		return err
 	}
@@ -100,6 +105,8 @@ func (a *app) runDaemon(cmd *cobra.Command) error {
 	rc := core.RuntimeConfig{
 		Config:     *cfg,
 		Server:     srv,
+		Servers:    allServers,
+		UserRules:  userRules,
 		BinaryPath: binaryPath,
 		RunDir:     runDir,
 	}
@@ -160,9 +167,12 @@ func (a *app) runDaemon(cmd *cobra.Command) error {
 	} else {
 		fmt.Fprintf(out, "  tun          off (enable with `vender tun on`)\n")
 	}
-	if srv != nil {
+	switch {
+	case srv != nil:
 		fmt.Fprintf(out, "  server       %s\n", srv.String())
-	} else {
+	case cfg.IsAutoServer() && cfg.Proxy.Mode != config.ModeDirect:
+		fmt.Fprintf(out, "  server       auto (failover over %d servers)\n", len(allServers))
+	default:
 		fmt.Fprintf(out, "  server       (none; direct mode)\n")
 	}
 	fmt.Fprintln(out, "  stop with Ctrl-C or SIGTERM")
@@ -222,25 +232,6 @@ func (a *app) runDaemon(cmd *cobra.Command) error {
 	}
 	fmt.Fprintln(out, "stopped")
 	return nil
-}
-
-// resolveSelectedServer returns the server named by config.yaml, or nil when
-// the mode is direct (direct mode does not need a usable server at all).
-func resolveSelectedServer(cfg *config.Config, ss *config.ServerSet) (*config.Server, error) {
-	if cfg.Proxy.Mode == config.ModeDirect {
-		return nil, nil
-	}
-	if cfg.SelectedServer == "" {
-		return nil, fmt.Errorf("no server selected for proxy mode %q:\n"+
-			"  import one with `vender import '<share-link>'`\n"+
-			"  or pick one in %s", cfg.Proxy.Mode, "config.yaml")
-	}
-	srv, ok := ss.Get(cfg.SelectedServer)
-	if !ok {
-		return nil, fmt.Errorf("%w: %q (import it, or fix selected_server in config.yaml)",
-			config.ErrNotFound, cfg.SelectedServer)
-	}
-	return srv, nil
 }
 
 // errNotRunning is reported by `vender status` when no daemon owns the run

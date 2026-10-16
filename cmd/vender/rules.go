@@ -12,28 +12,48 @@ import (
 func (a *app) newRulesCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "rules",
-		Short: "Inspect the built-in routing rules",
+		Short: "Inspect and edit the routing rules",
 		Long: `Show the routing policy vender applies in proxy.mode: rule.
 
 The policy is built in and fully offline: the rule sets it matches against are
 compiled sing-box rule sets embedded in the vender binary, so no download and
-no data directory is needed at runtime.
+no data directory is needed at runtime. On top of that:
 
-  vender rules list    the ordered policy, the DNS policy and the embedded sets`,
+  * a tiny built-in "critical" list (opencode.ai, api.tavily.com) is evaluated
+    first, so a dead proxy can never cut off the machine's control plane;
+  * an optional user file, rules.yaml, is merged *before* the built-in policy,
+    so a user entry always wins.
+
+  vender rules list    the ordered merged policy, the DNS policy and the sets
+  vender rules path    print the path of the user rules file
+  vender rules init    write a commented rules.yaml if none exists`,
 	}
-	cmd.AddCommand(a.newRulesListCmd())
+	cmd.AddCommand(a.newRulesListCmd(), a.newRulesPathCmd(), a.newRulesInitCmd())
 	return cmd
 }
 
 func (a *app) newRulesListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
-		Short: "List the ordered built-in routing policy",
+		Short: "List the ordered merged routing policy",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			out := cmd.OutOrStdout()
+			store, err := a.configStore()
+			if err != nil {
+				return err
+			}
+			user, err := rules.LoadUserRules(store.RulesPath())
+			if err != nil {
+				return err
+			}
+			if user == nil {
+				fmt.Fprintf(out, "# user rules: none (%s does not exist; create one with `vender rules init`)\n", store.RulesPath())
+			} else {
+				fmt.Fprintf(out, "# user rules: %s\n", store.RulesPath())
+			}
 
-			fmt.Fprintf(out, "# vender built-in routing policy (proxy.mode: rule)\n")
+			fmt.Fprintf(out, "# vender routing policy (proxy.mode: rule)\n")
 			fmt.Fprintf(out, "# rule sets embedded from %s @ %s (%s)\n\n",
 				rules.RuleSetSourceRepo,
 				shortCommit(rules.RuleSetSourceCommit),
@@ -49,10 +69,14 @@ func (a *app) newRulesListCmd() *cobra.Command {
 			}
 			fmt.Fprintln(out)
 
+			policy, err := rules.EffectiveRules(user)
+			if err != nil {
+				return err
+			}
 			w = tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "#\tNAME\tMATCHES\tOUTBOUND")
 			n := 0
-			for _, r := range rules.BuiltinRules() {
+			for _, r := range policy {
 				n++
 				fmt.Fprintf(w, "%d\t%s\t%s\t%s\n", n, r.Name, r.Summary(), r.Outbound)
 			}
@@ -62,7 +86,7 @@ func (a *app) newRulesListCmd() *cobra.Command {
 			}
 			fmt.Fprintln(out)
 
-			dns := rules.BuiltinDNS()
+			dns := rules.RuleModeDNS(user)
 			fmt.Fprintln(out, "DNS")
 			w = tabwriter.NewWriter(out, 4, 4, 2, ' ', 0)
 			for _, s := range dns.Servers {
@@ -70,10 +94,14 @@ func (a *app) newRulesListCmd() *cobra.Command {
 				if s.Detour != "" {
 					where = "via " + s.Detour
 				}
-				fmt.Fprintf(w, "  server\t%s\t%s %s\t(%s)\n", s.Tag, s.Type, s.Server, where)
+				addr := s.Server
+				if s.Type == "fakeip" {
+					addr = s.Inet4Range
+				}
+				fmt.Fprintf(w, "  server\t%s\t%s %s\t(%s)\n", s.Tag, s.Type, addr, where)
 			}
 			for _, r := range dns.Rules {
-				fmt.Fprintf(w, "  rule\t%s\trule_set=[%s]\t-> %s\n", r.Name, joinTags(r.RuleSets), r.Server)
+				fmt.Fprintf(w, "  rule\t%s\t%s\t-> %s\n", r.Name, dnsRuleMatch(r), r.Server)
 			}
 			fmt.Fprintf(w, "  final\t%s\tstrategy %s\n", dns.Final, dns.Strategy)
 			if err := w.Flush(); err != nil {
@@ -92,11 +120,76 @@ func (a *app) newRulesListCmd() *cobra.Command {
 				return err
 			}
 			fmt.Fprintln(out)
-			fmt.Fprintln(out, "A per-user rules file (to add or override entries) is not implemented yet;")
-			fmt.Fprintln(out, "it would slot in where rules.BuiltinRules returns its slice (internal/rules).")
+			fmt.Fprintln(out, "The critical list and the user file are shown in the merged policy above; a user")
+			fmt.Fprintln(out, "entry always wins over the built-in lists, and the critical list wins over both.")
 			return nil
 		},
 	}
+}
+
+func (a *app) newRulesPathCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "path",
+		Short: "Print the path of the user rules file",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			store, err := a.configStore()
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), store.RulesPath())
+			return nil
+		},
+	}
+}
+
+func (a *app) newRulesInitCmd() *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "init",
+		Short: "Write a commented rules.yaml if none exists",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			out := cmd.OutOrStdout()
+			store, err := a.configStore()
+			if err != nil {
+				return err
+			}
+			wrote, err := rules.WriteUserRules(store.RulesPath(), force)
+			if err != nil {
+				return err
+			}
+			path := store.RulesPath()
+			if wrote {
+				fmt.Fprintf(out, "Wrote %s\n", path)
+				fmt.Fprintln(out, "  the file is empty (all lists are []): add entries and restart the daemon,")
+				fmt.Fprintln(out, "  or press R in the TUI, to apply them")
+				return nil
+			}
+			fmt.Fprintf(out, "%s already exists; left unchanged (use --force to overwrite)\n", path)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "overwrite an existing rules.yaml")
+	return cmd
+}
+
+// dnsRuleMatch renders a DNS rule's matchers for `vender rules list`.
+func dnsRuleMatch(r rules.DNSRule) string {
+	var parts []string
+	if len(r.RuleSets) > 0 {
+		parts = append(parts, "rule_set=["+joinTags(r.RuleSets)+"]")
+	}
+	if len(r.Domains) > 0 {
+		parts = append(parts, "domain=["+joinTags(r.Domains)+"]")
+	}
+	if len(r.DomainSuffixes) > 0 {
+		parts = append(parts, "domain_suffix=["+joinTags(r.DomainSuffixes)+"]")
+	}
+	if len(r.QueryTypes) > 0 {
+		parts = append(parts, "query_type=["+joinTags(r.QueryTypes)+"]")
+	}
+	return joinTags(parts)
 }
 
 func shortCommit(sha string) string {

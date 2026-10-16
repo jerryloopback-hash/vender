@@ -145,6 +145,7 @@ loopback TCP (§8).
 |---|---|---|
 | `config.yaml` | `0644` | global settings; contains no secrets |
 | `servers.yaml` | `0600` | the server list; contains credentials |
+| `rules.yaml` | `0644` | optional per-user routing rules (M5); absent means "built-in policy, unmodified" |
 
 The config directory itself is created `0700`. Writes are atomic: content is
 written to a temp file in the same directory, chmodded, `fsync`ed, then
@@ -153,6 +154,9 @@ half-written file. `servers.yaml` also has its mode forced on every save, which
 repairs a file whose permissions drifted.
 
 A missing file is not an error — a fresh install loads built-in defaults.
+`rules.yaml` is the one file vender never creates on its own: an absent file
+means the built-in policy applies unchanged, and only `vender rules init` (or a
+user's editor) writes it.
 
 ### 4.2 `config.yaml`
 
@@ -174,8 +178,15 @@ engine:
         address: []                     # the device's own address(es)
         route_exclude_address: []        # CIDRs kept out of the tunnel
         route_exclude_address_set: []    # rule-set tags kept out of the tunnel
-selected_server: ""             # name of the active entry in servers.yaml
+selected_server: ""             # name in servers.yaml, or "auto" (M5 failover)
 ```
+
+`selected_server: auto` renders a URLTest group over **every** server in
+`servers.yaml` instead of a single `proxy` outbound, so a degraded node is
+bypassed without anyone switching anything. It is the only value that is not a
+server name; `Config.IsAutoServer` recognises it (case-insensitively), and
+`Config.Selection` is the single place the daemon and the controller agree on
+what it means.
 
 `engine.tun.auto_route` is a `*bool` so that "absent" means the documented
 default (`true`) while an explicit `auto_route: false` is honoured: a plain
@@ -311,8 +322,10 @@ without touching the user's real configuration.
 | `vender version` | implemented (M0) |
 | `vender import <share-link>` | implemented (M0) (`--name`, `--force`) |
 | `vender servers list` | implemented (M0) (`--links`) |
+| `vender servers use <name\|auto>` | implemented (M5) — selects a server, or `auto` for failover; restarts a running daemon |
 | `vender servers rm <name>` | implemented (M0) |
-| `vender rules list` | implemented (M2) — the ordered policy, DNS split and embedded sets |
+| `vender rules list` | implemented (M2; merged policy in M5) — the ordered policy, DNS split and embedded sets |
+| `vender rules path` / `vender rules init` | implemented (M5) — the user rules file (`rules.yaml`) |
 | `vender daemon` | implemented (M1) — foreground, one per run dir |
 | `vender status` | implemented (M1) — exit code means "usable" |
 | `vender proxy on\|off` | implemented (M1 Linux/GNOME, M4 Windows/WinINET) |
@@ -386,15 +399,18 @@ possible. It emits up to five top-level sections — `log`, `dns`, `inbounds`,
   `tun-in` (§6.5), which shares the struct and the `omitempty` tags so the
   TUN-off output is byte-identical to M1/M2's;
 - the **proxy** outbound (`vless` with `flow` + `tls.utls` + `tls.reality`, or
-  `hysteria2` with `password` + `obfs` + `tls`), always tagged `proxy`;
+  `hysteria2` with `password` + `obfs` + `tls`), always tagged `proxy` — or, in
+  `selected_server: auto` mode, one outbound per configured server plus a
+  `urltest` group **also tagged `proxy`** (§7.5), so nothing downstream changes;
 - a `direct` outbound and a `block` outbound, always present so that rules
   written against `rules.OutDirect` / `rules.OutBlock` always have a target;
 - `route.final` = `proxy` for `rule`/`global` and `direct` for `direct`;
 - in **rule** mode, `route.rule_set` (one `local`/`binary` entry per embedded
   set, with an **absolute** path inside the run dir), then `route.rules`: the
   actions (`sniff`, `hijack-dns`) first, followed by the destination rules from
-  `internal/rules.BuiltinRules()`, plus `route.default_domain_resolver` and the
-  `dns` section from `internal/rules.BuiltinDNS()`;
+  `internal/rules.EffectiveRules(user)` (critical + user + built-in), plus
+  `route.default_domain_resolver` and the `dns` section from
+  `internal/rules.RuleModeDNS(user)` (§7.3);
 - in **global** mode, a `dns` section with a single proxied resolver and **no**
   routing rules — `global` must stay global, so emitting the CN-direct rules
   there would silently turn it into `rule`;
@@ -587,10 +603,22 @@ package speaks in vender's own terms and `core/render.go` is the only place that
 knows the JSON schema.
 
 ```go
-func BuiltinRules() []Rule       // destination rules, in evaluation order
-func BuiltinActions() []Action   // sniff, hijack-dns
-func BuiltinDNS() DNS            // split DNS for rule mode
-func GlobalDNS() DNS             // proxied-only DNS for global mode
+func BuiltinRules() []Rule         // destination rules, in evaluation order
+func CriticalRules() []Rule        // the "must survive a dead proxy" list
+func CriticalDirectSuffixes() []string
+func EffectiveRules(u *UserRules) ([]Rule, error) // critical + user + builtin
+func BuiltinActions() []Action     // sniff, hijack-dns
+func BuiltinDNS() DNS              // split DNS for rule mode (no user rules)
+func RuleModeDNS(u *UserRules) DNS // split DNS for rule mode, merged
+func GlobalDNS() DNS               // proxied-only DNS for global mode
+
+// User rules (rules.yaml)
+func ParseUserRules(data []byte) (*UserRules, error)
+func LoadUserRules(path string) (*UserRules, error) // missing file => (nil, nil)
+func WriteUserRules(path string, force bool) (bool, error)
+func (u *UserRules) Validate() error
+func (u *UserRules) Rules() ([]Rule, error)
+func (u *UserRules) DirectSuffixes() (domains, suffixes []string)
 
 func RuleSets() []RuleSet                      // the embedded sets, pinned table
 func ReferencedRuleSets() []string             // the tags the policy needs
@@ -606,14 +634,25 @@ than a user's connection.
 
 ### 7.1 The policy
 
-Order is the policy, because the first matching rule wins:
+Order is the policy, because the first matching rule wins. Since M5 there are
+three layers, in this order:
+
+1. the built-in **critical list** (`opencode.ai`, `api.tavily.com`) — always
+   first, so no rule, built-in or user, can route a control-plane domain through
+   a dead proxy;
+2. the user's optional `rules.yaml`, merged *before* the built-in policy;
+3. the built-in policy.
 
 | # | Rule | Matches | Goes to |
 |---|---|---|---|
-| 1 | `private-dest-direct` | `ip_is_private` | `direct` |
-| 2 | `ads-block` | `geosite-category-ads-all` | `block` |
-| 3 | `service-overrides-proxy` | steam, onedrive, microsoft, google, youtube, telegram, netflix, openai, bahamut | `proxy` |
-| 4 | `cn-direct` | `geosite-cn`, `geoip-cn` | `direct` |
+| 1 | `critical-direct` | `domain_suffix` opencode.ai, api.tavily.com | `direct` |
+| 2 | `user-direct` | `rules.yaml` `direct:` (only if non-empty) | `direct` |
+| 3 | `user-proxy` | `rules.yaml` `proxy:` | `proxy` |
+| 4 | `user-block` | `rules.yaml` `block:` | `block` |
+| 5 | `private-dest-direct` | `ip_is_private` | `direct` |
+| 6 | `ads-block` | `geosite-category-ads-all` | `block` |
+| 7 | `service-overrides-proxy` | steam, onedrive, microsoft, google, youtube, telegram, netflix, openai, bahamut | `proxy` |
+| 8 | `cn-direct` | `geosite-cn`, `geoip-cn` | `direct` |
 | — | `route.final` | everything else | `proxy` |
 
 The reference config this is derived from carried ~9500 rules (9018
@@ -627,6 +666,41 @@ Steam store page or a Microsoft sign-in would be dialled directly and fail.
 `private-dest-direct` matches the **destination** only: the mixed inbound only
 ever accepts connections from localhost, so matching the source would match
 everything and send all traffic direct.
+
+#### The critical list
+
+`criticalDirectSuffixes` is deliberately tiny. The test for adding an entry is:
+losing it would make the machine *unmanageable* (not merely inconvenient) while
+the proxy is unreachable. `opencode.ai` is the coding agent's model/API plane and
+`api.tavily.com` is the research API; cutting either off would strand an agent
+that cannot fix the very problem it is diagnosing. The list is evaluated before
+everything, and the same domains are added to the DNS policy so they are
+*resolved* directly too (see §7.3).
+
+#### The user rules file (`rules.yaml`)
+
+```yaml
+direct:
+  - internal.corp        # internal.corp and every subdomain (domain_suffix)
+  - =exact.example       # exactly exact.example, no subdomains
+  - 10.0.0.0/8           # an IP range (ip_cidr)
+proxy:
+  - blocked.example
+block:
+  - ads.example
+```
+
+`internal/rules/userrules.go` parses it. An entry is one of: a bare domain (a
+suffix rule, covering subdomains), `.suffix`, `=exact`, a CIDR, or an explicit
+`domain:` / `suffix:` / `cidr:` prefix. The three lists are compiled in the order
+`direct`, `proxy`, `block`, so a domain that appears in two lists resolves by
+order (direct wins). The whole file is validated up front: a typo is reported
+instead of silently ignored, and the daemon refuses to start rather than run with
+a half-understood policy.
+
+The file is optional and never created implicitly. `vender rules init` writes a
+commented template; `vender rules path` prints where it would live; `vender rules
+list` prints the merged policy (critical + user + built-in) in evaluation order.
 
 ### 7.2 Actions
 
@@ -644,29 +718,68 @@ match. `hijack-dns` then hands a DNS connection to the engine's DNS module
 instead of routing it as plain traffic, so an application that resolves names
 "through" the proxy still gets the split policy below.
 
-### 7.3 Split DNS
+### 7.3 Split DNS, and why it can no longer hang
 
-Names are resolved on the same side of the world they will be dialled from —
-resolving a Chinese CDN's name through a foreign resolver (or the reverse) is how
-"smart routing" produces stale or plainly wrong addresses:
+**The failure this design fixes.** The M2 policy resolved every non-Chinese name
+through a Cloudflare DoH resolver reached *through the proxy* (`detour: proxy`).
+That makes name resolution depend on the proxy being healthy. When the link to
+the VPS degraded, DNS for everything non-CN stalled — a domain that should have
+gone direct could not even be *resolved*, because its query was queued behind a
+dead proxy. The machine became unusable, including `www.baidu.com` and the
+agent's own model API.
 
-| Queries for | Resolver | Reached |
-|---|---|---|
-| `geosite-cn` | `dns-cn` (`223.5.5.5`, UDP) | directly |
-| everything else | `dns-remote` (Cloudflare DoH) | through `proxy` |
+The M5 rule is: **a DNS query must never depend on the proxy.** Two mechanisms
+enforce it:
 
-`final: dns-remote`, `strategy: prefer_ipv4`. Two sing-box details were
-established by running the engine, not by reading the schema: the domestic
-resolver must **not** name a `detour` (1.14 rejects a detour to the empty
-`direct` outbound), and the DNS rule sets are looked up in the same
-`route.rule_set` list as the routing rules, so `ReferencedRuleSets()` feeds both.
+- **Real, direct resolution for what will go direct.** The critical list, the
+  user's direct list and `geosite-cn` are answered by `dns-cn`
+  (`223.5.5.5`, UDP, reached directly). These names get correct, immediately
+  usable addresses.
+- **FakeIP for what will be proxied.** Everything else, for address queries
+  (`A`/`AAAA`), is answered by a local `fakeip` resolver: a synthetic address
+  from `198.18.0.0/15`, handed out in microseconds with **no upstream query at
+  all**. The engine maps the fake address back to the domain before dialling, so
+  the proxy still receives the real name and the server resolves it where the
+  domain actually lives. This also means a poisoned domestic answer can never be
+  used for a proxied connection.
 
-`route.default_domain_resolver` points at `dns-cn`. It is used when a rule needs
-a destination's address (`ip_is_private`, `geoip-cn`) or when a `direct`
-outbound dials a name; a proxied outbound never resolves locally at all — it
-hands the name to the server — so a proxied lookup can never leak here. That was
-verified against a live run: foreign destinations reach the proxy with no local
-resolution at all.
+| Queries for | Resolver | Reached | Result |
+|---|---|---|---|
+| critical list | `dns-cn` | directly | real address |
+| user `direct:` domains | `dns-cn` | directly | real address |
+| `geosite-cn` | `dns-cn` | directly | real address |
+| everything else, `A`/`AAAA` | `dns-fakeip` | local | fake address, domain preserved |
+| everything else, other types | `dns-cn` (`final`) | directly | real address |
+
+`final: dns-cn` and `strategy: prefer_ipv4`. The last row is the one deliberate
+trade-off: a non-address query (HTTPS/SVCB, TXT, MX) for a foreign name is
+answered by the domestic resolver, so the *name* is visible to it. That is a
+minor metadata exposure, accepted because the alternative — a foreign resolver
+reached through the proxy — is exactly the failure being fixed. Address queries,
+which are what connections actually use, never leave the machine.
+
+`route.default_domain_resolver` still points at `dns-cn`, and that is
+load-bearing: it is what a `direct` outbound uses to resolve a name, so a direct
+dial gets a real address and **never** a fake one. A proxied outbound never
+resolves locally at all — it hands the name to the server.
+
+Two sing-box details were established against the pinned engine, not guessed: the
+domestic resolver must **not** name a `detour` (1.14 rejects a detour to the
+empty `direct` outbound), and `route.default_domain_resolver` is *required* in
+1.14 (its absence is a hard error unless an env var suppresses the check). Both
+were caught by `sing-box check`, and the whole policy was then exercised live
+through the engine's own Clash API `/dns/query` endpoint with a deliberately
+dead proxy: `www.baidu.com` and `opencode.ai` returned real addresses in <0.1 s,
+`google.com` returned a fake address in <0.1 s, while the *old* configuration
+took ~5 s and failed on the same two foreign names.
+
+The DNS rules mirror the routing split by construction: `RuleModeDNS(user)`
+builds the critical and user-direct rules from the same lists the routing policy
+uses, so the two cannot drift. A user `direct:` CIDR is not mirrored into DNS —
+sing-box 1.14 cannot match a CIDR in a DNS rule without response matching — and
+does not need to be: a direct outbound dialling a *name* re-resolves it through
+`dns-cn` anyway, and a connection that already arrives as an IP in the CIDR never
+needs DNS.
 
 ### 7.4 Embedded rule sets ("全部内置")
 
@@ -693,20 +806,51 @@ categories the policy uses is the only thing a human edits.
 `vender rules list` prints the actions, the ordered rules, the DNS split and the
 embedded sets with their provenance and sizes.
 
-### 7.5 Deliberate simplifications
+### 7.5 Node failover (`selected_server: auto`)
 
-- **One outbound.** A single `proxy` outbound; no proxy groups and no per-rule
-  node selection yet.
-- **No per-user rules file.** Adding or overriding entries would slot in exactly
-  where `BuiltinRules()` returns its slice; ordering, conversion and the CLI
-  listing all work off that slice already, so the seam is the function, not a
-  new code path.
+`selected_server: auto` makes `core.buildAutoOutbounds` render **every** server
+in `servers.yaml` as its own outbound (tagged by server name), plus a `urltest`
+group **tagged `proxy`**. Because the group reuses the `proxy` tag, nothing else
+changes: every rule that says "proxy", the `route.final`, and (in global mode)
+the DNS `detour` all keep referring to `proxy`, which is now the group.
+
+```
+outbounds: [ UpCloud-SJ, UpCloud-SJ-Hy2, {urltest proxy -> [UpCloud-SJ, UpCloud-SJ-Hy2]}, direct, block ]
+```
+
+The knobs are `url: http://www.gstatic.com/generate_204` (the same probe as the
+latency test, reached *through* the member so a node that connects but cannot
+carry traffic is judged unhealthy), `interval: 1m`, and `tolerance: 100` ms —
+above sing-box's 50 ms default so two nodes of similar latency do not flap.
+
+Single-server behaviour is unchanged in shape: with a server *name*, the config
+still has a single `proxy` outbound (the golden files pin it), and the daemon
+passes the one resolved server in `RuntimeConfig.Server`. Auto mode passes the
+whole list in `RuntimeConfig.Servers` and leaves `Server` nil; `Config.Selection`
+decides which of the two a mode needs, so `core` never has to know about the
+sentinel.
+
+A server name that collides with a reserved tag (`proxy`, `direct`, `block`,
+`mixed-in`, `tun-in`) is prefixed `server-` so it cannot shadow vender's own
+outbounds. `ServerOutboundTag` is the one function that computes this, used by
+the renderer and by the controller's failover reporting.
+
+### 7.6 Deliberate simplifications
+
+- **Failover is the engine's, not vender's.** vender renders a `urltest` group
+  and then only *reports* what the engine chose (via the Clash API, §8.3); it
+  does not implement its own health checks or switch nodes itself. That keeps one
+  source of truth for "which node is active".
 - **No `mode: global` rules.** `global` emits no routing rules at all, and
-  `direct` emits no proxy outbound and no `dns` section.
+  `direct` emits no proxy outbound and no `dns` section. Global mode with `auto`
+  is allowed; the DNS resolver is then reached through the group.
 - **Category granularity.** `geosite-microsoft` covers GitHub too, so GitHub is
   proxied; that is the upstream list's composition, and it is the behaviour most
   users want from a China-facing client anyway. `geosite-cn` is one category
   rather than a hand-tuned set of exceptions.
+- **User rules add no rule sets.** A user entry is a domain/suffix/CIDR, so the
+  embedded set list (and therefore the extraction cost) is unchanged by
+  `rules.yaml`.
 
 ## 8. Control channel (`internal/control`) — implemented in M3
 
@@ -783,6 +927,7 @@ which the connection belongs to it:
 | `latency` | `{name?}` | round trip in ms (through the tunnel for the active server) |
 | `start` / `stop` / `restart` | — | engine lifecycle inside the running daemon |
 | `rules` | — | the active policy: actions, ordered rules, DNS, rule sets |
+| `proxies` | — | M5: the failover group's state (auto? current member) and per-server health |
 | `logs` (stream) | — | engine output, with the daemon's lifecycle notes |
 | `traffic` (stream) | — | one sample per second from the engine's Clash API |
 
@@ -816,6 +961,13 @@ Three decisions in it are worth recording:
   (vender has a single outbound) it falls back to a bare TCP handshake and says
   so — `(tcp)` — because on a host where a TUN hijacks outbound TCP that number
   can be optimistic to the point of being meaningless.
+- **Failover state is the engine's, read back through the Clash API (M5).**
+  `/proxies` reports, for a `urltest` group, which member is `now` active and,
+  for each member, its last measured delay (`history`). `Controller.Proxies`
+  joins that with `servers.yaml` and answers `CmdProxies` with one row per
+  server: `active`, `alive`, `delayMs`. In auto mode a named member can also be
+  latency-probed *through the tunnel* with `/proxies/<member-tag>/delay`, so the
+  Nodes screen can measure a specific node rather than only the group.
 
 Streams reconnect on their own: if the engine restarts, the traffic poller
 backs off and reconnects with no involvement from any client.
@@ -853,9 +1005,9 @@ type Options struct {
 | Key | Screen | Contents |
 |---|---|---|
 | `1` | **Dashboard** | daemon and engine state, selected server, mode, uptime, latency badge, and an animated up/down traffic graph with a load gauge, human-readable rates and session totals |
-| `2` | **Nodes** | table of configured servers (name, type, protocol, endpoint, latency); `enter` selects and lets the daemon restart the engine, `t` measures latency, `r` reloads from disk |
+| `2` | **Nodes** | table of configured servers (name, type, protocol, endpoint, latency); `enter` selects and lets the daemon restart the engine, `A` switches to auto failover, `t` measures latency, `r` reloads from disk. In **auto** mode the header shows which member is carrying traffic and the latency column is fed by the engine's own URL-test results, so node health is visible without probing each one by hand. |
 | `3` | **Logs** | the engine's own output as streamed by the daemon, in a scrolling viewport with follow mode (`f`) and a substring filter (`/`) |
-| `4` | **Settings** | the routing mode (rule/global/direct), the inbounds — the mixed listener and the **TUN inbound** with its device, its knobs, the privilege verdict and an explicit warning when it is on but cannot work (`u` toggles it) — the engine paths, the **active built-in routing policy** rendered from `internal/rules`, and the **start-at-login registration** with `a` to toggle it |
+| `4` | **Settings** | the routing mode (rule/global/direct), the inbounds — the mixed listener and the **TUN inbound** with its device, its knobs, the privilege verdict and an explicit warning when it is on but cannot work (`u` toggles it) — the engine paths, the **merged routing policy** rendered from `internal/rules` (critical + `rules.yaml` + built-in, with the selected server and whether failover is active), and the **start-at-login registration** with `a` to toggle it |
 
 Global keys: `tab`/`shift+tab` (next/previous screen), `?` (help overlay), `q`
 (or Ctrl-C) to quit. On the Dashboard: `t` latency, `s`/`x`/`R` start/stop/
@@ -1071,9 +1223,9 @@ needs no root and writes nothing outside the prefix.
 | **M2** | `internal/rules` built-in policy, actions, split DNS and embedded rule sets, wired into the generated config; `vender rules list` | `proxy.mode: rule` sends CN/private destinations direct, blocks ads, proxies a documented override list and everything else, with matching split DNS; `sing-box check` passes for both server types and a live run shows direct vs proxied vs blocked; `global` and `direct` behave as documented |
 | **M3** | `internal/control` + `internal/tui`: the daemon control channel and the Bubble Tea client | TUI attaches to a running daemon, switches the active server and mode, tails engine logs, shows live traffic from the engine's own counters, quits cleanly and restores the terminal; behaves with no daemon; the channel rejects an unauthenticated client, and a bad host leaves no side effects |
 | **M4** | `internal/autostart` (systemd user unit / XDG entry, Task Scheduler task / Run key), Windows system proxy, release packaging and the installer | `autostart on` starts the daemon after login on both platforms; `off` removes it; `status` reports it; all idempotent. `vender proxy on\|off` works on Windows. Both release archives build and contain the engine plus the licence documents |
-| **M5** | Subscription URLs and bulk import, server latency testing | Importing a subscription adds all of its servers; a latency command reports a reachability ranking. *(Not implemented in this line.)* |
+| **M5** | **Robustness**: a critical "must survive a dead proxy" list, an optional per-user `rules.yaml` merged ahead of the built-in policy, a proxy-independent split DNS (FakeIP for proxied names, direct resolution for direct ones), and `selected_server: auto` node failover with the active member shown in the TUI | With a deliberately unreachable proxy, DNS still resolves in well under a second and direct traffic (CN + the critical list) keeps working while foreign requests fail fast; `sing-box check` accepts rule/auto/direct configs; `rules list` shows the merged policy; auto mode serves traffic through a reachable node while another is dead |
 | **M6** | **Optional TUN mode**: a `tun` inbound in the engine, `vender tun on\|off\|status`, a TUI toggle that reports the privilege verdict, and a TUN-aware autostart mechanism on both platforms | Config-level: golden files for TUN on/off in rule/global/direct plus `sing-box check` for each. Live: a TUN test in a network namespace where one is available, otherwise a documented statement of what could not be run. `vender tun on` against a running daemon either applies (persist + restart with the TUN inbound) or is refused before the engine is touched, with an actionable message. Autostart reflects the TUN-correct mechanism and `status` says whether it can work |
-| M7 | Hardening and release | Health-based failover across servers, log rotation, reproducible cross-builds, signed Windows binaries, a windowless Windows start |
+| M7 | Hardening and release | Subscription URLs and bulk import, per-server latency ranking, log rotation, reproducible cross-builds, signed Windows binaries, a windowless Windows start |
 
 ## 13. Engineering conventions
 

@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"github.com/ll-lite/vender/internal/config"
+	"github.com/ll-lite/vender/internal/rules"
 )
 
 // ConfigFileName is the generated sing-box configuration inside the run dir.
@@ -31,8 +32,15 @@ type RuntimeConfig struct {
 	// Config is the global vender configuration (listen address, mode, log level).
 	Config config.Config `json:"config"`
 	// Server is the selected outbound. It is required for mode rule/global and
-	// may be nil for mode direct.
+	// may be nil for mode direct or when selected_server is "auto".
 	Server *config.Server `json:"server,omitempty"`
+	// Servers is every configured server, in servers.yaml order. It is only
+	// consulted when selected_server is the "auto" sentinel, where it becomes
+	// the member list of the URLTest failover group.
+	Servers []config.Server `json:"servers,omitempty"`
+	// UserRules is the parsed rules.yaml, or nil when the file is absent. Its
+	// lists are merged ahead of the built-in policy.
+	UserRules *rules.UserRules `json:"user_rules,omitempty"`
 	// BinaryPath is the resolved sing-box executable (config.Engine.Binary,
 	// else bundled next to the vender executable, else PATH).
 	BinaryPath string `json:"binary_path"`
@@ -61,11 +69,28 @@ func (rc RuntimeConfig) Validate() error {
 	if err := rc.Config.Validate(); err != nil {
 		return err
 	}
-	if rc.Config.Proxy.Mode != config.ModeDirect && rc.Server == nil {
-		return fmt.Errorf("core: no server selected (required for proxy mode %q)", rc.Config.Proxy.Mode)
+	if rc.UserRules != nil {
+		if err := rc.UserRules.Validate(); err != nil {
+			return fmt.Errorf("core: %w", err)
+		}
+	}
+	if rc.Config.Proxy.Mode != config.ModeDirect {
+		switch {
+		case rc.Config.IsAutoServer():
+			if len(rc.Servers) == 0 {
+				return fmt.Errorf("core: selected_server %q needs at least one server in servers.yaml", config.SelectedServerAuto)
+			}
+		case rc.Server == nil:
+			return fmt.Errorf("core: no server selected (required for proxy mode %q)", rc.Config.Proxy.Mode)
+		}
 	}
 	if rc.Server != nil {
 		if err := rc.Server.Validate(); err != nil {
+			return err
+		}
+	}
+	for i := range rc.Servers {
+		if err := rc.Servers[i].Validate(); err != nil {
 			return err
 		}
 	}

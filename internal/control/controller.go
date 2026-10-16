@@ -407,22 +407,29 @@ func (c *Controller) render() (core.RuntimeConfig, error) {
 	}
 
 	var srv *config.Server
+	var all []config.Server
 	if cfg.Proxy.Mode != config.ModeDirect {
-		if cfg.SelectedServer == "" {
-			return core.RuntimeConfig{}, Errorf(KindBadRequest,
-				"control: no server selected for mode %q: import one with `vender import '<share-link>'`", cfg.Proxy.Mode)
+		s, as, serr := cfg.Selection(servers)
+		if serr != nil {
+			kind := KindBadRequest
+			if errors.Is(serr, config.ErrNotFound) {
+				kind = KindNotFound
+			}
+			return core.RuntimeConfig{}, Errorf(kind, "control: %v", serr)
 		}
-		got, ok := servers.Get(cfg.SelectedServer)
-		if !ok {
-			return core.RuntimeConfig{}, Errorf(KindNotFound,
-				"control: selected server %q is not in servers.yaml", cfg.SelectedServer)
-		}
-		srv = got
+		srv, all = s, as
+	}
+
+	userRules, err := rules.LoadUserRules(c.store.RulesPath())
+	if err != nil {
+		return core.RuntimeConfig{}, Errorf(KindBadRequest, "control: %v", err)
 	}
 
 	rc := core.RuntimeConfig{
 		Config:      *cfg,
 		Server:      srv,
+		Servers:     all,
+		UserRules:   userRules,
 		BinaryPath:  c.binary,
 		RunDir:      c.runDir,
 		ClashListen: c.clashAddr,
@@ -728,7 +735,11 @@ func (c *Controller) Status() StatusData {
 		st.EngineHealthy = c.engine.Healthy()
 	}
 	if servers != nil && cfg.SelectedServer != "" {
-		if srv, ok := servers.Get(cfg.SelectedServer); ok {
+		if cfg.IsAutoServer() {
+			st.SrvType = "auto"
+			st.SrvEndpoint = fmt.Sprintf("%d servers", servers.Len())
+			st.SrvDetail = "failover (urltest over every configured server)"
+		} else if srv, ok := servers.Get(cfg.SelectedServer); ok {
 			st.SrvType = string(srv.Type)
 			st.SrvEndpoint = srv.Endpoint()
 			st.SrvDetail = srv.Detail()
@@ -790,8 +801,10 @@ func (c *Controller) Latency(ctx context.Context, name string) LatencyData {
 	if probe == "" {
 		probe = selected
 	}
-	if probe == "" {
-		return LatencyData{Name: "", Err: "no server is selected"}
+	if probe == "" || strings.EqualFold(probe, config.SelectedServerAuto) {
+		// Auto mode has no single "the server": the caller must name one (the
+		// TUI passes the failover group's current member).
+		return LatencyData{Name: name, Err: "auto failover: name the server to probe"}
 	}
 	srv, ok := ss.Get(probe)
 	if !ok {
@@ -801,12 +814,22 @@ func (c *Controller) Latency(ctx context.Context, name string) LatencyData {
 	c.mu.RLock()
 	running := c.running
 	mode := c.cfg.Proxy.Mode
+	auto := c.cfg.IsAutoServer()
 	c.mu.RUnlock()
 
-	// In direct mode there is no proxy outbound, so the engine's delay probe
-	// has nothing to measure; fall through to the TCP path.
-	if running && mode != config.ModeDirect && strings.EqualFold(srv.Name, selected) && c.clash.Enabled() {
-		ms, derr := c.clash.Delay(ctx, "proxy", core.DefaultDelayTestURL, core.DefaultDelayTimeout)
+	// In auto mode a specific member can be measured through the tunnel by
+	// asking the engine to delay-probe that member's outbound; in single mode
+	// the tunnel probe only applies to the selected server.
+	delayTag := ""
+	switch {
+	case !running || mode == config.ModeDirect || !c.clash.Enabled():
+	case auto:
+		delayTag = core.ServerOutboundTag(srv)
+	case strings.EqualFold(srv.Name, selected):
+		delayTag = "proxy"
+	}
+	if delayTag != "" {
+		ms, derr := c.clash.Delay(ctx, delayTag, core.DefaultDelayTestURL, core.DefaultDelayTimeout)
 		if derr != nil {
 			return LatencyData{Name: srv.Name, Err: derr.Error()}
 		}
@@ -832,6 +855,8 @@ func (c *Controller) Rules() RulesData {
 	mode := c.cfg.Proxy.Mode
 	c.mu.RUnlock()
 
+	user, _ := rules.LoadUserRules(c.store.RulesPath())
+
 	out := RulesData{
 		Active: mode == config.ModeRule,
 		Final:  string(rules.OutProxy),
@@ -854,12 +879,87 @@ func (c *Controller) Rules() RulesData {
 	for _, a := range rules.BuiltinActions() {
 		out.Actions = append(out.Actions, a.Summary())
 	}
-	for _, r := range rules.BuiltinRules() {
+	policy, err := rules.EffectiveRules(user)
+	if err != nil {
+		out.DNS.Detail = err.Error()
+		return out
+	}
+	for _, r := range policy {
 		out.Rules = append(out.Rules, RuleInfo{Name: r.Name, Matches: r.Summary(), Outbound: string(r.Outbound)})
 	}
-	out.DNS = describeDNS(rules.BuiltinDNS())
+	out.DNS = describeDNS(rules.RuleModeDNS(user))
 	out.RuleSets = rules.ReferencedRuleSets()
 	return out
+}
+
+// Proxies reports the engine's failover state: which member is active and how
+// each server measures. It answers even when no failover group exists, so the
+// TUI can use one code path for both single-server and auto mode.
+func (c *Controller) Proxies(ctx context.Context) ProxiesData {
+	ss, err := c.store.LoadServers()
+	if err != nil {
+		return ProxiesData{Nodes: []NodeHealth{}, Err: err.Error()}
+	}
+	c.mu.RLock()
+	auto := c.cfg.IsAutoServer()
+	mode := c.cfg.Proxy.Mode
+	running := c.running
+	c.mu.RUnlock()
+
+	out := ProxiesData{Auto: auto, Nodes: make([]NodeHealth, 0, ss.Len())}
+	if auto {
+		// The policy always tags the failover group "proxy".
+		out.Group = "proxy"
+	}
+
+	// Ask the engine first: it is the only component that knows which member
+	// won the last URL test and how each member answered.
+	live := map[string]core.ClashProxy{}
+	active := ""
+	if running && mode != config.ModeDirect && c.clash.Enabled() {
+		if proxies, perr := c.clash.Proxies(ctx); perr == nil {
+			live = proxies
+			if g, ok := proxies["proxy"]; ok {
+				active = g.Now
+				if auto {
+					out.Current = g.Now
+				}
+			}
+		}
+	} else if mode == config.ModeDirect {
+		out.Err = "direct mode has no proxy outbound"
+	} else if !running {
+		out.Err = "the engine is not running"
+	}
+
+	for i := range ss.Servers {
+		srv := &ss.Servers[i]
+		n := NodeHealth{Name: srv.Name}
+		// The engine names a server's outbound tag after the server, so the
+		// live entry is keyed by the engine's tag (which is the server name, or
+		// its prefixed form when the name collides with a reserved tag).
+		if p, ok := live[core.ServerOutboundTag(srv)]; ok {
+			if d := p.LastDelay(); d > 0 {
+				n.DelayMs, n.Alive = d, true
+			}
+		}
+		// In auto mode the group's Now is authoritative for "active"; in
+		// single mode the selected server is active.
+		if auto {
+			n.Active = active != "" && strings.EqualFold(active, core.ServerOutboundTag(srv))
+		} else {
+			n.Active = strings.EqualFold(c.selectedServerName(), srv.Name)
+		}
+		out.Nodes = append(out.Nodes, n)
+	}
+	return out
+}
+
+// selectedServerName returns the configured selected_server, guarded.
+func (c *Controller) selectedServerName() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cfg.SelectedServer
 }
 
 func describeDNS(d rules.DNS) DNSInfo {
@@ -869,10 +969,27 @@ func describeDNS(d rules.DNS) DNSInfo {
 		if s.Detour != "" {
 			where = "via " + s.Detour
 		}
-		out.Servers = append(out.Servers, fmt.Sprintf("%s = %s %s (%s)", s.Tag, s.Type, s.Server, where))
+		addr := s.Server
+		if s.Type == "fakeip" {
+			addr = s.Inet4Range
+		}
+		out.Servers = append(out.Servers, fmt.Sprintf("%s = %s %s (%s)", s.Tag, s.Type, addr, where))
 	}
 	for _, r := range d.Rules {
-		out.Rules = append(out.Rules, fmt.Sprintf("%s -> %s", r.Name, r.Server))
+		var match []string
+		if len(r.RuleSets) > 0 {
+			match = append(match, "rule_set=["+strings.Join(r.RuleSets, " ")+"]")
+		}
+		if len(r.Domains) > 0 {
+			match = append(match, "domain=["+strings.Join(r.Domains, " ")+"]")
+		}
+		if len(r.DomainSuffixes) > 0 {
+			match = append(match, "domain_suffix=["+strings.Join(r.DomainSuffixes, " ")+"]")
+		}
+		if len(r.QueryTypes) > 0 {
+			match = append(match, "query_type=["+strings.Join(r.QueryTypes, " ")+"]")
+		}
+		out.Rules = append(out.Rules, fmt.Sprintf("%s (%s) -> %s", r.Name, strings.Join(match, " "), r.Server))
 	}
 	return out
 }
@@ -888,6 +1005,8 @@ func (c *Controller) Call(ctx context.Context, cmd string, args json.RawMessage)
 		return c.Servers(), nil
 	case CmdRules:
 		return c.Rules(), nil
+	case CmdProxies:
+		return c.Proxies(ctx), nil
 	case CmdSelect:
 		var a SelectArgs
 		if err := decodeArgs(args, &a); err != nil {

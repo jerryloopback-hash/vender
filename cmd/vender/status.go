@@ -108,6 +108,9 @@ func selectedServerLabel(cfg *config.Config, store *config.Store) string {
 	if err != nil {
 		return cfg.SelectedServer + " (servers.yaml unreadable: " + err.Error() + ")"
 	}
+	if cfg.IsAutoServer() {
+		return fmt.Sprintf("auto (failover over %d servers)", ss.Len())
+	}
 	srv, ok := ss.Get(cfg.SelectedServer)
 	if !ok {
 		return cfg.SelectedServer + " (missing from servers.yaml)"

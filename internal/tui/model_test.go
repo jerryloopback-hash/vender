@@ -196,8 +196,8 @@ func TestViewSettings(t *testing.T) {
 		"127.0.0.1:7897",
 		"inbounds", "tun", "tun settings", "privileges",
 		"built-in routing policy",
-		"private-dest-direct", "ads-block", "cn-direct",
-		"final", "dns", "embedded,",
+		"critical-direct", "private-dest-direct", "ads-block", "cn-direct",
+		"final", "dns", "user rules", "sets",
 		"start at login", "checking",
 	})
 }

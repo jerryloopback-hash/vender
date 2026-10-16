@@ -144,6 +144,24 @@ func BuiltinRules() []Rule {
 	}
 }
 
+// EffectiveRules is the routing policy actually rendered in rule mode: the
+// built-in critical list first, then the user's own file, then the built-in
+// policy. A user entry therefore always wins over the built-in lists, and the
+// critical list wins over everything — which is what keeps the machine
+// manageable when a user rule or a built-in category would otherwise send a
+// control-plane domain through a dead proxy.
+func EffectiveRules(user *UserRules) ([]Rule, error) {
+	userRules, err := user.Rules()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Rule, 0, len(userRules)+len(BuiltinRules())+1)
+	out = append(out, CriticalRules()...)
+	out = append(out, userRules...)
+	out = append(out, BuiltinRules()...)
+	return out, nil
+}
+
 // ActionKind names a sing-box route action. Actions change what the engine
 // does with a connection instead of choosing an outbound for it, and they are
 // emitted before any destination rule.
