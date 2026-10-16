@@ -58,7 +58,7 @@ func (a *app) runStatus(cmd *cobra.Command) error {
 	fmt.Fprintf(out, "run dir      %s\n", runDir)
 	fmt.Fprintf(out, "listen       %s (%s)\n", cfg.Proxy.Listen, listenLabel(listening))
 	fmt.Fprintf(out, "mode         %s\n", cfg.Proxy.Mode)
-	fmt.Fprintf(out, "tun          %s\n", tunLabel(cfg))
+	fmt.Fprintf(out, "tun          %s\n", tunLabel(cfg, running))
 	fmt.Fprintf(out, "server       %s\n", selectedServerLabel(cfg, store))
 
 	switch {
@@ -119,15 +119,24 @@ func selectedServerLabel(cfg *config.Config, store *config.Store) string {
 }
 
 // tunLabel describes the TUN inbound for `vender status`: one short line, and
-// honest about a TUN that is switched on but cannot start here.
-func tunLabel(cfg *config.Config) string {
+// honest about a TUN that is switched on but cannot start here. daemonRunning
+// says whether a daemon (which may be a system unit holding CAP_NET_ADMIN) is
+// already managing the engine: its privileges, not this CLI invocation's, then
+// decide whether the TUN can start, so the line must not cry "cannot start"
+// just because the invoking user has no capabilities.
+func tunLabel(cfg *config.Config, daemonRunning bool) string {
 	t := cfg.Engine.Tun
 	if !t.Enabled {
 		return "off"
 	}
 	label := fmt.Sprintf("on (%s, stack %s, auto_route %s)", t.InterfaceName, t.Stack, onOffWord(t.AutoRouteEnabled()))
-	// Resolve the engine so a `setcap`-granted binary counts as privileged:
-	// the point of the line is to answer "will this actually start?".
+	if daemonRunning {
+		label += " — managed by the running daemon"
+		return label
+	}
+	// No daemon yet: the TUN will be started with this invocation's own
+	// privileges, so resolve the engine (a `setcap`-granted binary counts) and
+	// answer "will this actually start?".
 	engine, _ := core.ResolveBinary(*cfg)
 	if p := core.CheckTUNPrivilege(engine); !p.OK {
 		label += " — cannot start: " + p.Detail

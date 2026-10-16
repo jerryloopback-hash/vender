@@ -310,7 +310,9 @@ func (a *app) reportTun(cmd *cobra.Command, rep tunReport) error {
 	}
 
 	// The privilege verdict is the difference between "on" and "on and
-	// working", so it is never omitted.
+	// working", so it is never omitted. A running daemon may be a system unit
+	// that holds CAP_NET_ADMIN, in which case this invocation's own (missing)
+	// capability is irrelevant and reporting MISSING would be a lie.
 	switch {
 	case !t.Enabled:
 		fmt.Fprintln(out, "  privileges         not needed while TUN is off")
@@ -318,6 +320,8 @@ func (a *app) reportTun(cmd *cobra.Command, rep tunReport) error {
 		fmt.Fprintln(out, "  privileges         unknown — no sing-box to inspect")
 	case verdict.OK:
 		fmt.Fprintf(out, "  privileges         ok — %s\n", verdict.Detail)
+	case daemonState == 1 && daemonTun:
+		fmt.Fprintln(out, "  privileges         ok — provided by the running daemon, which already has TUN up")
 	default:
 		fmt.Fprintf(out, "  privileges         MISSING — %s\n", verdict.Detail)
 		for _, line := range splitLines(verdict.Hint) {
