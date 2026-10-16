@@ -2,7 +2,10 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"os/user"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -30,6 +33,9 @@ type app struct {
 // the platform default (os.UserCacheDir()/vender).
 func (a *app) runDirPath() (string, error) {
 	if a.runDir == "" {
+		if home := invokingUserHome(); home != "" {
+			return filepath.Join(home, ".cache", appName), nil
+		}
 		return core.DefaultRunDir()
 	}
 	abs, err := filepath.Abs(a.runDir)
@@ -45,6 +51,15 @@ func (a *app) configStore() (*config.Store, error) {
 		return a.store, nil
 	}
 	if a.configDir == "" {
+		// Under sudo, $HOME is root's, but a per-user tool must read the
+		// *invoking* user's configuration: `sudo vender autostart on` decides
+		// the mechanism from that user's config.yaml and installs a unit whose
+		// User= is that user, so reading root's config would both miss TUN mode
+		// and register the wrong home.
+		if home := invokingUserHome(); home != "" {
+			a.store = config.NewStoreAt(filepath.Join(home, ".config", appName))
+			return a.store, nil
+		}
 		st, err := config.NewStore()
 		if err != nil {
 			return nil, err
@@ -58,6 +73,24 @@ func (a *app) configStore() (*config.Store, error) {
 	}
 	a.store = config.NewStoreAt(abs)
 	return a.store, nil
+}
+
+// invokingUserHome returns the home directory of the user who invoked a
+// root-owned process through sudo, or "" when this is not such a process. It
+// lets `sudo vender …` operate on the user's files instead of root's.
+func invokingUserHome() string {
+	if os.Geteuid() != 0 {
+		return ""
+	}
+	name := strings.TrimSpace(os.Getenv("SUDO_USER"))
+	if name == "" || name == "root" {
+		return ""
+	}
+	u, err := user.Lookup(name)
+	if err != nil || u.HomeDir == "" {
+		return ""
+	}
+	return u.HomeDir
 }
 
 func newRootCmd() *cobra.Command {
