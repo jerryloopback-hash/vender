@@ -79,6 +79,9 @@ type EngineConfig struct {
 	// connection to the server. Rendered as sing-box's outbound
 	// "bind_interface".
 	BindInterface string `yaml:"bind_interface"`
+	// Tun is the optional TUN inbound (§M6): transparent, system-wide traffic
+	// capture. Off by default.
+	Tun TunConfig `yaml:"tun"`
 }
 
 // Config is the global vender configuration (config.yaml).
@@ -99,7 +102,7 @@ func Default() *Config {
 			Listen: DefaultListen,
 			Mode:   ModeRule,
 		},
-		Engine:         EngineConfig{Binary: ""},
+		Engine:         EngineConfig{Binary: "", Tun: DefaultTun()},
 		SelectedServer: "",
 	}
 }
@@ -122,6 +125,7 @@ func (c *Config) Normalize() {
 	c.Proxy.Mode = ProxyMode(strings.ToLower(strings.TrimSpace(string(c.Proxy.Mode))))
 	c.Engine.Binary = strings.TrimSpace(c.Engine.Binary)
 	c.Engine.BindInterface = strings.TrimSpace(c.Engine.BindInterface)
+	c.Engine.Tun.Normalize()
 	c.SelectedServer = strings.TrimSpace(c.SelectedServer)
 }
 
@@ -147,6 +151,8 @@ func (c *Config) Validate() error {
 		problems = append(problems, fmt.Sprintf("engine.bind_interface %q must be an interface name without spaces or slashes", c.Engine.BindInterface))
 	}
 
+	problems = append(problems, c.Engine.Tun.Validate()...)
+
 	if len(problems) > 0 {
 		return &ValidationError{Subject: "config.yaml", Problems: problems}
 	}
@@ -169,12 +175,14 @@ func (c *Config) ValidateAgainst(ss *ServerSet) error {
 	return nil
 }
 
-// Clone returns a deep copy (Config is currently flat, but M1 will add slices).
+// Clone returns a deep copy (the TUN block owns a pointer and three slices, so
+// a shallow copy would let two configs share them).
 func (c *Config) Clone() *Config {
 	if c == nil {
 		return nil
 	}
 	cp := *c
+	cp.Engine.Tun = c.Engine.Tun.Clone()
 	return &cp
 }
 

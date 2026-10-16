@@ -77,6 +77,11 @@ func (rc RuntimeConfig) Validate() error {
 			return errors.New("core: RuntimeConfig.ClashListen requires a ClashSecret")
 		}
 	}
+	// The TUN block is validated by config.Config.Validate; what only core can
+	// check is that its rule-set references point at sets vender embeds.
+	if err := validateTunRuleSets(rc.Config); err != nil {
+		return err
+	}
 	return nil
 }
 

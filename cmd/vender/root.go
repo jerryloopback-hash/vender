@@ -99,6 +99,7 @@ in the platform cache directory instead:
 		"use this directory instead of the platform runtime directory")
 
 	root.AddCommand(
+		a.newTunCmd(),
 		a.newVersionCmd(),
 		a.newImportCmd(),
 		a.newServersCmd(),

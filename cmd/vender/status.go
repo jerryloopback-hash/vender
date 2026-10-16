@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ll-lite/vender/internal/config"
+	"github.com/ll-lite/vender/internal/core"
 )
 
 func (a *app) newStatusCmd() *cobra.Command {
@@ -57,6 +58,7 @@ func (a *app) runStatus(cmd *cobra.Command) error {
 	fmt.Fprintf(out, "run dir      %s\n", runDir)
 	fmt.Fprintf(out, "listen       %s (%s)\n", cfg.Proxy.Listen, listenLabel(listening))
 	fmt.Fprintf(out, "mode         %s\n", cfg.Proxy.Mode)
+	fmt.Fprintf(out, "tun          %s\n", tunLabel(cfg))
 	fmt.Fprintf(out, "server       %s\n", selectedServerLabel(cfg, store))
 
 	switch {
@@ -111,6 +113,23 @@ func selectedServerLabel(cfg *config.Config, store *config.Store) string {
 		return cfg.SelectedServer + " (missing from servers.yaml)"
 	}
 	return srv.String()
+}
+
+// tunLabel describes the TUN inbound for `vender status`: one short line, and
+// honest about a TUN that is switched on but cannot start here.
+func tunLabel(cfg *config.Config) string {
+	t := cfg.Engine.Tun
+	if !t.Enabled {
+		return "off"
+	}
+	label := fmt.Sprintf("on (%s, stack %s, auto_route %s)", t.InterfaceName, t.Stack, onOffWord(t.AutoRouteEnabled()))
+	// Resolve the engine so a `setcap`-granted binary counts as privileged:
+	// the point of the line is to answer "will this actually start?".
+	engine, _ := core.ResolveBinary(*cfg)
+	if p := core.CheckTUNPrivilege(engine); !p.OK {
+		label += " — cannot start: " + p.Detail
+	}
+	return label
 }
 
 // portAccepts reports whether addr accepts a TCP connection right now.

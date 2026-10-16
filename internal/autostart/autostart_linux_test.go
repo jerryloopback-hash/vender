@@ -5,6 +5,7 @@ package autostart
 import (
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -302,5 +303,258 @@ func TestEnableFailsLoudlyWhenSystemctlFails(t *testing.T) {
 	// The unit file is still there: a failed enable is reported, not hidden.
 	if _, statErr := os.Stat(filepath.Join(home, ".config", "systemd", "user", "vender.service")); statErr != nil {
 		t.Errorf("unit file missing after a failed enable: %v", statErr)
+	}
+}
+
+// --- TUN mode: the system unit ----------------------------------------------
+
+// tunBackend is the systemd backend with a writable system unit directory and a
+// chosen euid, so the TUN path can be driven without root.
+func tunBackend(t *testing.T, r *fakeRun, euid int) (linuxBackend, string) {
+	t.Helper()
+	b, home := systemdBackend(t, r)
+	b.systemUnitDir = filepath.Join(home, "etc-systemd-system")
+	b.euid = euid
+	return b, home
+}
+
+// With TUN enabled and root available, `on` installs the *system* unit: it is
+// the only mechanism that can carry CAP_NET_ADMIN.
+func TestEnableWithTunInstallsASystemUnit(t *testing.T) {
+	r := newFakeRun()
+	b, home := tunBackend(t, r, 0)
+
+	st, err := b.enableWith(Options{TUN: true})
+	if err != nil {
+		t.Fatalf("enableWith: %v", err)
+	}
+	if !st.Enabled || st.Mechanism != MechanismSystemdSystem {
+		t.Errorf("state = %+v", st)
+	}
+	if st.Target != b.systemUnitPath() {
+		t.Errorf("target = %q, want %q", st.Target, b.systemUnitPath())
+	}
+
+	body, err := os.ReadFile(b.systemUnitPath())
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	got := string(body)
+	for _, want := range []string{
+		"[Unit]",
+		"[Service]",
+		"User=tester",
+		"Environment=HOME=" + home,
+		"AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW",
+		"CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW",
+		"ExecStart=/usr/local/bin/vender daemon",
+		"WantedBy=multi-user.target",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("system unit is missing %q:\n%s", want, got)
+		}
+	}
+	// The system manager, not the user manager.
+	if !r.ran("systemctl daemon-reload") || !r.ran("systemctl enable --now vender.service") {
+		t.Errorf("systemctl was not driven for the system manager (calls: %v)", r.calls)
+	}
+	if r.ran("systemctl --user enable --now vender.service") {
+		t.Errorf("the user manager was used for a TUN-enabled registration (calls: %v)", r.calls)
+	}
+	// A superseded user unit would fight for the run dir's lock.
+	if fileExists(filepath.Join(home, ".config", "systemd", "user", "vender.service")) {
+		t.Error("a user unit was left next to the system unit")
+	}
+}
+
+// Without root the system unit cannot be installed. The user unit is still
+// registered (the daemon does start at login) and the error says exactly what
+// TUN still needs.
+func TestEnableWithTunWithoutRootFallsBackAndSaysSo(t *testing.T) {
+	r := newFakeRun()
+	b, home := tunBackend(t, r, 1000)
+
+	st, err := b.enableWith(Options{TUN: true, CapabilityHint: "sing-box carries CAP_NET_ADMIN (setcap)"})
+	if err == nil {
+		t.Fatal("enableWith succeeded without root and without a capability")
+	}
+	if !strings.Contains(err.Error(), "sudo vender autostart on") {
+		t.Errorf("error does not name the fix: %v", err)
+	}
+	if !strings.Contains(err.Error(), "setcap") {
+		t.Errorf("error does not quote the capability verdict: %v", err)
+	}
+	if !st.Enabled || st.Mechanism != MechanismSystemdUser {
+		t.Errorf("fallback state = %+v", st)
+	}
+	if !strings.Contains(st.Detail, "cannot create a TUN") {
+		t.Errorf("fallback detail does not explain the TUN problem: %q", st.Detail)
+	}
+	if !fileExists(filepath.Join(home, ".config", "systemd", "user", "vender.service")) {
+		t.Error("the fallback did not install the user unit")
+	}
+}
+
+// status must tell the truth in all three TUN-relevant states.
+func TestStatusWithTun(t *testing.T) {
+	t.Run("system unit registered", func(t *testing.T) {
+		r := newFakeRun()
+		b, _ := tunBackend(t, r, 0)
+		r.answers["systemctl is-enabled vender.service"] = "enabled"
+		r.answers["systemctl is-active vender.service"] = "active"
+		if _, err := b.enableWith(Options{TUN: true}); err != nil {
+			t.Fatalf("enableWith: %v", err)
+		}
+		st, err := b.statusWith(Options{TUN: true})
+		if err != nil {
+			t.Fatalf("statusWith: %v", err)
+		}
+		if !st.Enabled || st.Mechanism != MechanismSystemdSystem {
+			t.Errorf("state = %+v", st)
+		}
+		for _, want := range []string{"systemctl is-active: active", "can create a TUN"} {
+			if !strings.Contains(st.Detail, want) {
+				t.Errorf("detail %q is missing %q", st.Detail, want)
+			}
+		}
+	})
+
+	t.Run("user unit registered while TUN is on", func(t *testing.T) {
+		r := newFakeRun()
+		b, _ := tunBackend(t, r, 1000)
+		if _, err := b.enableWith(Options{}); err != nil {
+			t.Fatalf("enableWith: %v", err)
+		}
+		st, err := b.statusWith(Options{TUN: true, CapabilityHint: "the engine needs CAP_NET_ADMIN"})
+		if err != nil {
+			t.Fatalf("statusWith: %v", err)
+		}
+		if !st.Enabled || st.Mechanism != MechanismSystemdUser {
+			t.Errorf("state = %+v", st)
+		}
+		for _, want := range []string{"cannot create a TUN", "sudo vender autostart on", "CAP_NET_ADMIN"} {
+			if !strings.Contains(st.Detail, want) {
+				t.Errorf("detail %q is missing %q", st.Detail, want)
+			}
+		}
+	})
+
+	t.Run("nothing registered", func(t *testing.T) {
+		r := newFakeRun()
+		b, _ := tunBackend(t, r, 1000)
+		st, err := b.statusWith(Options{TUN: true})
+		if err != nil {
+			t.Fatalf("statusWith: %v", err)
+		}
+		if st.Enabled {
+			t.Errorf("state = %+v", st)
+		}
+		if st.Mechanism != MechanismSystemdSystem || !strings.Contains(st.Detail, "system unit") {
+			t.Errorf("a disabled TUN status should name the system unit it would install: %+v", st)
+		}
+	})
+}
+
+// `off` removes the system unit too, and refuses to pretend when it cannot: a
+// root-owned unit left behind would start the daemon again at the next boot.
+func TestDisableRemovesTheSystemUnit(t *testing.T) {
+	r := newFakeRun()
+	b, _ := tunBackend(t, r, 0)
+	if _, err := b.enableWith(Options{TUN: true}); err != nil {
+		t.Fatalf("enableWith: %v", err)
+	}
+	if err := b.disable(); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if fileExists(b.systemUnitPath()) {
+		t.Error("the system unit survived disable")
+	}
+	if !r.ran("systemctl disable --now vender.service") {
+		t.Errorf("the system unit was not disabled through systemctl (calls: %v)", r.calls)
+	}
+
+	// The same removal as a non-root user has to fail loudly.
+	r2 := newFakeRun()
+	b2, _ := tunBackend(t, r2, 0)
+	if _, err := b2.enableWith(Options{TUN: true}); err != nil {
+		t.Fatalf("enableWith: %v", err)
+	}
+	b2.euid = 1000
+	if err := b2.disable(); err == nil {
+		t.Error("removing a root-owned system unit as a user succeeded")
+	} else if !strings.Contains(err.Error(), "sudo vender autostart off") {
+		t.Errorf("error does not name the fix: %v", err)
+	}
+}
+
+// A system unit that contains a space in the executable path must still be one
+// systemd command word, and the paths inside it must survive round-tripping.
+func TestSystemUnitQuotesPaths(t *testing.T) {
+	got := systemdSystemUnit(`/opt/my vender/vender`, "tester", `/home/my user`)
+	if !strings.Contains(got, `ExecStart="/opt/my vender/vender" daemon`) {
+		t.Errorf("ExecStart is not quoted:\n%s", got)
+	}
+	if !strings.Contains(got, `Environment=HOME="/home/my user"`) {
+		t.Errorf("HOME is not quoted:\n%s", got)
+	}
+}
+
+// A TUN registration that is not asked for keeps the old behaviour exactly: the
+// user unit, no system unit, no root needed.
+func TestEnableWithoutTunStaysUnprivileged(t *testing.T) {
+	r := newFakeRun()
+	b, _ := tunBackend(t, r, 1000)
+	st, err := b.enableWith(Options{})
+	if err != nil {
+		t.Fatalf("enableWith: %v", err)
+	}
+	if st.Mechanism != MechanismSystemdUser {
+		t.Errorf("mechanism = %q, want the user unit", st.Mechanism)
+	}
+	if fileExists(b.systemUnitPath()) {
+		t.Error("a system unit was installed although TUN is off")
+	}
+}
+
+// homeOf resolves the invoking user's home for a `sudo vender autostart on`,
+// so the system unit points at their configuration rather than root's. It is
+// driven through the seam because a test must not need a real account.
+func TestHomeOf(t *testing.T) {
+	restore := userLookup
+	t.Cleanup(func() { userLookup = restore })
+
+	userLookup = func(name string) (*user.User, error) {
+		if name != "tester" {
+			return nil, errors.New("no such user")
+		}
+		return &user.User{Username: name, HomeDir: "/home/tester"}, nil
+	}
+	if got := homeOf("tester"); got != "/home/tester" {
+		t.Errorf("homeOf = %q, want /home/tester", got)
+	}
+	// A missing account is not fatal: the unit simply does not pin HOME.
+	if got := homeOf("nobody-here"); got != "" {
+		t.Errorf("homeOf for an unknown user = %q, want empty", got)
+	}
+}
+
+// A system unit that fails to enable must not be left on disk: the fallback
+// installs the per-user registration, and a stale system unit beside it would
+// make `status` and the next boot disagree.
+func TestFailedSystemUnitIsCleanedUp(t *testing.T) {
+	r := newFakeRun()
+	b, _ := tunBackend(t, r, 0)
+	r.fail["systemctl enable --now vender.service"] = true
+	r.answers["systemctl enable --now vender.service"] = "Job for vender.service failed"
+
+	st, err := b.enableWith(Options{TUN: true})
+	if err == nil {
+		t.Fatal("enableWith succeeded although systemctl refused")
+	}
+	if fileExists(b.systemUnitPath()) {
+		t.Error("the system unit was left behind after a failed enable")
+	}
+	if !st.Enabled || st.Mechanism != MechanismSystemdUser {
+		t.Errorf("the fallback state = %+v", st)
 	}
 }

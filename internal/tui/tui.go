@@ -115,6 +115,12 @@ func runPlain(ctx context.Context, opts Options, w io.Writer) error {
 	snap := loadSnapshot(opts)
 	fmt.Fprintf(w, "listen       %s\n", orDash(snap.Listen))
 	fmt.Fprintf(w, "mode         %s\n", orDash(snap.Mode))
+	fmt.Fprintf(w, "tun          %s (stack %s, device %s, auto_route %s)\n",
+		onOffWord(snap.Tun.Enabled), orDash(snap.Tun.Stack), orDash(snap.Tun.InterfaceName),
+		onOffWord(snap.Tun.AutoRouteEnabled()))
+	if snap.Tun.Enabled && !snap.TunPriv.OK {
+		fmt.Fprintf(w, "             cannot start here: %s\n", snap.TunPriv.Detail)
+	}
 	fmt.Fprintf(w, "servers      %d configured\n", len(snap.Servers))
 	if st, err := autostart.Status(); err == nil {
 		fmt.Fprintf(w, "autostart    %s (%s)\n", enabledWord(st.Enabled), st.Mechanism)

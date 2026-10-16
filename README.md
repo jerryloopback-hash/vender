@@ -4,9 +4,11 @@ A lightweight, cross-platform personal proxy client for **Linux** and **Windows 
 
 `vender` is a thin, friendly control layer around [sing-box](https://sing-box.sagernet.org/),
 which it runs as a managed child process. It exposes a local mixed
-**SOCKS5 + HTTP** inbound (default `127.0.0.1:7897`) that any application can use.
-There is **no TUN mode** — nothing is routed system-wide, so the proxy is opt-in
-per application and easy to reason about.
+**SOCKS5 + HTTP** inbound (default `127.0.0.1:7897`) that any application can use,
+and it can *additionally* be switched into an optional **TUN mode** that captures
+the host's traffic system-wide. TUN mode is **off by default** and the local
+inbound is always there, so the usual way to use vender is still opt-in per
+application and easy to reason about.
 
 Two outbound protocols are supported:
 
@@ -19,17 +21,21 @@ The pinned engine is **sing-box 1.14.3** (see `scripts/fetch-sing-box.sh`).
 
 ## Status
 
-`vender` is at **M4**: the configuration layer and share-link parser (M0), the
+`vender` is at **M6**: the configuration layer and share-link parser (M0), the
 engine (M1), **smart routing out of the box** (M2), an **animated terminal UI**
-(M3), and now **start at login on Linux and Windows 11**, **Windows system-proxy
-control** and **release packaging** (M4). The rule sets the default policy
-matches against are **embedded in the binary**, so a working default needs no
-download at runtime; the TUI attaches to the running daemon over a local control
-channel and can switch servers, change mode, start and stop the engine, tail its
-log, show live traffic and turn start-at-login on and off.
+(M3), **start at login on Linux and Windows 11**, **Windows system-proxy
+control** and **release packaging** (M4), and now an optional **TUN mode** —
+transparent, system-wide capture on top of the same engine and the same policy.
+The rule sets the default policy matches against are **embedded in the binary**,
+so a working default needs no download at runtime; the TUI attaches to the
+running daemon over a local control channel and can switch servers, change mode,
+turn TUN mode on and off, start and stop the engine, tail its log, show live
+traffic and toggle start-at-login.
 
 Everything the CLI offers is implemented; there are no `not implemented` stubs
-left.
+left. (The subscription/latency milestone, M5, is not part of this line: `import`
+takes one link at a time and latency is measured by `vender tui` and the control
+channel rather than by a dedicated command.)
 
 ## Roadmap
 
@@ -40,8 +46,9 @@ left.
 | M2 | Built-in routing rules (CN direct, ad block, private IPs), split DNS, embedded rule sets, `rules list` |
 | M3 | Control channel (loopback TCP + token, `control.json`), live traffic from sing-box's Clash API, animated Bubble Tea TUI (`vender tui`) |
 | **M4** | **Autostart** (systemd user unit / XDG autostart on Linux; Task Scheduler logon task / Run key on Windows), **Windows system proxy** (WinINET), **release packaging** and a per-user installer |
-| M5 | Subscription links and bulk import, server latency testing |
-| M6 | Hardening & release: health-based failover, log rotation, signed builds |
+| M5 | Subscription links and bulk import, server latency testing — *not in this line* |
+| **M6** | **Optional TUN mode** (transparent system-wide capture, `vender tun on\|off\|status`, TUN-aware autostart) |
+| M7 | Hardening & release: health-based failover, log rotation, signed builds |
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and the
 interfaces between milestones.
@@ -141,6 +148,10 @@ If none is found, the error names all three locations.
 ./vender proxy on              # also point the desktop's system proxy at vender
 ./vender proxy off             # restore the system proxy
 
+./vender tun on                # optional: capture the whole host (needs a privilege)
+./vender tun status            # setting, device, and whether it can actually start
+./vender tun off               # back to the local inbound only
+
 ./vender autostart on          # run the daemon at login (systemd unit / Task Scheduler task)
 ./vender autostart status      # what is registered, and where (exit code!)
 ./vender autostart off         # remove the registration
@@ -162,9 +173,10 @@ server clears the selection.
 
 This is a convenience for applications that honour the desktop proxy settings
 but have no proxy option of their own. It only ever changes the *user's* proxy
-configuration — no TUN, no VPN, no daemon state — and vender still recommends
-configuring the proxy per application (or exporting `http_proxy` / `https_proxy`
-/ `all_proxy`, which `proxy on` prints).
+configuration — never the routes, never the daemon's state — and vender still
+recommends configuring the proxy per application (or exporting `http_proxy` /
+`https_proxy` / `all_proxy`, which `proxy on` prints). For traffic that cannot
+be configured per application, see [TUN mode](#tun-mode) below.
 
 | Platform | What is written |
 |---|---|
@@ -195,7 +207,8 @@ which is exactly when you tend to want it.
 | Windows | Task Scheduler **logon task** (primary) | `\vender\daemon`, registered from XML: logon trigger, `InteractiveToken`, `LeastPrivilege`, hidden, no time limit |
 | Windows | per-user Registry Run key (fallback when the task cannot be created) | `HKCU\...\CurrentVersion\Run`, value `vender` |
 
-Neither platform needs administrator rights.
+Neither platform needs administrator rights — **unless TUN mode is on**, see
+[Autostart with TUN mode](#autostart-with-tun-mode).
 
 **Start at boot, not just at login** (Linux): the user manager is normally torn
 down when your last session ends. `autostart on` asks logind for lingering
@@ -207,13 +220,50 @@ is still correct and `status` says so in its `detail` line — run
 but vender is a *console-subsystem* executable, so Task Scheduler does not
 guarantee a fully invisible start — a console window can flash at logon. A
 windowless start needs a GUI-subsystem build or a `conhost --headless` launcher
-and is deferred to M6; the daemon itself does not need a console. The Windows
+and is deferred to M7; the daemon itself does not need a console. The Windows
 paths are compile-checked (`GOOS=windows go build ./...`) and their XML, argument
 vectors and output parsing are unit-tested, but they cannot be *executed* on a
 Linux development host.
 
 The entry only ever runs `vender daemon`, which is headless: one daemon per run
 directory, a fresh control token per start, and a clean exit on `SIGTERM`.
+
+### Autostart with TUN mode
+
+The two mechanisms above are **per-user**, and a per-user mechanism cannot be
+given a kernel privilege: a systemd *user* manager is unprivileged, so it has
+nothing to hand out, and a per-user Run key cannot run a process elevated. With
+`engine.tun.enabled: true`, `vender autostart on` therefore switches to the
+mechanism that *can*:
+
+| Platform | Mechanism with TUN on | What it costs |
+|---|---|---|
+| Linux | a **system** unit `/etc/systemd/system/vender.service` with `User=<you>` and `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW` | one `sudo vender autostart on`. The daemon still runs as you, not as root; `CapabilityBoundingSet` keeps every other capability out of reach |
+| Windows | the same logon task, registered as `HighestAvailable` instead of `LeastPrivilege` | one `vender autostart on` from an **elevated** prompt |
+
+If that privileged registration cannot be made — no root, no elevation — `on`
+still installs the per-user entry (so the daemon does start at login) and then
+**returns an error** naming what TUN mode is still missing. It never reports a
+setup that cannot work. `status` tells the same truth at any time: it says which
+mechanism is registered and whether that mechanism can create a TUN, and when it
+cannot it prints the fix.
+
+The alternative to the system unit is the `setcap` route: keep the per-user
+unit and grant the capability to the engine binary itself —
+
+```sh
+sudo setcap cap_net_admin,cap_net_raw+ep "$(command -v sing-box)"
+```
+
+— which needs no file in `/etc` at all, but is **lost whenever that binary is
+replaced**: a sing-box upgrade, a reinstall, or unpacking a fresh vender release
+archive over it. `vender tun status` and `vender autostart status` check the
+binary's file capabilities too, so they report this arrangement correctly
+instead of calling it broken.
+
+`vender autostart off` removes both the user and the system artifacts; the
+system one needs root, and if it cannot be removed `off` says so rather than
+leaving a root-owned unit that would start the daemon again at the next boot.
 
 ## The terminal UI
 
@@ -228,11 +278,12 @@ An animated Bubble Tea interface with four screens:
 | `1` | **Dashboard** | daemon and engine state, the selected server, the mode, uptime, and a **live up/down traffic graph** with human-readable rates and session totals |
 | `2` | **Nodes** | every configured server with its type, protocol, endpoint and latency. `enter` makes one active (the daemon restarts the engine in place), `t` measures latency |
 | `3` | **Logs** | the engine's own output, streamed live, with follow mode (`f`) and a filter (`/`) |
-| `4` | **Settings** | the routing mode, the listener, a read-only view of the **active built-in policy**, and the **start-at-login registration** (`a` toggles it) |
+| `4` | **Settings** | the routing mode, the listener, the **TUN inbound** (state, device, and whether this machine can actually create it — `u` toggles it), a read-only view of the **active built-in policy**, and the **start-at-login registration** (`a` toggles it) |
 
 Other keys: `tab` / `shift+tab` between screens, `?` for help, `t` to test
 latency, `s` / `x` / `R` to start, stop and restart the engine, `m` to cycle
-the mode, `a` on Settings to toggle start-at-login, `q` or Ctrl-C to quit.
+the mode, `u` on Settings to toggle TUN mode, `a` on Settings to toggle
+start-at-login, `q` or Ctrl-C to quit.
 
 The TUI is a **client**: it never runs sing-box itself, it asks the daemon. So
 it can attach and detach at any time, and two of them can be open at once. It
@@ -249,8 +300,8 @@ secret. Nothing outside the daemon talks to it.
 The daemon publishes a small endpoint at `<run-dir>/control.json` (mode `0600`)
 holding a loopback TCP address and a random token, regenerated on every start
 and deleted on exit. Clients speak newline-delimited, versioned JSON over that
-connection: `status`, `servers`, `select`, `mode`, `latency`, `start`, `stop`,
-`restart` and `rules` are request/response, while `logs` and `traffic` are
+connection: `status`, `servers`, `select`, `mode`, `tun`, `latency`, `start`,
+`stop`, `restart` and `rules` are request/response, while `logs` and `traffic` are
 subscriptions that take their connection over. A request without the token is
 rejected. See `docs/ARCHITECTURE.md` §8 for the protocol and for why it is
 loopback TCP rather than a unix socket.
@@ -272,6 +323,92 @@ engine:
 
 `bind_interface` is passed straight through to sing-box and only affects the
 connection to the proxy server, not the local inbound.
+
+## TUN mode
+
+```sh
+./vender tun on        # capture the whole host through the tunnel
+./vender tun status    # is it on, what device, and can this machine actually create one?
+./vender tun off       # back to the local inbound only
+```
+
+By default vender only proxies applications that you point at
+`127.0.0.1:7897`. TUN mode is the opt-in alternative: the engine creates a
+virtual network device, installs routes that pull every destination into it, and
+carries each connection through the selected server according to the same
+routing policy (rule / global / direct). The mixed inbound **stays up**, so both
+ways in work at the same time.
+
+```sh
+sudo vender autostart on     # the privileged registration TUN mode needs
+#   or, keeping the per-user service:
+sudo setcap cap_net_admin,cap_net_raw+ep "$(command -v sing-box)"
+```
+
+### It needs a privilege, and vender says so before trying
+
+Creating the TUN device is the one thing vender cannot do as an ordinary user:
+
+| Platform | What is needed | How vender reports it |
+|---|---|---|
+| Linux | `CAP_NET_ADMIN` (and `CAP_NET_RAW`) in the process, or on the `sing-box` binary via `setcap ...+ep` | `vender tun status` prints the verdict and the exact fixes; the daemon refuses to enable TUN *before* stopping a working engine |
+| Windows | an elevated (Administrator) process — a WinTun adapter is a driver-level device | the same, with the "register autostart from an elevated prompt" route |
+
+`vender tun status` exits non-zero when TUN is off (so it drops into a script),
+and prints, in order: the setting, the device and stack, the resolved engine,
+**the privilege verdict**, and what a running daemon thinks. Without the
+privilege the engine would otherwise fail with sing-box's own
+`configure tun interface: open tun: TUNSETIFF: operation not permitted`, which
+says nothing about how to fix it.
+
+### What is rendered, and what to think about
+
+| Setting | Default | Notes |
+|---|---|---|
+| `stack` | `mixed` | `system` — the kernel stack, reached through the device; `gvisor` — a user-space stack; `mixed` — TCP on gvisor, UDP on the kernel. Always written explicitly, so a change of engine default cannot silently change vender's behaviour |
+| `interface_name` | `vender0` | named explicitly so `ip link`, `ip route` and any cleanup have one predictable device to look for. Max 15 characters on Linux |
+| `auto_route` | `true` | installs the routes for `0.0.0.0/1` and `128.0.0.0/1` and adds `ip rule`s, so the engine's own marked connections bypass its own tunnel instead of looping. `auto_route: false` captures nothing until you add a route yourself — the safe way to try a TUN on a machine whose connectivity matters |
+| `strict_route` | `false` | a kill switch: refuses traffic that would leave outside the tunnel. Useful, and it means a broken engine means *no* connectivity |
+| `mtu` | `0` (`auto` → 9000) | lower it if a path MTU problem shows up |
+| `route_exclude_address` | empty | CIDRs kept out of the tunnel. The usual entries spare your LAN, a corporate VPN, or mihomo/clash's own `198.18.0.0/15` |
+| `route_exclude_address_set` | empty | the same, expressed as embedded rule-set tags (`geoip-cn`, `geosite-cn`, …). vender checks the tag exists and declares it in the engine config. sing-box 1.14 has no `route_exclude_rule` field; this is that knob |
+| `address` | empty → engine default | the device's own address. Left alone, sing-box picks a private `/30` that does not collide with the `198.18.0.0/15` a mihomo/clash TUN uses |
+
+Two things that follow from turning it on, stated plainly:
+
+- **DNS is now the engine's job.** In `rule` mode — and, under a TUN, in
+  `global` mode too — the generated config starts with `{"action": "sniff"}`
+  and `{"protocol": ["dns"], "action": "hijack-dns"}`, so DNS queries stop being
+  plain packets to port 53 and are answered by the split-DNS policy instead
+  (domestic names via `223.5.5.5`, everything else over the proxied resolver).
+  In `direct` mode there are no such actions: direct mode must not intercept
+  anything.
+- **`global` is still `global`.** Under a TUN, global mode gains those two
+  *actions* — without them "everything through the proxy" would be false for the
+  one protocol every connection starts with — and still emits **no destination
+  rules**.
+- **The whole host depends on the engine.** If it cannot reach the server, the
+  host loses connectivity, not just one application. That is what `tun off`
+  (and, in the other direction, `strict_route`) is for.
+
+### Coexisting with another TUN or VPN
+
+The host's default route is no longer exclusively yours once a TUN is up. Three
+practical points:
+
+- **Another TUN already installed** (mihomo, a corporate VPN): do not run two
+  `auto_route` TUNs that both claim the default route — they fight, and the
+  result is usually "no connectivity at all". Stop the other one first, or keep
+  `auto_route: false` and route only what you want.
+- **The engine's own connection to the server** must not be routed back into
+  its own tunnel. sing-box handles that with fwmarks and `ip rule`s; vender also
+  emits `route.auto_detect_interface: true` when a TUN is on and
+  `engine.bind_interface` is empty, which binds the outbound to the interface
+  holding the default route. Set `bind_interface` instead when the host is
+  multi-homed (see [Behind an existing VPN or TUN](#behind-an-existing-vpn-or-tun)).
+- **A stale device** from a killed process: `ip link del vender0` removes it, and
+  the routes and rules go with it. `vender tun off` + a restart is the supported
+  way.
 
 ## Configuration
 
@@ -303,8 +440,22 @@ Two files live in the config directory:
   engine:
       binary: ""          # empty => next to vender, else PATH
       bind_interface: ""  # e.g. eth0 on a multi-homed host
+      tun:
+          enabled: false        # opt-in; see "TUN mode" below
+          stack: mixed          # system | gvisor | mixed
+          mtu: 0                # 0 = the engine's own default (9000)
+          auto_route: true      # install the routes that pull traffic in
+          strict_route: false   # true = refuse traffic that would bypass the tunnel
+          interface_name: vender0
+          # address: []                       # the device's own address
+          # route_exclude_address: []         # CIDRs kept out of the tunnel
+          # route_exclude_address_set: []     # rule-set tags kept out (e.g. geoip-cn)
   selected_server: ""
   ```
+
+  A disabled `engine.tun` block is inert: it is not validated and nothing is
+  rendered from it, so a typo in a feature you are not using cannot stop vender
+  from starting.
 
 - `servers.yaml` — the server list, **written with mode `0600`** because it
   holds credentials (UUIDs, passwords, REALITY public keys). Managed by
@@ -448,22 +599,24 @@ scripts/fetch-rules.sh --print-size # the embedded total
 3. in rule mode extracts the embedded rule sets into `<run dir>/rules/` (before
    the config that references them);
 4. renders `singbox.json` **atomically** (`0600`, since it holds credentials)
-   with one `mixed` inbound, the selected outbound, a `direct` outbound, a
-   `block` outbound, the built-in rules, their actions, the split DNS policy and
-   the experimental Clash API (loopback, with a generated secret) the TUI reads
-   live traffic from;
-5. starts `sing-box run -c <run dir>/singbox.json` in its own process group and
+   with one `mixed` inbound (plus a `tun` inbound when TUN mode is on), the
+   selected outbound, a `direct` outbound, a `block` outbound, the built-in
+   rules, their actions, the split DNS policy and the experimental Clash API
+   (loopback, with a generated secret) the TUI reads live traffic from;
+5. checks, when TUN mode is on, that this process can create a TUN device, and
+   fails with the exact fix instead of sing-box's bare `operation not permitted`;
+6. starts `sing-box run -c <run dir>/singbox.json` in its own process group and
    returns only once the inbound port actually accepts TCP connections;
-6. publishes its control endpoint as `<run dir>/control.json` (`0600`) and
+7. publishes its control endpoint as `<run dir>/control.json` (`0600`) and
    serves it, so `vender tui` can attach;
-7. streams sing-box's output to its own standard output, prefixed `sing-box:`,
+8. streams sing-box's output to its own standard output, prefixed `sing-box:`,
    and to every attached client;
-8. on `SIGINT`/`SIGTERM`, stops sing-box gracefully (`SIGTERM`, then `SIGKILL`
+9. on `SIGINT`/`SIGTERM`, stops sing-box gracefully (`SIGTERM`, then `SIGKILL`
    after a grace period), removes the pid file and the control endpoint, and
    releases the lock.
 
 While it runs, a client can also switch the active server, change the routing
-mode, and start/stop/restart the engine in place — the daemon re-renders the
+mode, turn TUN mode on and off, and start/stop/restart the engine in place — the daemon re-renders the
 configuration and restarts sing-box without the daemon itself going away.
 
 `vender status` reads the same lock, so its exit code means exactly "the proxy

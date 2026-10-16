@@ -79,14 +79,18 @@ func TestCLIAutostart(t *testing.T) {
 	restore := autostartEnable
 	restoreOff := autostartDisable
 	restoreStatus := autostartStatus
+	restoreOpts := autostartOptions
 	t.Cleanup(func() {
 		autostartEnable, autostartDisable, autostartStatus = restore, restoreOff, restoreStatus
+		autostartOptions = restoreOpts
 	})
+	// The real option reader would look at the host's config.yaml.
+	autostartOptions = func(*app) autostart.Options { return autostart.Options{} }
 
 	enabled := false
-	autostartEnable = func() error { enabled = true; return nil }
+	autostartEnable = func(autostart.Options) error { enabled = true; return nil }
 	autostartDisable = func() error { enabled = false; return nil }
-	autostartStatus = func() (autostart.State, error) {
+	autostartStatus = func(autostart.Options) (autostart.State, error) {
 		if enabled {
 			return autostart.State{
 				Enabled:   true,
@@ -490,5 +494,169 @@ func TestCLIImportFromFreshConfigDirInNestedPath(t *testing.T) {
 	}
 	if !strings.Contains(out, fmt.Sprintf("saved to %s", filepath.Join(dir, config.ServersFileName))) {
 		t.Errorf("import output = %q, want it to name the file it wrote", out)
+	}
+}
+
+// --- M6: `vender tun` -------------------------------------------------------
+
+// The TUN command is a configuration edit when no daemon is running: the
+// setting has to survive, and `status` has to exit non-zero while it is off
+// (the same contract as `vender status` and `vender autostart status`).
+func TestCLITunWithoutADaemon(t *testing.T) {
+	cfgDir := t.TempDir()
+	runDir := t.TempDir()
+	store := config.NewStoreAt(cfgDir)
+
+	// Off by default: status explains itself and exits non-zero.
+	out, err := runCLIIn(t, runDir, "tun", "status", "--config-dir", cfgDir)
+	if err == nil {
+		t.Fatalf("tun status while off = nil error, want a non-zero exit (output %q)", out)
+	}
+	if !strings.Contains(out, "TUN mode: off") {
+		t.Errorf("status output = %q", out)
+	}
+
+	// On: persisted, and reported.
+	out, err = runCLIIn(t, runDir, "tun", "on", "--config-dir", cfgDir)
+	if err != nil {
+		t.Fatalf("tun on: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "TUN mode enabled: on") {
+		t.Errorf("tun on output = %q", out)
+	}
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.Engine.Tun.Enabled {
+		t.Error("tun on did not persist the setting")
+	}
+	// The verdict is always reported, so a user is never left guessing whether
+	// TUN can work here.
+	if !strings.Contains(out, "privileges") {
+		t.Errorf("tun on output does not report the privilege verdict: %q", out)
+	}
+
+	// Idempotent, and now status exits 0.
+	if _, err := runCLIIn(t, runDir, "tun", "on", "--config-dir", cfgDir); err != nil {
+		t.Fatalf("tun on twice: %v", err)
+	}
+	if _, err := runCLIIn(t, runDir, "tun", "status", "--config-dir", cfgDir); err != nil {
+		t.Errorf("tun status while on = %v, want nil", err)
+	}
+
+	// --json is machine-readable and reports the same setting.
+	out, err = runCLIIn(t, runDir, "tun", "status", "--config-dir", cfgDir, "--json")
+	if err != nil {
+		t.Fatalf("tun status --json: %v", err)
+	}
+	var got struct {
+		Enabled    bool   `json:"enabled"`
+		Action     string `json:"action"`
+		Stack      string `json:"stack"`
+		Iface      string `json:"interface"`
+		AutoRoute  bool   `json:"autoRoute"`
+		Privileges bool   `json:"privilegesOk"`
+		Daemon     int    `json:"daemon"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("tun status --json is not JSON: %v\n%s", err, out)
+	}
+	if !got.Enabled || got.Stack != config.DefaultTunStack || got.Iface != config.DefaultTunInterfaceName || !got.AutoRoute {
+		t.Errorf("json = %+v", got)
+	}
+	if got.Action != "status" {
+		t.Errorf("action = %q", got.Action)
+	}
+	if got.Daemon != 0 {
+		t.Errorf("daemon = %d, want 0 (not running)", got.Daemon)
+	}
+
+	// Off again.
+	out, err = runCLIIn(t, runDir, "tun", "off", "--config-dir", cfgDir)
+	if err != nil {
+		t.Fatalf("tun off: %v\n%s", err, out)
+	}
+	if cfg, err = store.LoadConfig(); err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Engine.Tun.Enabled {
+		t.Error("tun off did not persist the setting")
+	}
+	if _, err := runCLIIn(t, runDir, "tun", "status", "--config-dir", cfgDir); err == nil {
+		t.Error("tun status after off = nil error, want a non-zero exit")
+	}
+}
+
+// `tun` follows the same shape as `proxy` and `autostart`: an unknown
+// subcommand prints the usage (cobra's behaviour for a group command) instead
+// of doing something surprising, and a stray argument to a leaf is an error.
+func TestCLITunRejectsUnknownSubcommand(t *testing.T) {
+	out, err := runCLI(t, "tun", "sideways")
+	if err != nil {
+		t.Fatalf("tun sideways: %v", err)
+	}
+	for _, want := range []string{"Available Commands:", "on", "off", "status"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("tun sideways does not print the usage (%q missing):\n%s", want, out)
+		}
+	}
+	if _, err := runCLI(t, "tun", "on", "extra"); err == nil {
+		t.Error("tun on with an argument = nil error")
+	}
+}
+
+// `autostart on` has to hand the registration what the daemon will need, which
+// is read from the configuration the CLI was pointed at: with TUN on, the
+// mechanism has to be the privileged one.
+func TestCLIAutostartPassesTheTunSetting(t *testing.T) {
+	restoreOpts := autostartOptions
+	restoreEnable := autostartEnable
+	restoreStatus := autostartStatus
+	t.Cleanup(func() {
+		autostartOptions, autostartEnable, autostartStatus = restoreOpts, restoreEnable, restoreStatus
+	})
+
+	cfgDir := t.TempDir()
+	runDir := t.TempDir()
+	store := config.NewStoreAt(cfgDir)
+
+	var seen autostart.Options
+	autostartEnable = func(o autostart.Options) error { seen = o; return nil }
+	autostartStatus = func(autostart.Options) (autostart.State, error) {
+		return autostart.State{Enabled: true, Mechanism: autostart.MechanismSystemdSystem, Target: "/etc/systemd/system/vender.service"}, nil
+	}
+	autostartOptions = defaultAutostartOptions
+
+	// TUN off: the per-user mechanism, no capability hint.
+	cfg := config.Default()
+	if err := store.SaveConfig(cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	if _, err := runCLIIn(t, runDir, "autostart", "on", "--config-dir", cfgDir); err != nil {
+		t.Fatalf("autostart on: %v", err)
+	}
+	if seen.TUN || seen.CapabilityHint != "" {
+		t.Errorf("options with TUN off = %+v", seen)
+	}
+
+	// TUN on: the option travels, and the hint explains what is missing (this
+	// test process is not privileged, so there is always something).
+	cfg.Engine.Tun.Enabled = true
+	if err := store.SaveConfig(cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	out, err := runCLIIn(t, runDir, "autostart", "on", "--config-dir", cfgDir)
+	if err != nil {
+		t.Fatalf("autostart on with TUN: %v\n%s", err, out)
+	}
+	if !seen.TUN {
+		t.Error("the TUN setting did not reach the registration")
+	}
+	if seen.CapabilityHint == "" {
+		t.Error("a TUN registration without the capability got no hint")
+	}
+	if !strings.Contains(out, "systemd-system") {
+		t.Errorf("the output does not report the system unit: %q", out)
 	}
 }

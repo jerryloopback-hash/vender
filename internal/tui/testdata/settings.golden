@@ -1,15 +1,17 @@
- Dashboard   Nodes       Logs        Settings                                             vender M4
+ Dashboard   Nodes       Logs        Settings                                             vender M6
 ╭─ routing mode ───────────────────────────────────────────────────────────────────────────────────╮
 │ ▸ (●) rule   active  built-in policy: CN and private destinations direct, ads blocked, the rest… │
 │   ( ) global         every connection through the selected server                                │
 │   ( ) direct         no proxy at all (the local inbound still works)                             │
 │ ←/→ choose · enter apply · applying restarts the engine in place                                 │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
-╭─ listener ───────────────────────────────────────────────────────────────────────────────────────╮
+╭─ inbounds ───────────────────────────────────────────────────────────────────────────────────────╮
 │ mixed SOCKS5+HTTP  127.0.0.1:7897                                                                │
-│ log level          info   bind interface  -                                                      │
-│ engine binary      /usr/local/bin/sing-box                                                       │
-│ config dir         /home/test/.config/vender                                                     │
+│ tun                off  press u to enable system-wide capture                                    │
+│ tun settings       stack mixed   device vender0   mtu auto   auto_route on   strict_route off    │
+│ privileges         missing  uid 1000 does not hold CAP_NET_ADMIN (CapEff 0000000000000000)       │
+│ engine binary      /usr/local/bin/sing-box   log info                                            │
+│ config dir         /home/test/.config/vender   bind -                                            │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ built-in routing policy ────────────────────────────────────────────────────────────────────────╮
 │ actions  sniff, protocol=dns -> hijack-dns      final  proxy                                     │
@@ -25,4 +27,4 @@
 │ system proxy    `vender proxy on|off` points the desktop at the local inbound                    │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
  ● daemon pid 4821  attached to the daemon at 127.0.0.1:41234
- ←/→ mode • enter apply • a start at login • tab screens • ? help
+ ←/→ mode • enter apply • u tun • a start at login • tab screens • ? help

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/help"
@@ -73,7 +74,7 @@ func (m Model) tabsView() string {
 			}
 		}
 	}
-	right := m.theme.appName.Render("vender") + " " + m.theme.appTag.Render("M4")
+	right := m.theme.appName.Render("vender") + " " + m.theme.appTag.Render(milestoneTag)
 	if gap := m.panelWidth() - lipgloss.Width(b.String()) - lipgloss.Width(right) - 1; gap > 0 {
 		b.WriteString(repeat(" ", gap))
 		b.WriteString(right)
@@ -211,6 +212,7 @@ func (m Model) daemonPanel(w int) string {
 	line2 := m.theme.subtle.Render("server   ") + m.serverText()
 	line3 := m.theme.subtle.Render("mode     ") + m.theme.value.Render(orDash(st.Mode)) +
 		m.theme.subtle.Render("   listen ") + m.theme.value.Render(orDash(st.Listen)) +
+		m.theme.subtle.Render("   tun ") + m.tunBadge() +
 		m.theme.subtle.Render("   servers ") + m.theme.value.Render(fmt.Sprintf("%d (%d active)", st.ServerCount, activeCount(m.servers)))
 	line4 := m.theme.subtle.Render("latency  ") + m.latencyBadge() +
 		m.theme.subtle.Render("   engine ") + m.theme.value.Render(orDash(st.EngineVersion))
@@ -258,6 +260,23 @@ func (m Model) nodesPanel(w int) string {
 	return m.theme.panel("nodes", w,
 		m.theme.value.Render(label)+m.theme.subtle.Render("   ·   press 2 or tab for the list"),
 	)
+}
+
+// tunBadge is the Dashboard's one-word TUN state. A TUN that is on but cannot
+// work is the interesting case, so it is coloured as a warning rather than
+// reported as a plain "on".
+func (m Model) tunBadge() string {
+	t := m.tun()
+	switch {
+	case !t.Known:
+		return m.theme.dim.Render("?")
+	case !t.Enabled:
+		return m.theme.dim.Render("off")
+	case !t.Priv.OK:
+		return m.theme.bad.Render("on (no privilege)")
+	default:
+		return m.theme.value.Render("on") + m.theme.dim.Render(" "+orDash(t.Interface))
+	}
 }
 
 func (m Model) currentDown() float64 {
@@ -572,22 +591,94 @@ func (m Model) settingsView() string {
 	}
 	modeLines = append(modeLines, m.theme.dim.Render("←/→ choose · enter apply · applying restarts the engine in place"))
 
-	listener := []string{
+	inbounds := []string{
 		m.theme.subtle.Render("mixed SOCKS5+HTTP  ") + m.theme.value.Render(orDash(m.listenLabel())),
-		m.theme.subtle.Render("log level          ") + m.theme.value.Render(orDash(m.snap.LogLevel)) +
-			m.theme.subtle.Render("   bind interface  ") + m.theme.value.Render(orDash(m.snap.BindInterface)),
-		m.theme.subtle.Render("engine binary      ") + m.theme.value.Render(orDash(m.snap.Binary)),
-		m.theme.subtle.Render("config dir         ") + m.theme.value.Render(m.snap.ConfigDir),
 	}
+	inbounds = append(inbounds, m.tunLines()...)
+	inbounds = append(inbounds,
+		m.theme.subtle.Render("engine binary      ")+m.theme.value.Render(orDash(m.snap.Binary))+
+			m.theme.subtle.Render("   log ")+m.theme.value.Render(orDash(m.snap.LogLevel)),
+		m.theme.subtle.Render("config dir         ")+m.theme.value.Render(m.snap.ConfigDir)+
+			m.theme.subtle.Render("   bind ")+m.theme.value.Render(orDash(m.snap.BindInterface)),
+	)
 
 	policy := m.policyLines(mode)
 
 	return strings.Join([]string{
 		m.theme.panel("routing mode", w, modeLines...),
-		m.theme.panel("listener", w, listener...),
+		m.theme.panel("inbounds", w, inbounds...),
 		m.theme.panel("built-in routing policy", w, policy...),
 		m.theme.panel("autostart", w, m.autostartLines()...),
 	}, "\n")
+}
+
+// tunLines renders the TUN inbound's state inside the inbounds panel. It is the
+// one place in the TUI that can say "this feature is switched on but cannot
+// work here": a TUN needs CAP_NET_ADMIN (Linux) or Administrator (Windows), and
+// a user who enables it without that would otherwise only find out from an
+// engine that refuses to start.
+//
+// It is deliberately three lines in the common case — the panel it lives in has
+// no room to spare — and grows by one line only when there is something the
+// user must act on.
+func (m Model) tunLines() []string {
+	t := m.tun()
+	if !t.Known {
+		return []string{m.theme.subtle.Render("tun                ") + m.theme.dim.Render("checking…")}
+	}
+
+	state := m.theme.dim.Render("off")
+	action := "  press u to enable system-wide capture"
+	switch {
+	case t.Enabled && t.Priv.OK:
+		state = m.theme.ok.Render("on")
+		action = "  press u to disable"
+	case t.Enabled:
+		state = m.theme.bad.Render("on, but blocked")
+		action = "  press u to disable"
+	}
+
+	lines := []string{
+		m.theme.subtle.Render("tun                ") + state + m.theme.dim.Render(action),
+		m.theme.subtle.Render("tun settings       ") +
+			m.theme.value.Render(fmt.Sprintf("stack %s   device %s   mtu %s   auto_route %s   strict_route %s",
+				orDash(t.Stack), orDash(t.Interface), mtuLabel(t.MTU), onOffWord(t.AutoRoute), onOffWord(t.StrictRoute))),
+	}
+
+	// The privilege verdict is the difference between "on" and "working", so it
+	// is always shown.
+	const label = "privileges         "
+	width := max(20, m.panelWidth()-len(label)-12)
+	priv := m.theme.subtle.Render(label)
+	if t.Priv.OK {
+		priv += m.theme.ok.Render("ok") + m.theme.dim.Render("  "+truncate(t.Priv.Detail, width))
+	} else {
+		priv += m.theme.bad.Render("missing") + m.theme.dim.Render("  "+truncate(t.Priv.Detail, width))
+	}
+	lines = append(lines, priv)
+
+	if t.Enabled && !t.Priv.OK {
+		lines = append(lines, m.theme.bad.Render("warning            ")+
+			m.theme.subtle.Render("the engine cannot create a TUN device; `vender tun status` lists the fix"))
+	} else if t.Enabled && m.attached && !t.Active {
+		lines = append(lines, m.theme.warn.Render("engine             ")+
+			m.theme.subtle.Render("the running engine has no TUN inbound (it is stopped, or was not restarted)"))
+	}
+	return lines
+}
+
+func mtuLabel(mtu int) string {
+	if mtu == 0 {
+		return "auto"
+	}
+	return strconv.Itoa(mtu)
+}
+
+func onOffWord(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
 }
 
 // autostartLines renders the start-at-login registration. The state is read
@@ -746,6 +837,7 @@ func (m Model) helpOverlay() string {
 		{
 			"Settings",
 			"  ←/→, h/l   choose a mode     enter  apply",
+			"  u          toggle TUN mode (transparent, system-wide capture)",
 			"  a          toggle start at login (systemd unit / XDG entry / Run key)",
 		},
 		{
@@ -792,7 +884,7 @@ func (m Model) keyMap() help.KeyMap {
 		return km{short: append([]key.Binding{f, b("/", "filter"), b("t", "clear")}, common...)}
 	case screenSettings:
 		return km{short: append([]key.Binding{
-			b("←/→", "mode"), b("enter", "apply"), b("a", "start at login"),
+			b("←/→", "mode"), b("enter", "apply"), b("u", "tun"), b("a", "start at login"),
 		}, common...)}
 	default:
 		short := []key.Binding{b("t", "latency"), b("s/x", "start/stop"), b("m", "mode")}

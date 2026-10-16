@@ -106,7 +106,7 @@ done
 # --- archive helpers ---------------------------------------------------------
 # Reproducible-ish: a fixed mtime, sorted entries and no owner metadata, so two
 # runs over identical inputs produce identical archives. Bit-for-bit
-# reproducible cross-builds are M6's; this at least removes the easy sources of
+# reproducible cross-builds are M7's; this at least removes the easy sources of
 # churn.
 make_tar() {
 	local out="$1" dir="$2" top="$3"

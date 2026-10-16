@@ -11,14 +11,21 @@ and the interfaces that later milestones compile against today.
   proxy with minimal ceremony.
 - Two well-chosen outbound protocols: VLESS + Vision + REALITY (TCP) and
   Hysteria2 (UDP).
-- A local **mixed SOCKS5 + HTTP** inbound so applications opt in per app.
+- A local **mixed SOCKS5 + HTTP** inbound so applications opt in per app, which
+  stays the default and the primary way to use vender.
+- An **optional TUN mode** (M6) for the traffic that cannot be configured per
+  application, sharing the same engine, the same policy and the same control
+  channel as the mixed inbound.
 - Configuration that is plain YAML, human-readable, and safe on disk.
 
 **Non-goals**
 
-- No TUN / system-wide transparent proxying.
+- TUN mode **off by default**, and never switched on by vender itself: it changes
+  the host's routing table, so it is an explicit `vender tun on`.
 - No subscription marketplace, no telemetry, no accounts.
 - No attempt to reimplement the proxy protocols; sing-box does that.
+- No attempt to reimplement the kernel's job: the routing rules, the fwmarks and
+  the device are sing-box's, driven by vender's own `engine.tun` block.
 
 ## 2. Process model
 
@@ -39,6 +46,8 @@ and the interfaces that later milestones compile against today.
         |        sing-box child      |   |   vender tui     |
         |  mixed inbound 127.0.0.1:  |   |     (M3)         |
         |  7897 -> selected outbound |   |  Bubble Tea UI   |
+        |  + optional tun inbound    |   |  (M6: tun toggle)|
+        |    (M6, vender0)           |   |                  |
         |  clash api 127.0.0.1:<auto>|   +------------------+
         +----------------------------+            ^
                       ^                           | CLI commands
@@ -155,8 +164,29 @@ proxy:
 engine:
     binary: ""                  # empty => bundled next to vender, else PATH
     bind_interface: ""          # pin the proxy outbound to an interface
+    tun:                        # M6: optional system-wide capture
+        enabled: false          # off by default
+        stack: mixed            # system | gvisor | mixed
+        mtu: 0                  # 0 => the engine's own default (9000)
+        auto_route: true        # install the routes that pull traffic in
+        strict_route: false     # refuse traffic that would bypass the tunnel
+        interface_name: vender0
+        address: []                     # the device's own address(es)
+        route_exclude_address: []        # CIDRs kept out of the tunnel
+        route_exclude_address_set: []    # rule-set tags kept out of the tunnel
 selected_server: ""             # name of the active entry in servers.yaml
 ```
+
+`engine.tun.auto_route` is a `*bool` so that "absent" means the documented
+default (`true`) while an explicit `auto_route: false` is honoured: a plain
+`bool` cannot tell the two apart once YAML has decoded them, and the difference
+here is whether the host's routing table is touched. `Config.Normalize` fills
+the pointer in, so what is written back to `config.yaml` is always explicit and
+self-documenting.
+
+A **disabled** `engine.tun` block is validated by nobody and rendered by nothing.
+That is deliberate: a typo in a feature that is switched off must not stop vender
+from starting, and it keeps the TUN knob-set additive.
 
 `Config.Normalize` fills zero values with defaults and canonicalises casing, so
 a partial file behaves like a documented one. `Config.Validate` rejects an
@@ -286,6 +316,7 @@ without touching the user's real configuration.
 | `vender daemon` | implemented (M1) — foreground, one per run dir |
 | `vender status` | implemented (M1) — exit code means "usable" |
 | `vender proxy on\|off` | implemented (M1 Linux/GNOME, M4 Windows/WinINET) |
+| `vender tun on\|off\|status` | implemented (M6) — persists `engine.tun.enabled`, restarts the engine through the daemon, `status` prints the privilege verdict and exits non-zero when TUN is off |
 | `vender tui` | implemented (M3) — the TUI; prints a snapshot when not a terminal |
 | `vender autostart on\|off\|status` | implemented (M4) — `status` exits non-zero when disabled, `--json` is machine-readable |
 
@@ -294,7 +325,7 @@ A stub is a real, documented command that exits with
 exit codes stable across milestones, so scripts and the TUI can be written
 against the final command set before the implementations land.
 
-## 6. Engine (`internal/core`) — implemented in M1
+## 6. Engine (`internal/core`) — implemented in M1, TUN inbound in M6
 
 The engine is the only seam between vender and sing-box. M0 shipped the
 interface and the resolved runtime input; M1 implements both.
@@ -351,7 +382,9 @@ possible. It emits up to five top-level sections — `log`, `dns`, `inbounds`,
 `outbounds`, `route` — and nothing else:
 
 - one `mixed` inbound tagged `mixed-in`, with `listen` / `listen_port` split
-  from `proxy.listen`;
+  from `proxy.listen`, and — when TUN mode is on — a `tun` inbound tagged
+  `tun-in` (§6.5), which shares the struct and the `omitempty` tags so the
+  TUN-off output is byte-identical to M1/M2's;
 - the **proxy** outbound (`vless` with `flow` + `tls.utls` + `tls.reality`, or
   `hysteria2` with `password` + `obfs` + `tls`), always tagged `proxy`;
 - a `direct` outbound and a `block` outbound, always present so that rules
@@ -431,7 +464,95 @@ released by the OS when the process dies, the lock can never go stale, which is
 why `vender status` uses the lock — not the pid file — to answer "is a daemon
 running?". The pid file exists only so status can print a pid.
 
-### 6.5 System proxy (`cmd/vender/proxy*.go`)
+### 6.5 TUN mode (M6)
+
+TUN mode is an *inbound*, not a second engine: `BuildConfig` emits a `tun`
+inbound next to the ever-present `mixed` one, and everything downstream — the
+outbound, the built-in policy, the split DNS, the Clash API — is unchanged. A
+user who turns TUN on keeps `127.0.0.1:7897` working, and `vender tun off`
+restores exactly the M1/M2 document, byte for byte (a golden test asserts that:
+TUN off emits nothing TUN-shaped, not even the device name).
+
+```go
+func buildTunInbound(t config.TunConfig) singboxInbound
+func declaredRuleSets(cfg config.Config) []string  // policy sets (rule mode) ∪ TUN exclusions
+func validateTunRuleSets(cfg config.Config) error
+func CheckTUNPrivilege(engineBinary string) TUNPrivilege
+```
+
+Five decisions are worth recording, because each one was forced by something
+concrete:
+
+- **`address`, never `inet4_address`.** The pinned engine refuses the legacy
+  pair by name ("removed in sing-box 1.12.0"). The modern `address` is a list of
+  CIDRs and is left empty by default, so sing-box picks its own private `/30`;
+  that default does not collide with the `198.18.0.0/15` a mihomo/clash TUN uses.
+- **`stack` is always written**, even when it equals the engine's default. The
+  engine accepts `stack: "bogus"` without complaint, so a typo would otherwise
+  be a silent behaviour change; vender validates the value itself and emits it
+  explicitly.
+- **`global` mode gains the two actions, and nothing else, under a TUN.**
+  Without `hijack-dns`, DNS would leave the host as raw packets to port 53 and
+  "everything through the proxy" would be false for the one protocol every
+  connection starts with; without `sniff`, the proxied outbound would only ever
+  see raw IPs. Actions select no outbound, so global stays global — the golden
+  case asserts that it emits exactly those two rules and no destination rules.
+  `direct` mode gets no actions at all: it must not intercept anything.
+- **`route.auto_detect_interface` is emitted when a TUN is up** and
+  `engine.bind_interface` is not set. It binds the engine's own outbound to the
+  interface holding the default route, which is what keeps the connection *to
+  the proxy server* from being routed back into the engine's own tunnel.
+- **Rule-set exclusions are declared, not assumed.** `route_exclude_address_set`
+  names tags that must appear in `route.rule_set` or `sing-box check` refuses the
+  config, so `declaredRuleSets` returns the union of the policy's sets (rule
+  mode) and the TUN exclusions, and `WriteConfig` extracts the `.srs` files
+  whenever that list is non-empty — including in `global` and `direct` mode,
+  which otherwise declare none. `RuntimeConfig.Validate` rejects a tag vender
+  does not embed, with the same "typos fail in tests, not in a user's tunnel"
+  rule the policy itself follows.
+
+**Privileges.** `CheckTUNPrivilege` is the only platform-specific piece of M6,
+behind `privilege_{linux,windows,other}.go`. On Linux it answers "will
+`sing-box run` get CAP_NET_ADMIN?" by checking, in order of cost: euid 0; the
+`CapEff` mask in `/proc/self/status`; and the `security.capability` xattr of the
+engine binary (`setcap ...+ep`), which the kernel grants at exec time. The xattr
+decode is pure and unit-tested against a real value (a copy of ping's), including
+the case that matters — permitted-but-**not**-effective capabilities, which still
+fail `capable(CAP_NET_ADMIN)`.
+
+`engine.Start` consults it *before* spawning, so the failure is one sentence
+naming the three legitimate fixes instead of the engine's own
+`configure tun interface: open tun: TUNSETIFF: operation not permitted`. On
+Windows the check reads `TokenElevation` through `advapi32.dll` with the same
+`syscall.NewLazyDLL` route the lock already takes, so it adds no dependency; it
+is the one part of M6 that cannot be executed off Windows.
+
+**Verifying TUN mode without endangering the host.** A second `auto_route` TUN
+next to a working one hijacks the default route and the two fight, so the
+verification recipe is deliberately narrow:
+
+1. **Config level, always.** Golden files for TUN off/on in all three modes, plus
+   `sing-box check -c <generated>` for each — the only check that can catch a
+   field name the engine does not know. `internal/core/singboxcheck_test.go`
+   does exactly that against a real engine binary and **skips** when none is
+   present, so a clean clone still passes `go test ./...`.
+2. **Live, in a network namespace** (preferred; needs root once):
+   `ip netns add vendertest`, `ip link add … type veth peer …`, an address and
+   an `iptables -t nat -A POSTROUTING -s … -j MASQUERADE` on the host side, then
+   run `sing-box run -c <generated>` *inside* the namespace. Nothing the engine
+   does there can touch the host's routes.
+3. **Live, fallback**, when namespaces are not available: `auto_route: false`,
+   `ip route add <one-test-ip>/32 dev vender0` for a single address, curl that
+   one address, then `ip link del vender0`. The default route is never touched.
+4. **Otherwise, stop.** If neither is possible — no root, unprivileged user
+   namespaces disabled, a TUN already installed by something else — the honest
+   answer is that the *data path* is unverified. What can still be proven is
+   that the generated config is accepted and initialised by the real engine
+   (it reaches the device and fails on `TUNSETIFF: operation not permitted`,
+   which is exactly the privilege boundary), and that vender's own pre-flight
+   check intercepts that case with the actionable message first.
+
+### 6.6 System proxy (`cmd/vender/proxy*.go`)
 
 `proxy on` writes the GNOME proxy schema (`org.gnome.system.proxy.*`) through
 `gsettings`, setting the endpoints before flipping the mode so a failure part
@@ -658,6 +779,7 @@ which the connection belongs to it:
 | `servers` | — | the server list, with the active one flagged |
 | `select` | `{name}` | persists the choice, restarts the engine |
 | `mode` | `{mode}` | persists `rule`/`global`/`direct`, restarts the engine |
+| `tun` | `{enabled}` | persists `engine.tun.enabled`, restarts the engine; **refuses before touching the engine** when this daemon cannot create a TUN device |
 | `latency` | `{name?}` | round trip in ms (through the tunnel for the active server) |
 | `start` / `stop` / `restart` | — | engine lifecycle inside the running daemon |
 | `rules` | — | the active policy: actions, ordered rules, DNS, rule sets |
@@ -698,7 +820,18 @@ Three decisions in it are worth recording:
 Streams reconnect on their own: if the engine restarts, the traffic poller
 backs off and reconnects with no involvement from any client.
 
-## 9. TUI (`internal/tui`) — implemented in M3
+**TUN is refused before the engine is touched.** `Controller.SetTun` runs the
+privilege check *before* it persists anything or restarts anything, because the
+alternative — stop a working proxy, then fail to start the TUN — leaves the user
+with neither. A client that is refused (a `bad_request`, not an internal error)
+can therefore report "nothing was changed; the engine keeps running" and be
+right. Every `status` reply carries the daemon's **own** privilege verdict
+(`tun.privilegesOk` / `tun.privilegeDetail`), so a client does not have to
+guess: the TUI's warning uses the daemon's answer when attached and the local
+machine's when it is not, and `vender tun status` prints both the setting and the
+verdict.
+
+## 9. TUI (`internal/tui`) — implemented in M3, TUN toggle in M6
 
 The TUI is a control-channel client, entered through a single function:
 
@@ -722,7 +855,7 @@ type Options struct {
 | `1` | **Dashboard** | daemon and engine state, selected server, mode, uptime, latency badge, and an animated up/down traffic graph with a load gauge, human-readable rates and session totals |
 | `2` | **Nodes** | table of configured servers (name, type, protocol, endpoint, latency); `enter` selects and lets the daemon restart the engine, `t` measures latency, `r` reloads from disk |
 | `3` | **Logs** | the engine's own output as streamed by the daemon, in a scrolling viewport with follow mode (`f`) and a substring filter (`/`) |
-| `4` | **Settings** | the routing mode (rule/global/direct), the listener and engine paths, the **active built-in routing policy** rendered from `internal/rules`, and the **start-at-login registration** with `a` to toggle it |
+| `4` | **Settings** | the routing mode (rule/global/direct), the inbounds — the mixed listener and the **TUN inbound** with its device, its knobs, the privilege verdict and an explicit warning when it is on but cannot work (`u` toggles it) — the engine paths, the **active built-in routing policy** rendered from `internal/rules`, and the **start-at-login registration** with `a` to toggle it |
 
 Global keys: `tab`/`shift+tab` (next/previous screen), `?` (help overlay), `q`
 (or Ctrl-C) to quit. On the Dashboard: `t` latency, `s`/`x`/`R` start/stop/
@@ -773,7 +906,7 @@ dependency at all — it is `net`, `encoding/json`, `crypto/rand` and
 `crypto/subtle`. Everything stays cross-compilable to `windows/amd64` with no
 build tags in either package.
 
-## 10. Autostart (`internal/autostart`) — implemented in M4
+## 10. Autostart (`internal/autostart`) — implemented in M4, TUN mechanism in M6
 
 ```go
 func Enable() error              // idempotent
@@ -840,7 +973,7 @@ pipe). Furthermore, Task Scheduler's `Hidden` setting hides the task from the
 library view and suppresses the default window in the common case, but it does
 not guarantee that a **console-subsystem** executable shows no console at all; a
 fully windowless start needs a GUI-subsystem build or a `conhost --headless`
-launcher. That is deliberately left to M6 (signed Windows binaries) rather than
+launcher. That is deliberately left to M7 (signed Windows binaries) rather than
 half-done here. The daemon itself works with or without a console.
 
 The XML/argument construction and the output parsing are in `windows.go`, which
@@ -848,7 +981,41 @@ The XML/argument construction and the output parsing are in `windows.go`, which
 those tests run on Linux too; `autostart_windows.go` is a three-line wrapper over
 the real `schtasks`/`reg`.
 
-### 10.3 What the CLI and the TUI do
+### 10.3 The TUN mechanism (M6)
+
+The default registrations are per-user, and a per-user mechanism cannot be given
+a kernel privilege: a systemd *user* manager is unprivileged (it has nothing to
+hand out), and a Run key value cannot run a process elevated. With
+`engine.tun.enabled: true`, `EnableWithOptions(Options{TUN: true})` therefore
+switches mechanisms:
+
+| Platform | With TUN on | Cost |
+|---|---|---|
+| Linux | `/etc/systemd/system/vender.service`: `User=<invoking user>`, `Environment=HOME=<their home>`, `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW`, `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW`, `WantedBy=multi-user.target` | one `sudo vender autostart on`. The combination `User=` + `AmbientCapabilities=` is the one that works: systemd sets the ambient set as root and ambient capabilities survive the setuid to the target user. The daemon runs as the user, not as root, and the bounding set keeps every other capability out of reach |
+| Windows | the same logon task, `RunLevel=HighestAvailable` | one `vender autostart on` from an elevated prompt |
+
+Three decisions in it:
+
+- **The privileged path never silently degrades.** If the system unit cannot be
+  installed, `on` still makes the per-user registration (the daemon *does* start
+  at login), then returns an error naming what TUN still needs. Installing a
+  user unit and reporting success would be a lie the user only discovers weeks
+  later, at the next login.
+- **The attribute is the truth, not the mechanism.** `Status` reports which
+  mechanism is registered *and* whether that mechanism can create a TUN, quoting
+  the caller's verdict (which comes from `core.CheckTUNPrivilege`, so it also
+  recognises a `setcap`-granted engine binary). On Windows it reads
+  `<RunLevel>` back out of the queried task definition rather than assuming.
+- **`Options`, not a dependency.** autostart does not import `internal/config`:
+  the caller reads `config.yaml`, asks `core` for the privilege verdict, and
+  passes two fields. The package stays standalone — it reads `$HOME`, runs
+  `systemctl`/`loginctl`/`schtasks`/`reg` and nothing else — which is what keeps
+  its tests drivable with an isolated `HOME` and a stub runner.
+
+`Enable()`/`Disable()`/`Status()` keep their signatures and mean
+`...WithOptions(Options{})`, so the M4 API and its tests are unchanged.
+
+### 10.4 What the CLI and the TUI do
 
 `vender autostart on|off|status` is a thin shell over the three entry points;
 `status` exits non-zero when nothing is registered (the same contract as
@@ -904,8 +1071,9 @@ needs no root and writes nothing outside the prefix.
 | **M2** | `internal/rules` built-in policy, actions, split DNS and embedded rule sets, wired into the generated config; `vender rules list` | `proxy.mode: rule` sends CN/private destinations direct, blocks ads, proxies a documented override list and everything else, with matching split DNS; `sing-box check` passes for both server types and a live run shows direct vs proxied vs blocked; `global` and `direct` behave as documented |
 | **M3** | `internal/control` + `internal/tui`: the daemon control channel and the Bubble Tea client | TUI attaches to a running daemon, switches the active server and mode, tails engine logs, shows live traffic from the engine's own counters, quits cleanly and restores the terminal; behaves with no daemon; the channel rejects an unauthenticated client, and a bad host leaves no side effects |
 | **M4** | `internal/autostart` (systemd user unit / XDG entry, Task Scheduler task / Run key), Windows system proxy, release packaging and the installer | `autostart on` starts the daemon after login on both platforms; `off` removes it; `status` reports it; all idempotent. `vender proxy on\|off` works on Windows. Both release archives build and contain the engine plus the licence documents |
-| **M5** | Subscription URLs and bulk import, server latency testing | Importing a subscription adds all of its servers; a latency command reports a reachability ranking |
-| **M6** | Hardening and release | Health-based failover across servers, log rotation, reproducible cross-builds, signed Windows binaries, a windowless Windows start, user documentation |
+| **M5** | Subscription URLs and bulk import, server latency testing | Importing a subscription adds all of its servers; a latency command reports a reachability ranking. *(Not implemented in this line.)* |
+| **M6** | **Optional TUN mode**: a `tun` inbound in the engine, `vender tun on\|off\|status`, a TUI toggle that reports the privilege verdict, and a TUN-aware autostart mechanism on both platforms | Config-level: golden files for TUN on/off in rule/global/direct plus `sing-box check` for each. Live: a TUN test in a network namespace where one is available, otherwise a documented statement of what could not be run. `vender tun on` against a running daemon either applies (persist + restart with the TUN inbound) or is refused before the engine is touched, with an actionable message. Autostart reflects the TUN-correct mechanism and `status` says whether it can work |
+| M7 | Hardening and release | Health-based failover across servers, log rotation, reproducible cross-builds, signed Windows binaries, a windowless Windows start |
 
 ## 13. Engineering conventions
 
@@ -924,6 +1092,16 @@ needs no root and writes nothing outside the prefix.
   `cmd/vender/proxy_{linux,windows}.go`,
   `internal/autostart/autostart_{linux,windows,other}.go` — and never sprinkled
   through the CLI.
+- **A privilege is a documented input, not an accident.** TUN mode is the only
+  thing vender does that needs a capability, so it is the only thing that checks
+  for one, and the check is a value (`core.TUNPrivilege`) rather than a bool: it
+  carries the detail and the fix, so the engine's error, `vender tun status` and
+  `vender autostart status` all say the same true thing. The TUN *rendering* is
+  covered by golden files; the TUN *capability* logic by unit tests against a
+  real `/proc/self/status` mask and a real capability xattr; the engine's
+  acceptance by `sing-box check` for all three modes with TUN on and off, in a
+  test that skips when no engine binary is present (so a clean clone still
+  passes `go test ./...`).
 - **A Windows path is not "untestable".** Build tags are used only where the
   real API is needed. Everything a Windows path *decides* — the task XML, the
   `schtasks`/`reg` argument vectors, UTF-16 encoding, the parsing of their

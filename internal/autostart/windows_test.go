@@ -127,7 +127,7 @@ func TestWindowsStatusReportsARegisteredTask(t *testing.T) {
 	// schtasks writes UTF-16LE to a pipe; the fake reproduces that so the
 	// parser is exercised against the real shape.
 	f.answers["schtasks /Query /TN "+winTaskName+" /XML"] =
-		utf16leString(taskXML(b.exe))
+		utf16leString(taskXML(b.exe, false))
 
 	st, err := b.status()
 	if err != nil {
@@ -190,7 +190,7 @@ func TestWindowsDisableReportsARealFailure(t *testing.T) {
 }
 
 func TestTaskXMLShape(t *testing.T) {
-	xml := taskXML(`C:\Program Files\vender\vender.exe`)
+	xml := taskXML(`C:\Program Files\vender\vender.exe`, false)
 	for _, want := range []string{
 		`encoding="UTF-16"`,
 		`<URI>\vender\daemon</URI>`,
@@ -207,7 +207,7 @@ func TestTaskXMLShape(t *testing.T) {
 		}
 	}
 	// XML metacharacters in the path must be escaped, not injected.
-	if strings.Contains(taskXML(`C:\a&b<c>"d.exe`), `&b<c>`) {
+	if strings.Contains(taskXML(`C:\a&b<c>"d.exe`, false), `&b<c>`) {
 		t.Error("the executable path is not XML-escaped")
 	}
 }
@@ -271,4 +271,123 @@ func TestWinNotFoundMarkers(t *testing.T) {
 // utf16leString renders s as the UTF-16LE text schtasks would print.
 func utf16leString(s string) string {
 	return string(utf16leBytes(s))
+}
+
+// --- TUN mode: the elevated logon task --------------------------------------
+
+// With TUN enabled the task must run with the highest available privileges:
+// a WinTun adapter is a driver-level device, and a LeastPrivilege task cannot
+// create one.
+func TestEnableWithTunCreatesAnElevatedTask(t *testing.T) {
+	f := newWinFake()
+	b := winBackend(f, "schtasks", "reg")
+	st, err := b.enableWith(Options{TUN: true})
+	if err != nil {
+		t.Fatalf("enableWith: %v", err)
+	}
+	if !st.Enabled || st.Mechanism != MechanismWindowsTask {
+		t.Errorf("state = %+v", st)
+	}
+	if !strings.Contains(st.Detail, "highest available privileges") {
+		t.Errorf("detail = %q", st.Detail)
+	}
+	if !strings.Contains(taskXML(b.exe, true), "<RunLevel>HighestAvailable</RunLevel>") {
+		t.Error("the staged task XML does not ask for the highest run level")
+	}
+}
+
+// The per-user Run key cannot elevate, so a TUN registration must not fall back
+// to it: installing something that cannot work is worse than an error.
+func TestEnableWithTunDoesNotFallBackToTheRunKey(t *testing.T) {
+	f := newWinFake()
+	b := winBackend(f, "schtasks", "reg")
+	f.fail["schtasks /Create /TN "+winTaskName+" /XML  /F"] = true
+	f.answers["schtasks /Create /TN "+winTaskName+" /XML  /F"] = "ERROR: Access is denied."
+
+	_, err := b.enableWith(Options{TUN: true, CapabilityHint: "this process is not elevated"})
+	if err == nil {
+		t.Fatal("enableWith reported success although the task could not be created")
+	}
+	if !strings.Contains(err.Error(), "elevated") {
+		t.Errorf("error does not say elevation is needed: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not elevated") {
+		t.Errorf("error does not quote the privilege verdict: %v", err)
+	}
+	if f.ran("reg add ") {
+		t.Errorf("the Run key was written for a TUN registration (calls: %v)", f.calls)
+	}
+}
+
+// Without TUN the least-privilege task and the Run key fallback are unchanged.
+func TestEnableWithoutTunKeepsLeastPrivilege(t *testing.T) {
+	f := newWinFake()
+	b := winBackend(f, "schtasks", "reg")
+	st, err := b.enableWith(Options{})
+	if err != nil {
+		t.Fatalf("enableWith: %v", err)
+	}
+	if st.Mechanism != MechanismWindowsTask {
+		t.Errorf("mechanism = %q", st.Mechanism)
+	}
+	if !strings.Contains(taskXML(b.exe, false), "<RunLevel>LeastPrivilege</RunLevel>") {
+		t.Error("the default task is not least-privilege")
+	}
+}
+
+// status must say when the registered task cannot deliver what TUN needs.
+func TestWindowsStatusWithTun(t *testing.T) {
+	t.Run("elevated task", func(t *testing.T) {
+		f := newWinFake()
+		b := winBackend(f, "schtasks", "reg")
+		f.answers["schtasks /Query /TN "+winTaskName+" /XML"] = utf16leString(taskXML(b.exe, true))
+		st, err := b.statusWith(Options{TUN: true})
+		if err != nil {
+			t.Fatalf("statusWith: %v", err)
+		}
+		if !strings.Contains(st.Detail, "which is what TUN mode needs") {
+			t.Errorf("detail = %q", st.Detail)
+		}
+	})
+
+	t.Run("least-privilege task while TUN is on", func(t *testing.T) {
+		f := newWinFake()
+		b := winBackend(f, "schtasks", "reg")
+		f.answers["schtasks /Query /TN "+winTaskName+" /XML"] = utf16leString(taskXML(b.exe, false))
+		st, err := b.statusWith(Options{TUN: true})
+		if err != nil {
+			t.Fatalf("statusWith: %v", err)
+		}
+		for _, want := range []string{"cannot create a WinTun adapter", "vender autostart on"} {
+			if !strings.Contains(st.Detail, want) {
+				t.Errorf("detail %q is missing %q", st.Detail, want)
+			}
+		}
+	})
+
+	t.Run("run key while TUN is on", func(t *testing.T) {
+		f := newWinFake()
+		b := winBackend(f, "reg")
+		f.answers["reg query "+winRunKeyPath+" /v "+winRunValueName] =
+			winRunKeyPath + "\r\n    " + winRunValueName + "    REG_SZ    \"C:\\vender\\vender.exe\" daemon\r\n"
+		st, err := b.statusWith(Options{TUN: true})
+		if err != nil {
+			t.Fatalf("statusWith: %v", err)
+		}
+		if !strings.Contains(st.Detail, "cannot run elevated") {
+			t.Errorf("detail = %q", st.Detail)
+		}
+	})
+
+	t.Run("nothing registered", func(t *testing.T) {
+		f := newWinFake()
+		b := winBackend(f, "schtasks", "reg")
+		st, err := b.statusWith(Options{TUN: true})
+		if err != nil {
+			t.Fatalf("statusWith: %v", err)
+		}
+		if st.Enabled || !strings.Contains(st.Detail, "highest available") {
+			t.Errorf("state = %+v", st)
+		}
+	})
 }

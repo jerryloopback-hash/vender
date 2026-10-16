@@ -80,20 +80,34 @@ func writeTaskXMLTemp(content string) (string, error) {
 
 // --- enable -----------------------------------------------------------------
 
-func (b windowsBackend) enable() (State, error) {
+func (b windowsBackend) enable() (State, error) { return b.enableWith(Options{}) }
+
+// enableWith registers the logon task. With TUN mode the task must run elevated
+// (a WinTun adapter is a driver-level device), which is a *different* task
+// definition — HighestAvailable instead of LeastPrivilege — and which the
+// per-user Run key cannot express at all. So for TUN the task is the only
+// acceptable mechanism: falling back to the Run key would install something
+// that starts a daemon that cannot create the TUN.
+func (b windowsBackend) enableWith(o Options) (State, error) {
 	if b.exe == "" {
 		return State{}, errors.New("autostart: cannot determine the vender executable path (os.Executable failed)")
 	}
 
 	var taskErr error
 	if _, err := b.lookPath("schtasks"); err == nil {
-		st, err := b.enableTask()
+		st, err := b.enableTask(o.TUN)
 		if err == nil {
 			return st, nil
 		}
 		taskErr = err
 	} else {
 		taskErr = errors.New("schtasks is not available")
+	}
+
+	if o.TUN {
+		return State{}, fmt.Errorf("autostart: TUN mode needs a logon task registered with the highest privileges, "+
+			"and the task could not be created (%v); the per-user Run key cannot elevate, so it is not installed. "+
+			"Run `vender autostart on` once from an elevated (Administrator) prompt%s", taskErr, b.capabilityNoteSuffix(o))
 	}
 
 	st, err := b.enableRunKey()
@@ -104,11 +118,20 @@ func (b windowsBackend) enable() (State, error) {
 	return st, nil
 }
 
-func (b windowsBackend) enableTask() (State, error) {
+// capabilityNoteSuffix quotes the caller's privilege verdict, so the error says
+// both what failed and what is still missing.
+func (b windowsBackend) capabilityNoteSuffix(o Options) string {
+	if o.CapabilityHint == "" {
+		return ""
+	}
+	return "; the current verdict: " + o.CapabilityHint
+}
+
+func (b windowsBackend) enableTask(elevated bool) (State, error) {
 	if b.writeTemp == nil {
 		return State{}, errors.New("autostart: no way to stage the task XML")
 	}
-	xmlPath, err := b.writeTemp(taskXML(b.exe))
+	xmlPath, err := b.writeTemp(taskXML(b.exe, elevated))
 	if err != nil {
 		return State{}, err
 	}
@@ -118,12 +141,18 @@ func (b windowsBackend) enableTask() (State, error) {
 	if err != nil {
 		return State{}, fmt.Errorf("schtasks /Create /TN %s: %w%s", winTaskName, err, winOutputSuffix(out))
 	}
+	detail := "Task Scheduler logon task created (least privilege, hidden); " +
+		"runs `vender daemon` at logon. A short console window can still appear because vender is a console-subsystem binary"
+	if elevated {
+		detail = "Task Scheduler logon task created with the highest available privileges (hidden) because TUN mode is on; " +
+			"the daemon can create the WinTun adapter at logon without another prompt. " +
+			"A short console window can still appear because vender is a console-subsystem binary"
+	}
 	return State{
 		Enabled:   true,
 		Mechanism: MechanismWindowsTask,
 		Target:    winTaskName,
-		Detail: "Task Scheduler logon task created (least privilege, hidden); " +
-			"runs `vender daemon` at logon. A short console window can still appear because vender is a console-subsystem binary",
+		Detail:    detail,
 	}, nil
 }
 
@@ -172,15 +201,26 @@ func (b windowsBackend) disable() error {
 
 // --- status -----------------------------------------------------------------
 
-func (b windowsBackend) status() (State, error) {
+func (b windowsBackend) status() (State, error) { return b.statusWith(Options{}) }
+
+func (b windowsBackend) statusWith(o Options) (State, error) {
 	if _, err := b.lookPath("schtasks"); err == nil {
 		if out, err := b.run("schtasks", "/Query", "/TN", winTaskName, "/XML"); err == nil {
 			if looksLikeTaskXML(out) {
+				detail := "Task Scheduler logon task " + winTaskName + " is registered" + describeTaskCommand(out)
+				if o.TUN {
+					if taskIsElevated(out) {
+						detail += "; it runs with the highest available privileges, which is what TUN mode needs"
+					} else {
+						detail += "; TUN is enabled but this task runs with the least privilege, which cannot create a WinTun adapter — " +
+							"re-register it from an elevated prompt: `vender autostart on`"
+					}
+				}
 				return State{
 					Enabled:   true,
 					Mechanism: MechanismWindowsTask,
 					Target:    winTaskName,
-					Detail:    "Task Scheduler logon task " + winTaskName + " is registered" + describeTaskCommand(out),
+					Detail:    detail,
 				}, nil
 			}
 		}
@@ -188,22 +228,32 @@ func (b windowsBackend) status() (State, error) {
 
 	if _, err := b.lookPath("reg"); err == nil {
 		if value, ok := b.runKeyValue(); ok {
+			detail := "per-user Registry Run key = " + value
+			if o.TUN {
+				detail += "; TUN is enabled but a Run key value cannot run elevated, so the TUN adapter cannot be created — " +
+					"remove it and run `vender autostart on` from an elevated prompt to register the logon task instead"
+			}
 			return State{
 				Enabled:   true,
 				Mechanism: MechanismWindowsRunKey,
 				Target:    `HKCU\` + winRunKeyPath + `\` + winRunValueName,
-				Detail:    "per-user Registry Run key = " + value,
+				Detail:    detail,
 			}, nil
 		}
 	}
 
 	// Nothing installed: say what `on` would do.
 	if _, err := b.lookPath("schtasks"); err == nil {
+		detail := "not registered; `vender autostart on` would create a Task Scheduler logon task (falling back to the per-user Run key if that is refused)"
+		if o.TUN {
+			detail = "not registered; with TUN enabled `vender autostart on` creates the logon task with the highest available " +
+				"privileges, which needs to be run once from an elevated prompt"
+		}
 		return State{
 			Enabled:   false,
 			Mechanism: MechanismWindowsTask,
 			Target:    winTaskName,
-			Detail:    "not registered; `vender autostart on` would create a Task Scheduler logon task (falling back to the per-user Run key if that is refused)",
+			Detail:    detail,
 		}, nil
 	}
 	return State{
@@ -212,6 +262,12 @@ func (b windowsBackend) status() (State, error) {
 		Target:    `HKCU\` + winRunKeyPath + `\` + winRunValueName,
 		Detail:    "not registered; `vender autostart on` would set the per-user Registry Run key",
 	}, nil
+}
+
+// taskIsElevated reports whether a queried task definition runs with the
+// highest available privileges.
+func taskIsElevated(out string) bool {
+	return strings.Contains(normalizeWinOutput(out), "<RunLevel>HighestAvailable</RunLevel>")
 }
 
 func (b windowsBackend) runKeyValue() (string, bool) {
@@ -232,16 +288,22 @@ func runKeyValue(exe string) string {
 }
 
 // taskXML is the Task Scheduler definition registered with `schtasks /Create
-// /XML`. It is a logon trigger that runs in the interactive user's session, at
-// the least privilege, as a hidden task.
+// /XML`. It is a logon trigger that runs in the interactive user's session, as
+// a hidden task, at the least privilege by default and with the highest
+// available privileges when TUN mode needs them (which also means the
+// registration itself has to come from an elevated prompt).
 //
 // Note on the console window: `<Hidden>true</Hidden>` removes the task from the
 // Task Scheduler library view and suppresses the default window in the common
 // case, but a console-subsystem executable can still flash a console. The
 // guaranteed windowless variant is a GUI-subsystem build or a `conhost
-// --headless` launcher, both deferred to M6; the daemon itself needs no
+// --headless` launcher, both deferred to M7; the daemon itself needs no
 // console to work.
-func taskXML(exe string) string {
+func taskXML(exe string, elevated bool) string {
+	runLevel := "LeastPrivilege"
+	if elevated {
+		runLevel = "HighestAvailable"
+	}
 	return `<?xml version="1.0" encoding="UTF-16"?>` + "\n" +
 		`<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">` + "\n" +
 		`  <RegistrationInfo>` + "\n" +
@@ -256,7 +318,7 @@ func taskXML(exe string) string {
 		`  <Principals>` + "\n" +
 		`    <Principal id="Author">` + "\n" +
 		`      <LogonType>InteractiveToken</LogonType>` + "\n" +
-		`      <RunLevel>LeastPrivilege</RunLevel>` + "\n" +
+		`      <RunLevel>` + runLevel + `</RunLevel>` + "\n" +
 		`    </Principal>` + "\n" +
 		`  </Principals>` + "\n" +
 		`  <Settings>` + "\n" +

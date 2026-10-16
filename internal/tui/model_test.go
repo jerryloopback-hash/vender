@@ -14,6 +14,7 @@ import (
 	"github.com/ll-lite/vender/internal/autostart"
 	"github.com/ll-lite/vender/internal/config"
 	"github.com/ll-lite/vender/internal/control"
+	"github.com/ll-lite/vender/internal/core"
 )
 
 var update = flag.Bool("update", false, "rewrite the golden view files in testdata/")
@@ -73,6 +74,13 @@ func fixtureSnapshot(servers []config.Server) configSnapshot {
 		Binary:      "/usr/local/bin/sing-box",
 		Selected:    "Interserver-LA",
 		Servers:     servers,
+		Tun:         config.DefaultTun(),
+		// What a normal (unprivileged) user sees: the verdict is part of the
+		// state the Settings screen has to show, not an afterthought.
+		TunPriv: core.TUNPrivilege{
+			OK:     false,
+			Detail: "uid 1000 does not hold CAP_NET_ADMIN (CapEff 0000000000000000)",
+		},
 	}
 }
 
@@ -88,6 +96,12 @@ func runningModel(t *testing.T) Model {
 		EngineRunning: true, EnginePid: 4829, EngineHealthy: true,
 		EngineVersion: "sing-box 1.14.3", UptimeSecs: 192,
 		ClashListen: "127.0.0.1:41234", ServerCount: 2,
+		Tun: control.TunStatus{
+			Enabled: false, Active: false, Stack: "mixed", Interface: "vender0",
+			AutoRoute: true, StrictRoute: false,
+			PrivilegesOK:    false,
+			PrivilegeDetail: "uid 1000 does not hold CAP_NET_ADMIN (CapEff 0000000000000000)",
+		},
 	}
 	m.snap = fixtureSnapshot(fixtureServers())
 	m.selected = "Interserver-LA"
@@ -180,6 +194,7 @@ func TestViewSettings(t *testing.T) {
 	assertGolden(t, "settings.golden", m.View(), []string{
 		"routing mode", "rule", "global", "direct",
 		"127.0.0.1:7897",
+		"inbounds", "tun", "tun settings", "privileges",
 		"built-in routing policy",
 		"private-dest-direct", "ads-block", "cn-direct",
 		"final", "dns", "embedded,",
@@ -643,5 +658,133 @@ func assertGolden(t *testing.T, name, got string, wants []string) {
 	}
 	if got != string(want) {
 		t.Errorf("view differs from %s\n--- got ---\n%s\n--- want ---\n%s", path, got, want)
+	}
+}
+
+// --- M6: TUN mode in the Settings screen ------------------------------------
+
+// A TUN that is switched on but cannot work must say so, in the panel and with
+// a warning line: otherwise the only feedback is an engine that refuses to
+// start, hours later, at login.
+func TestSettingsWarnsWhenTunCannotWork(t *testing.T) {
+	m := runningModel(t)
+	m.status.Tun = control.TunStatus{
+		Enabled: true, Active: false, Stack: "mixed", Interface: "vender0", AutoRoute: true,
+		PrivilegesOK:    false,
+		PrivilegeDetail: "uid 1000 does not hold CAP_NET_ADMIN (CapEff 0000000000000000)",
+	}
+	m = m.switchScreen(screenSettings)
+	view := m.View()
+	for _, want := range []string{"on, but blocked", "missing", "CAP_NET_ADMIN", "press u to disable"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("settings does not show %q:\n%s", want, view)
+		}
+	}
+	if !strings.Contains(view, "tun settings") || !strings.Contains(view, "vender0") {
+		t.Errorf("settings does not show the TUN knobs:\n%s", view)
+	}
+}
+
+// With the privilege present the panel shows a plain "on" and no warning.
+func TestSettingsShowsTunOnWhenItCanWork(t *testing.T) {
+	m := runningModel(t)
+	m.status.Tun = control.TunStatus{
+		Enabled: true, Active: true, Stack: "gvisor", Interface: "vender0",
+		AutoRoute: true, StrictRoute: true, MTU: 1500,
+		PrivilegesOK: true, PrivilegeDetail: "running as root (uid 0)",
+	}
+	m = m.switchScreen(screenSettings)
+	view := m.View()
+	for _, want := range []string{"gvisor", "mtu 1500", "strict_route on", "running as root"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("settings does not show %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "warning") {
+		t.Errorf("a working TUN still produced a warning:\n%s", view)
+	}
+}
+
+// `u` is daemon state: with no daemon there is nothing to toggle, and the TUI
+// must say so instead of pretending to write the file.
+func TestSettingsTunToggleNeedsADaemon(t *testing.T) {
+	m := detachedModel(t)
+	m = m.switchScreen(screenSettings)
+
+	next, cmd := m.handleSettingsKey("u")
+	m = next.(Model)
+	if cmd != nil {
+		t.Error("a TUN toggle without a daemon issued a command")
+	}
+	if !strings.Contains(m.toast, "vender daemon") {
+		t.Errorf("toast = %q", m.toast)
+	}
+}
+
+// With a daemon attached, `u` issues one command and marks the screen busy.
+func TestSettingsTunToggleIsACommand(t *testing.T) {
+	m := runningModel(t)
+	m = m.switchScreen(screenSettings)
+
+	next, cmd := m.handleSettingsKey("u")
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("u did not issue a TUN command")
+	}
+	if !strings.Contains(m.busy, "tun") {
+		t.Errorf("busy = %q", m.busy)
+	}
+
+	// With TUN already on, the same key asks for it to be turned off.
+	m.status.Tun.Enabled = true
+	next, cmd = m.handleSettingsKey("u")
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("u did not issue a TUN command when TUN was on")
+	}
+	if !strings.Contains(m.busy, "disabling") {
+		t.Errorf("busy = %q", m.busy)
+	}
+}
+
+// A daemon status carrying TUN state updates the panel; this is the path that
+// a `vender tun on` in another terminal reaches the TUI through.
+func TestStatusUpdateRefreshesTheTunPanel(t *testing.T) {
+	m := runningModel(t)
+	m = m.switchScreen(screenSettings)
+	if strings.Contains(m.View(), "press u to disable") {
+		t.Fatal("the fixture already had TUN on")
+	}
+	next, _ := m.Update(statusMsg{st: control.StatusData{
+		Mode: "rule", Listen: "127.0.0.1:7897",
+		Tun: control.TunStatus{Enabled: true, Active: true, Stack: "mixed", Interface: "vender0", AutoRoute: true,
+			PrivilegesOK: true, PrivilegeDetail: "running as root (uid 0)"},
+	}})
+	m = next.(Model)
+	if !strings.Contains(m.View(), "press u to disable") {
+		t.Errorf("the panel did not pick the new state up:\n%s", m.View())
+	}
+}
+
+// The non-terminal fallback (the `vender tui | cat` path) reports the TUN state
+// too, and says so plainly when it cannot work.
+func TestPlainSnapshotReportsTun(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Engine.Tun.Enabled = true
+	cfg.Engine.BindInterface = ""
+	if err := config.NewStoreAt(dir).SaveConfig(cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	var buf strings.Builder
+	if err := runPlain(context.Background(), Options{ConfigDir: dir, RunDir: filepath.Join(dir, "run")}, &buf); err != nil {
+		t.Fatalf("runPlain: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "tun          on") {
+		t.Errorf("the plain snapshot does not report TUN:\n%s", out)
+	}
+	if !strings.Contains(out, "stack mixed") {
+		t.Errorf("the plain snapshot does not report the stack:\n%s", out)
 	}
 }

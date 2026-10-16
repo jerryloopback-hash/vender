@@ -146,6 +146,20 @@ func (a *app) runDaemon(cmd *cobra.Command) error {
 	fmt.Fprintf(out, "  engine       %s\n", binaryPath)
 	fmt.Fprintf(out, "  listen       %s\n", cfg.Proxy.Listen)
 	fmt.Fprintf(out, "  mode         %s\n", cfg.Proxy.Mode)
+	if cfg.Engine.Tun.Enabled {
+		tun := cfg.Engine.Tun
+		auto := "off"
+		if tun.AutoRouteEnabled() {
+			auto = "on"
+		}
+		fmt.Fprintf(out, "  tun          %s (stack %s, mtu %s, auto_route %s, strict_route %s)\n",
+			tun.InterfaceName, tun.Stack, mtuDesc(tun.MTU), auto, boolDesc(tun.StrictRoute))
+		if p := core.CheckTUNPrivilege(binaryPath); !p.OK {
+			fmt.Fprintf(out, "  tun warning  %s\n", p.Detail)
+		}
+	} else {
+		fmt.Fprintf(out, "  tun          off (enable with `vender tun on`)\n")
+	}
 	if srv != nil {
 		fmt.Fprintf(out, "  server       %s\n", srv.String())
 	} else {
@@ -259,4 +273,20 @@ func daemonRunning(runDir string) (bool, int, error) {
 		return true, core.ReadPid(runDir), nil
 	}
 	return false, 0, err
+}
+
+// mtuDesc renders the TUN MTU the way the CLI does elsewhere: 0 means the
+// engine picks.
+func mtuDesc(mtu int) string {
+	if mtu == 0 {
+		return "auto"
+	}
+	return fmt.Sprintf("%d", mtu)
+}
+
+func boolDesc(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
 }

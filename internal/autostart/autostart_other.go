@@ -16,8 +16,17 @@ var errUnsupported = fmt.Errorf("autostart: no start-at-login mechanism for %s/%
 // Enable registers vender to start the daemon at login. It is idempotent.
 func Enable() error { return errUnsupported }
 
+// EnableWithOptions is Enable; the Options a TUN registration needs do not
+// change the answer on a platform with no mechanism at all.
+func EnableWithOptions(Options) error { return errUnsupported }
+
 // Disable removes the autostart registration. It is idempotent.
 func Disable() error { return errUnsupported }
 
 // Status reports the current autostart registration.
 func Status() (State, error) { return State{Mechanism: MechanismUnknown}, errUnsupported }
+
+// StatusWithOptions is Status.
+func StatusWithOptions(Options) (State, error) {
+	return State{Mechanism: MechanismUnknown}, errUnsupported
+}

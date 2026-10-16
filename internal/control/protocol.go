@@ -67,6 +67,7 @@ const (
 	CmdServers = "servers"
 	CmdSelect  = "select"
 	CmdMode    = "mode"
+	CmdTun     = "tun"
 	CmdLatency = "latency"
 	CmdStart   = "start"
 	CmdStop    = "stop"
@@ -157,6 +158,33 @@ type StatusData struct {
 
 	ClashListen string `json:"clashListen,omitempty"`
 	ServerCount int    `json:"serverCount"`
+
+	// Tun is the TUN inbound's state (M6). It travels in every status reply so
+	// a client never has to guess whether system-wide capture is on, and so
+	// the TUI can show the *daemon's* privilege verdict rather than its own.
+	Tun TunStatus `json:"tun"`
+}
+
+// TunStatus describes the optional TUN inbound.
+type TunStatus struct {
+	// Enabled is the configuration setting (config.yaml engine.tun.enabled).
+	Enabled bool `json:"enabled"`
+	// Active reports whether the engine that is running now was rendered with a
+	// TUN inbound. It differs from Enabled while the engine is stopped or after
+	// an enable that could not be applied.
+	Active bool `json:"active"`
+	// Stack, Interface, MTU, AutoRoute and StrictRoute are the settings in
+	// effect, for display.
+	Stack       string `json:"stack,omitempty"`
+	Interface   string `json:"interface,omitempty"`
+	MTU         int    `json:"mtu,omitempty"`
+	AutoRoute   bool   `json:"autoRoute"`
+	StrictRoute bool   `json:"strictRoute"`
+	// PrivilegesOK reports whether this daemon can create a TUN device, and
+	// PrivilegeDetail explains the verdict. They are answered in-process, which
+	// is what makes them trustworthy: a client's own privileges may differ.
+	PrivilegesOK    bool   `json:"privilegesOk"`
+	PrivilegeDetail string `json:"privilegeDetail,omitempty"`
 }
 
 // ServerInfo is one row of the server list, as the daemon sees it.
@@ -182,6 +210,11 @@ type SelectArgs struct {
 // ModeArgs is the argument of CmdMode.
 type ModeArgs struct {
 	Mode string `json:"mode"`
+}
+
+// TunArgs is the argument of CmdTun.
+type TunArgs struct {
+	Enabled bool `json:"enabled"`
 }
 
 // LatencyArgs is the argument of CmdLatency. An empty Name means the active

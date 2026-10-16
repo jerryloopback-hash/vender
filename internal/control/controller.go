@@ -219,6 +219,42 @@ func (c *Controller) SelectServer(name string) error {
 	return c.applyLocked()
 }
 
+// SetTun turns the TUN inbound on or off, persists the choice to config.yaml,
+// and restarts the engine if it is running. Toggling TUN is a bigger change
+// than a mode switch — the engine's whole inbound set changes — so it goes
+// through the same render-and-restart path and reports the engine's own error
+// (a missing CAP_NET_ADMIN, say) to the caller.
+func (c *Controller) SetTun(enabled bool) error {
+	c.ops.Lock()
+	defer c.ops.Unlock()
+
+	cfg, err := c.store.LoadConfig()
+	if err != nil {
+		return Errorf(KindInternal, "control: %v", err)
+	}
+	if cfg.Engine.Tun.Enabled == enabled {
+		// Nothing to change; still answer, but do not blink the engine.
+		return nil
+	}
+	cfg.Engine.Tun.Enabled = enabled
+	if err := cfg.Validate(); err != nil {
+		return Errorf(KindBadRequest, "control: %v", err)
+	}
+	if enabled {
+		// Refuse before touching the engine when this daemon cannot do it: the
+		// alternative is a restart that stops a working proxy and then fails,
+		// leaving the user without either.
+		if perr := core.CheckTUNPrivilege(c.binary).Err(); perr != nil {
+			return Errorf(KindBadRequest, "%v", perr)
+		}
+	}
+	if err := c.store.SaveConfig(cfg); err != nil {
+		return Errorf(KindInternal, "control: %v", err)
+	}
+	c.note(fmt.Sprintf("tun %s", onOff(enabled)))
+	return c.applyLocked()
+}
+
 // SetMode changes the routing mode, persists it, and restarts the engine if it
 // is running.
 func (c *Controller) SetMode(mode string) error {
@@ -651,6 +687,19 @@ func (c *Controller) Status() StatusData {
 	engVersion := c.engVersion
 	c.mu.RUnlock()
 
+	priv := core.CheckTUNPrivilege(c.binary)
+	tun := TunStatus{
+		Enabled:         cfg.Engine.Tun.Enabled,
+		Active:          running && cfg.Engine.Tun.Enabled,
+		Stack:           cfg.Engine.Tun.Stack,
+		Interface:       cfg.Engine.Tun.InterfaceName,
+		MTU:             cfg.Engine.Tun.MTU,
+		AutoRoute:       cfg.Engine.Tun.AutoRouteEnabled(),
+		StrictRoute:     cfg.Engine.Tun.StrictRoute,
+		PrivilegesOK:    priv.OK,
+		PrivilegeDetail: priv.Detail,
+	}
+
 	st := StatusData{
 		Vender:        c.version,
 		PID:           os.Getpid(),
@@ -664,6 +713,7 @@ func (c *Controller) Status() StatusData {
 		Restarting:    restarting,
 		LastError:     lastErr,
 		ClashListen:   c.clashAddr,
+		Tun:           tun,
 	}
 	if servers != nil {
 		st.ServerCount = servers.Len()
@@ -856,6 +906,15 @@ func (c *Controller) Call(ctx context.Context, cmd string, args json.RawMessage)
 			return nil, err
 		}
 		return ApplyData{Action: CmdMode, Status: c.Status()}, nil
+	case CmdTun:
+		var a TunArgs
+		if err := decodeArgs(args, &a); err != nil {
+			return nil, err
+		}
+		if err := c.SetTun(a.Enabled); err != nil {
+			return nil, err
+		}
+		return ApplyData{Action: CmdTun, Status: c.Status()}, nil
 	case CmdLatency:
 		var a LatencyArgs
 		if err := decodeArgs(args, &a); err != nil {
@@ -933,4 +992,12 @@ func enginePID(e core.Engine) int {
 		return p.Pid()
 	}
 	return 0
+}
+
+// onOff renders a boolean the way the daemon's log lines say it.
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
 }

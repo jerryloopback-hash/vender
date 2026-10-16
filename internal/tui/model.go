@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/ll-lite/vender/internal/autostart"
 	"github.com/ll-lite/vender/internal/config"
 	"github.com/ll-lite/vender/internal/control"
+	"github.com/ll-lite/vender/internal/core"
 )
 
 // screen identifies one of the TUI's four screens.
@@ -46,6 +48,11 @@ const (
 // defaultRefreshInterval is the traffic/status poll cadence when Options leaves
 // it unset.
 const defaultRefreshInterval = time.Second
+
+// milestoneTag is the build milestone shown in the tab bar. It is what the
+// documentation and `vender version` are read against, so it moves with the
+// milestone rather than with the build.
+const milestoneTag = "M6"
 
 // --- messages ---------------------------------------------------------------
 
@@ -110,10 +117,17 @@ type configSnapshot struct {
 	Mode          string
 	LogLevel      string
 	Binary        string
+	EnginePath    string
 	BindInterface string
 	Selected      string
 	Servers       []config.Server
 	Err           string
+
+	// Tun is the configured TUN block, and TunPriv is the local verdict on
+	// whether this machine could create a TUN. Both are read from disk, so the
+	// Settings screen can tell the truth with no daemon running.
+	Tun     config.TunConfig
+	TunPriv core.TUNPrivilege
 }
 
 // --- model ------------------------------------------------------------------
@@ -230,7 +244,7 @@ func (m Model) Init() tea.Cmd {
 		m.spinner.Tick,
 		loadSnapshotCmd(m.opts),
 		attachCmd(m.ctx, m.opts),
-		autostartStatusCmd(),
+		autostartStatusCmd(autostart.Options{}),
 	)
 }
 
@@ -338,33 +352,53 @@ func loadSnapshotCmd(opts Options) tea.Cmd {
 	}
 }
 
+// autostartOptions tells the autostart registration what the daemon will need,
+// so that enabling TUN and enabling start-at-login in either order converges on
+// the mechanism that actually works.
+func (m Model) autostartOptions() autostart.Options {
+	t := m.tun()
+	o := autostart.Options{TUN: t.Enabled}
+	if t.Enabled {
+		o.CapabilityHint = t.Priv.Detail
+	}
+	return o
+}
+
 // autostartStatusCmd reads the start-at-login registration. It is a local call,
 // not a daemon command: the registration is a file (or a registry value) that
 // belongs to the user, and the daemon may not even be running when a user wants
 // to turn autostart on.
-func autostartStatusCmd() tea.Cmd {
+func autostartStatusCmd(opts autostart.Options) tea.Cmd {
 	return func() tea.Msg {
-		st, err := autostart.Status()
+		st, err := autostart.StatusWithOptions(opts)
 		return autostartMsg{state: st, err: err}
 	}
 }
 
 // autostartToggleCmd enables or disables start-at-login and reports the
-// resulting state.
-func autostartToggleCmd(enable bool) tea.Cmd {
+// resulting state. The disable path needs no options: removing what is there
+// does not depend on what the daemon will need.
+func autostartToggleCmd(opts autostart.Options, enable bool) tea.Cmd {
 	return func() tea.Msg {
 		note := "autostart off"
 		var err error
 		if enable {
 			note = "autostart on"
-			err = autostart.Enable()
+			err = autostart.EnableWithOptions(opts)
 		} else {
 			err = autostart.Disable()
 		}
 		if err != nil {
-			return autostartMsg{err: err, note: note}
+			// `on` may have installed a per-user entry and still returned an
+			// error (TUN needs a privileged one); show whatever state exists
+			// alongside the error.
+			st, serr := autostart.StatusWithOptions(opts)
+			if serr != nil {
+				return autostartMsg{err: err, note: note}
+			}
+			return autostartMsg{state: st, err: err, note: note}
 		}
-		st, serr := autostart.Status()
+		st, serr := autostart.StatusWithOptions(opts)
 		return autostartMsg{state: st, err: serr, note: note}
 	}
 }
@@ -383,6 +417,13 @@ func loadSnapshot(opts Options) configSnapshot {
 		snap.Binary = cfg.Engine.Binary
 		snap.BindInterface = cfg.Engine.BindInterface
 		snap.Selected = cfg.SelectedServer
+		snap.Tun = cfg.Engine.Tun
+		// The privilege verdict is about the machine, and about the engine
+		// binary the capabilities would be granted to, so resolve it here (in
+		// a command, never in View).
+		engine, _ := core.ResolveBinary(*cfg)
+		snap.EnginePath = engine
+		snap.TunPriv = core.CheckTUNPrivilege(engine)
 	}
 	if ss, err := store.LoadServers(); err != nil {
 		if snap.Err == "" {
@@ -426,6 +467,30 @@ func setModeCmd(ctx context.Context, opts Options, mode string) tea.Cmd {
 			return actionDoneMsg{label: "mode " + mode, err: err}
 		}
 		return actionDoneMsg{label: "mode set to " + mode}
+	})
+}
+
+// tunCmd turns the TUN inbound on or off through the daemon. Toggling TUN
+// restarts the engine, which can take a few seconds, and the daemon may refuse
+// (a missing CAP_NET_ADMIN) — the refusal is reported as a toast with the
+// daemon's own words, which is the whole point of asking the daemon rather than
+// writing the file.
+func tunCmd(ctx context.Context, opts Options, enable bool) tea.Cmd {
+	return actionCall(ctx, opts, func(cli *control.Client, cctx context.Context) tea.Msg {
+		applied, err := cli.SetTun(cctx, enable)
+		label := "tun off"
+		if enable {
+			label = "tun on"
+		}
+		if err != nil {
+			return actionDoneMsg{label: label, err: err}
+		}
+		if enable && !applied.Status.Tun.PrivilegesOK {
+			// Should not happen (the daemon refuses), but if it ever does, say
+			// so rather than claim success.
+			return actionDoneMsg{label: label, err: errors.New("the daemon accepted TUN but reports it lacks the privilege")}
+		}
+		return actionDoneMsg{label: label}
 	})
 }
 
@@ -620,7 +685,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case snapshotMsg:
 		m.snap = msg.snap
 		m.rebuildRows()
-		return m, nil
+		// The registration's *right* mechanism depends on the TUN setting,
+		// which has just been read; re-probe now that it is known.
+		return m, autostartStatusCmd(m.autostartOptions())
 
 	case autostartMsg:
 		m.busy = ""
@@ -835,15 +902,34 @@ func (m Model) handleSettingsKey(key string) (tea.Model, tea.Cmd) {
 		return m.applyMode(modes[m.settingsCursor])
 	case "m":
 		return m.cycleMode()
+	case "u":
+		// Toggle the TUN inbound. Unlike start-at-login this is daemon state —
+		// the engine's whole inbound set changes — so it needs the daemon.
+		return m.toggleTun()
 	case "a":
 		// Toggle start-at-login. It is a local change (a systemd unit, an XDG
 		// entry, a registry value), so it does not need the daemon — which is
 		// often not running yet at the moment a user wants to enable it.
 		enable := !m.startAtLogin.Enabled
 		m.busy = "updating autostart…"
-		return m, autostartToggleCmd(enable)
+		return m, autostartToggleCmd(m.autostartOptions(), enable)
 	}
 	return m, nil
+}
+
+// toggleTun flips the TUN inbound through the daemon.
+func (m Model) toggleTun() (tea.Model, tea.Cmd) {
+	if !m.attached {
+		m.setToast("tun mode is daemon state: start it with `vender daemon`", true)
+		return m, nil
+	}
+	enable := !m.tun().Enabled
+	if enable {
+		m.busy = "enabling tun mode…"
+	} else {
+		m.busy = "disabling tun mode…"
+	}
+	return m, tunCmd(m.ctx, m.opts, enable)
 }
 
 func (m Model) startEngineAction(action string) (tea.Model, tea.Cmd) {
@@ -866,6 +952,62 @@ func (m Model) startLatency(name string) (tea.Model, tea.Cmd) {
 	}
 	m.busy = "testing " + label + "…"
 	return m, latencyCmd(m.ctx, m.opts, name)
+}
+
+// tunView is the TUN state as the Settings screen and the Dashboard present it.
+// It prefers the daemon's answer, because that describes the *running* engine,
+// and falls back to the configuration files, which are all there is with no
+// daemon at all.
+type tunView struct {
+	// Known is false only while no snapshot has been loaded.
+	Known       bool
+	Enabled     bool
+	Active      bool
+	Stack       string
+	Interface   string
+	AutoRoute   bool
+	StrictRoute bool
+	MTU         int
+	// Priv is the privilege verdict — the daemon's when attached (its own
+	// privileges are what matter), this process's otherwise.
+	Priv core.TUNPrivilege
+}
+
+func (m Model) tun() tunView {
+	file := m.snap.Tun
+	v := tunView{
+		Known:       true,
+		Enabled:     file.Enabled,
+		Stack:       file.Stack,
+		Interface:   file.InterfaceName,
+		AutoRoute:   file.AutoRouteEnabled(),
+		StrictRoute: file.StrictRoute,
+		MTU:         file.MTU,
+		Priv:        m.snap.TunPriv,
+	}
+	if !m.attached {
+		return v
+	}
+	// The daemon is authoritative about two things the files cannot know:
+	// whether the *running* engine was rendered with a TUN, and whether *it*
+	// can create one (its privileges are not necessarily the client's). The
+	// descriptive knobs still come from the file when the daemon did not send
+	// them, which keeps the panel useful against an older daemon.
+	t := m.status.Tun
+	v.Enabled = t.Enabled
+	v.Active = t.Active
+	v.Priv = core.TUNPrivilege{OK: t.PrivilegesOK, Detail: t.PrivilegeDetail}
+	if t.Stack != "" {
+		v.Stack = t.Stack
+	}
+	if t.Interface != "" {
+		v.Interface = t.Interface
+	}
+	v.AutoRoute, v.StrictRoute = t.AutoRoute, t.StrictRoute
+	if t.MTU != 0 {
+		v.MTU = t.MTU
+	}
+	return v
 }
 
 func (m Model) cycleMode() (tea.Model, tea.Cmd) {

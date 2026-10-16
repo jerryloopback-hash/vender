@@ -21,6 +21,8 @@ const (
 	tagBlock  = "block"
 	// tagMixed is the tag of the local mixed SOCKS5+HTTP inbound.
 	tagMixed = "mixed-in"
+	// tagTun is the tag of the optional TUN inbound.
+	tagTun = "tun-in"
 )
 
 // singboxConfig is the subset of sing-box's configuration schema that vender
@@ -82,16 +84,44 @@ type singboxLog struct {
 	Timestamp bool   `json:"timestamp"`
 }
 
+// singboxInbound is one entry of the generated `inbounds` list. The mixed and
+// TUN inbounds share the type so that both render through one struct; the
+// fields a given inbound does not use are omitted, which is what keeps the
+// TUN-off output byte-identical to M1/M2's.
 type singboxInbound struct {
 	Type       string `json:"type"`
 	Tag        string `json:"tag"`
-	Listen     string `json:"listen"`
-	ListenPort int    `json:"listen_port"`
+	Listen     string `json:"listen,omitempty"`
+	ListenPort int    `json:"listen_port,omitempty"`
+
+	// --- tun only -----------------------------------------------------------
+	//
+	// `address` is the modern replacement for the legacy inet4_address /
+	// inet6_address pair, which sing-box 1.12 removed outright (the pinned
+	// 1.14.3 refuses them by name).
+	InterfaceName string   `json:"interface_name,omitempty"`
+	Address       []string `json:"address,omitempty"`
+	MTU           int      `json:"mtu,omitempty"`
+	Stack         string   `json:"stack,omitempty"`
+	// Stack and the flags below are emitted only in TUN mode. `stack` is always
+	// explicit so vender's behaviour does not depend on an engine default that
+	// can change between sing-box releases.
+	AutoRoute              bool     `json:"auto_route,omitempty"`
+	StrictRoute            bool     `json:"strict_route,omitempty"`
+	RouteExcludeAddress    []string `json:"route_exclude_address,omitempty"`
+	RouteExcludeAddressSet []string `json:"route_exclude_address_set,omitempty"`
 }
 
 type singboxRoute struct {
 	// RuleSet declares the embedded rule set files sing-box may match against.
 	RuleSet []singboxRuleSet `json:"rule_set,omitempty"`
+	// AutoDetectInterface binds the engine's own outbound connections to the
+	// interface holding the default route. With a TUN up it is what keeps the
+	// connection *to the proxy server* out of the tunnel (without it the
+	// engine can route its own handshake back into its own TUN on a host whose
+	// proxy server is reached by IP). Emitted only in TUN mode, and only when
+	// engine.bind_interface has not already pinned the outbound.
+	AutoDetectInterface bool `json:"auto_detect_interface,omitempty"`
 	// DefaultDomainResolver resolves a destination name when a rule needs its
 	// address (ip_is_private, geoip-cn) or when a direct outbound dials a name.
 	DefaultDomainResolver *singboxDomainResolver `json:"default_domain_resolver,omitempty"`
@@ -214,6 +244,12 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 		}},
 	}
 
+	// The TUN inbound coexists with the mixed one: a user with TUN on usually
+	// still wants 127.0.0.1:7897 for tools that take an explicit proxy.
+	if rc.Config.Engine.Tun.Enabled {
+		cfg.Inbounds = append(cfg.Inbounds, buildTunInbound(rc.Config.Engine.Tun))
+	}
+
 	// The Clash API is opt-in: only the daemon asks for it, and only so the TUI
 	// can read live traffic and measure latency. The address is validated by
 	// RuntimeConfig.Validate (loopback only, secret required).
@@ -250,6 +286,31 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 	// Rule mode is the only mode that ships the built-in policy; global means
 	// what it says (everything through the proxy), so emitting CN-direct rules
 	// there would silently break the mode's contract.
+	//
+	// Under a TUN, global mode does get the sniff/hijack-dns actions, because
+	// without them DNS would leave the host as raw packets to port 53 and the
+	// engine's proxied resolver would never be consulted. Actions route
+	// nothing, so global stays global.
+	tun := rc.Config.Engine.Tun.Enabled
+	// auto_detect_interface is what stops the engine from routing its own
+	// connection to the proxy server back into its own TUN. When
+	// engine.bind_interface is set the outbound is already pinned, so the
+	// global setting would be redundant.
+	autoDetect := tun && rc.Config.Engine.BindInterface == ""
+
+	// The rule sets the config will declare: the built-in policy's in rule
+	// mode, plus any TUN route-exclusion sets. Building them (and extracting
+	// the files) is a no-op when the list is empty, which keeps the modes that
+	// reference none byte-identical to M2's output.
+	declared := declaredRuleSets(rc.Config)
+	var sets []singboxRuleSet
+	if len(declared) > 0 {
+		sets, err = buildRuleSets(rc.RunDir, declared)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	switch rc.Config.Proxy.Mode {
 	case config.ModeRule:
 		dns, err := buildDNS(rules.BuiltinDNS())
@@ -258,16 +319,13 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 		}
 		cfg.DNS = dns
 
-		sets, err := buildRuleSets(rc.RunDir, rules.ReferencedRuleSets())
-		if err != nil {
-			return nil, err
-		}
 		routeRules, err := buildRules()
 		if err != nil {
 			return nil, err
 		}
 		cfg.Route = singboxRoute{
-			RuleSet: sets,
+			RuleSet:             sets,
+			AutoDetectInterface: autoDetect,
 			// Destination names are resolved with the domestic resolver: it is
 			// the one that can answer for the names a direct outbound dials,
 			// and a proxied outbound never resolves locally at all (it passes
@@ -283,10 +341,23 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 			return nil, err
 		}
 		cfg.DNS = dns
-		cfg.Route = singboxRoute{Rules: []singboxRule{}, Final: final}
+		cfg.Route = singboxRoute{
+			RuleSet:             sets,
+			AutoDetectInterface: autoDetect,
+			Rules:               globalRules(tun),
+			Final:               final,
+		}
 
 	default: // config.ModeDirect
-		cfg.Route = singboxRoute{Rules: []singboxRule{}, Final: final}
+		// Direct mode must not proxy, so it gets no actions either: with
+		// hijack-dns the engine would answer DNS itself instead of letting the
+		// packets out.
+		cfg.Route = singboxRoute{
+			RuleSet:             sets,
+			AutoDetectInterface: autoDetect,
+			Rules:               []singboxRule{},
+			Final:               final,
+		}
 	}
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
@@ -294,6 +365,77 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 		return nil, fmt.Errorf("core: encode sing-box config: %w", err)
 	}
 	return append(data, '\n'), nil
+}
+
+// buildTunInbound renders the optional TUN inbound from vender's own
+// engine.tun block. Every field is passed through with the same name sing-box
+// uses, so the doc and the generated file read alike.
+//
+// Two choices are worth recording:
+//
+//   - `address` is always omitted when the user left it empty, so sing-box
+//     picks its own private /30. That default (172.19.0.1/30 in 1.14) does not
+//     collide with the 198.18.0.0/15 that mihomo/clash uses for its TUN.
+//   - `stack` is always emitted, even when it equals the engine default, so a
+//     change of default in a future sing-box cannot silently change vender's
+//     behaviour.
+func buildTunInbound(t config.TunConfig) singboxInbound {
+	return singboxInbound{
+		Type:                   "tun",
+		Tag:                    tagTun,
+		InterfaceName:          t.InterfaceName,
+		Address:                t.Address,
+		MTU:                    t.MTU,
+		Stack:                  t.Stack,
+		AutoRoute:              t.AutoRouteEnabled(),
+		StrictRoute:            t.StrictRoute,
+		RouteExcludeAddress:    t.RouteExcludeAddress,
+		RouteExcludeAddressSet: t.RouteExcludeAddressSet,
+	}
+}
+
+// declaredRuleSets is the list of rule set tags the generated config declares
+// in route.rule_set: the built-in policy's in rule mode, plus the TUN
+// route-exclusion sets in any mode. Duplicates keep their first position, so
+// the generated file is deterministic.
+func declaredRuleSets(cfg config.Config) []string {
+	if cfg.Proxy.Mode != config.ModeRule && !cfg.Engine.Tun.Enabled {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var out []string
+	add := func(tags ...string) {
+		for _, tag := range tags {
+			if tag == "" || seen[tag] {
+				continue
+			}
+			seen[tag] = true
+			out = append(out, tag)
+		}
+	}
+	if cfg.Proxy.Mode == config.ModeRule {
+		add(rules.ReferencedRuleSets()...)
+	}
+	if cfg.Engine.Tun.Enabled {
+		add(cfg.Engine.Tun.RouteExcludeAddressSet...)
+	}
+	return out
+}
+
+// validateTunRuleSets rejects a TUN exclusion that names a rule set vender does
+// not embed. It lives here rather than in internal/config because only core
+// knows the embedded sets.
+func validateTunRuleSets(cfg config.Config) error {
+	if !cfg.Engine.Tun.Enabled {
+		return nil
+	}
+	for _, tag := range cfg.Engine.Tun.RouteExcludeAddressSet {
+		if _, ok := rules.LookupRuleSet(tag); !ok {
+			return fmt.Errorf(
+				"core: engine.tun.route_exclude_address_set %q is not one of the rule sets vender embeds (see `vender rules list`)", tag)
+		}
+	}
+	return nil
 }
 
 // buildOutbound renders the selected server as the proxy outbound.
@@ -442,14 +584,7 @@ func buildDNS(policy rules.DNS) (*singboxDNS, error) {
 // `dns` section plus the hijack-dns action, not as destination matches, so a
 // DNSOnly rule here would silently misroute DNS. BuiltinRules returns none.
 func buildRules() ([]singboxRule, error) {
-	out := make([]singboxRule, 0)
-	for _, a := range rules.BuiltinActions() {
-		rule := singboxRule{Action: string(a.Kind)}
-		if a.Protocol != "" {
-			rule.Protocol = []string{a.Protocol}
-		}
-		out = append(out, rule)
-	}
+	out := buildActions()
 	for _, r := range rules.BuiltinRules() {
 		if err := r.Validate(); err != nil {
 			return nil, err
@@ -474,6 +609,39 @@ func buildRules() ([]singboxRule, error) {
 		})
 	}
 	return out, nil
+}
+
+// buildActions renders the sniff + hijack-dns pair in evaluation order.
+// Sniffing comes first because a connection that arrives as a bare IP is just
+// an IP until the engine looks at its first bytes; hijack-dns then hands a DNS
+// connection to the engine's DNS module instead of routing it as plain traffic.
+func buildActions() []singboxRule {
+	out := make([]singboxRule, 0, len(rules.BuiltinActions()))
+	for _, a := range rules.BuiltinActions() {
+		rule := singboxRule{Action: string(a.Kind)}
+		if a.Protocol != "" {
+			rule.Protocol = []string{a.Protocol}
+		}
+		out = append(out, rule)
+	}
+	return out
+}
+
+// globalRules is what global mode emits: nothing at all through the mixed
+// inbound (global means "everything through the proxy", and the built-in
+// destination rules would quietly turn it into rule mode), but the two actions
+// when a TUN is up.
+//
+// The actions are needed under a TUN and harmless without one: sniff makes the
+// proxied outbound receive the real destination name, and hijack-dns makes DNS
+// go through the engine's proxied resolver instead of leaving the host as raw
+// packets to port 53 — which is the whole point of global mode. They select no
+// outbound, so the mode's contract is untouched.
+func globalRules(tun bool) []singboxRule {
+	if !tun {
+		return []singboxRule{}
+	}
+	return buildActions()
 }
 
 func outboundTag(o rules.Outbound) (string, error) {

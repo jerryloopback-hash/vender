@@ -21,6 +21,13 @@ proxy:
 engine:
     binary: ""
     bind_interface: ""
+    tun:
+        enabled: false
+        stack: mixed
+        mtu: 0
+        auto_route: true
+        strict_route: false
+        interface_name: vender0
 selected_server: ""
 `
 
@@ -51,13 +58,17 @@ func TestConfigNormalize(t *testing.T) {
 			want: Config{
 				LogLevel: "debug",
 				Proxy:    ProxyConfig{Listen: "127.0.0.1:1080", Mode: ModeRule},
-				Engine:   EngineConfig{},
+				Engine:   EngineConfig{Tun: DefaultTun()},
 			},
 		},
 		{
 			name: "whitespace and case are canonicalised",
 			in:   Config{LogLevel: " Info ", Proxy: ProxyConfig{Listen: " 127.0.0.1:7890 ", Mode: " GLOBAL "}},
-			want: Config{LogLevel: "info", Proxy: ProxyConfig{Listen: "127.0.0.1:7890", Mode: ModeGlobal}},
+			want: Config{
+				LogLevel: "info",
+				Proxy:    ProxyConfig{Listen: "127.0.0.1:7890", Mode: ModeGlobal},
+				Engine:   EngineConfig{Tun: DefaultTun()},
+			},
 		},
 	}
 

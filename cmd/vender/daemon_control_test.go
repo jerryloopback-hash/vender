@@ -362,3 +362,134 @@ func TestDaemonPublishesAndWithdrawsItsEndpoint(t *testing.T) {
 		t.Error("control.json still exists after shutdown")
 	}
 }
+
+// TestDaemonTunCommand drives the TUN command through the real control channel.
+//
+// There are exactly two legitimate outcomes, and the test accepts both because
+// which one happens depends on where the suite runs: either this process can
+// create a TUN device (root, or a capability) and the daemon re-renders and
+// restarts the engine with the TUN inbound, or it cannot — and then the daemon
+// must refuse *before* touching the engine, leave the configuration alone, and
+// say what is missing.
+func TestDaemonTunCommand(t *testing.T) {
+	listen := "127.0.0.1:" + fmt.Sprint(freePort(t))
+	h := startDaemon(t, listen, vlessLink)
+	defer h.stop(t)
+
+	cli := h.dial(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	st, err := cli.Status(ctx)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if st.Tun.Enabled || st.Tun.Active {
+		t.Errorf("a fresh daemon already has TUN on: %+v", st.Tun)
+	}
+	// The privilege verdict always travels with the status, because a client's
+	// own verdict is not the daemon's.
+	if st.Tun.PrivilegeDetail == "" {
+		t.Error("status carries no TUN privilege detail")
+	}
+
+	// Turning off what is already off is a no-op that still answers.
+	if applied, err := cli.SetTun(ctx, false); err != nil {
+		t.Fatalf("SetTun(false): %v", err)
+	} else if applied.Status.Tun.Enabled {
+		t.Errorf("TUN is on after SetTun(false): %+v", applied.Status.Tun)
+	}
+
+	applied, err := cli.SetTun(ctx, true)
+	if err != nil {
+		// The refusal path.
+		msg := err.Error()
+		if !strings.Contains(msg, "CAP_NET_ADMIN") && !strings.Contains(strings.ToLower(msg), "administrator") {
+			t.Errorf("a refused TUN enable does not name the privilege: %v", err)
+		}
+		if kind := control.KindOf(err); kind != control.KindBadRequest {
+			t.Errorf("kind = %q, want bad_request (a refusal, not an internal failure)", kind)
+		}
+		// Nothing was persisted, and the engine was not stopped by the attempt.
+		cfg, cerr := config.NewStoreAt(h.cfgDir).LoadConfig()
+		if cerr != nil {
+			t.Fatalf("LoadConfig: %v", cerr)
+		}
+		if cfg.Engine.Tun.Enabled {
+			t.Error("a refused enable changed config.yaml")
+		}
+		st, serr := cli.Status(ctx)
+		if serr != nil {
+			t.Fatalf("Status after a refusal: %v", serr)
+		}
+		if !st.EngineRunning {
+			t.Error("a refused enable left the engine down")
+		}
+		if strings.Contains(h.output.String(), "vender: tun on") {
+			t.Errorf("the refusal was recorded as a change:\n%s", h.output)
+		}
+		return
+	}
+
+	// The privileged path: persisted, applied, and the engine restarted with a
+	// TUN inbound.
+	if !applied.Status.Tun.Enabled || !applied.Status.Tun.Active {
+		t.Errorf("state after SetTun(true) = %+v", applied.Status.Tun)
+	}
+	cfg, cerr := config.NewStoreAt(h.cfgDir).LoadConfig()
+	if cerr != nil {
+		t.Fatalf("LoadConfig: %v", cerr)
+	}
+	if !cfg.Engine.Tun.Enabled {
+		t.Error("SetTun(true) did not persist the setting")
+	}
+	if !applied.Status.EngineHealthy {
+		t.Error("the engine is not healthy after the TUN restart")
+	}
+
+	// And back off: the TUN inbound disappears from the rendered config.
+	if applied, err := cli.SetTun(ctx, false); err != nil {
+		t.Fatalf("SetTun(false): %v", err)
+	} else if applied.Status.Tun.Enabled || applied.Status.Tun.Active {
+		t.Errorf("state after SetTun(false) = %+v", applied.Status.Tun)
+	}
+	if cfg, cerr = config.NewStoreAt(h.cfgDir).LoadConfig(); cerr != nil {
+		t.Fatalf("LoadConfig: %v", cerr)
+	}
+	if cfg.Engine.Tun.Enabled {
+		t.Error("SetTun(false) did not persist the setting")
+	}
+}
+
+// The CLI's `tun on` against a running daemon ends in one of the same two
+// states, and must never leave the daemon with a broken configuration.
+func TestCLITunOnAgainstARunningDaemon(t *testing.T) {
+	listen := "127.0.0.1:" + fmt.Sprint(freePort(t))
+	h := startDaemon(t, listen, vlessLink)
+	defer h.stop(t)
+
+	out, err := runCLIIn(t, h.runDir, "tun", "on", "--config-dir", h.cfgDir)
+	cfg, cerr := config.NewStoreAt(h.cfgDir).LoadConfig()
+	if cerr != nil {
+		t.Fatalf("LoadConfig: %v", cerr)
+	}
+	if err != nil {
+		// Refused: the setting must not have been left on.
+		if cfg.Engine.Tun.Enabled {
+			t.Errorf("a refused `tun on` persisted the setting (output %q)", out)
+		}
+		if !strings.Contains(out+err.Error(), "CAP_NET_ADMIN") && !strings.Contains(strings.ToLower(err.Error()), "administrator") {
+			t.Errorf("the failure does not name the privilege: %v\n%s", err, out)
+		}
+		if !strings.Contains(err.Error(), "engine keeps running") {
+			t.Errorf("the failure does not say the engine is intact: %v", err)
+		}
+	} else if !cfg.Engine.Tun.Enabled {
+		t.Error("`tun on` reported success but did not persist the setting")
+	}
+
+	// Either way the daemon is still serving: `status` exits 0.
+	if out, err := runCLIIn(t, h.runDir, "status", "--config-dir", h.cfgDir); err != nil {
+		t.Errorf("status after `tun on`: %v\n%s", err, out)
+	}
+}

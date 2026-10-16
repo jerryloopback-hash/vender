@@ -252,6 +252,13 @@ func (c *Client) SetMode(ctx context.Context, mode string) (ApplyData, error) {
 	return out, err
 }
 
+// SetTun turns the TUN inbound on or off and restarts the engine.
+func (c *Client) SetTun(ctx context.Context, enabled bool) (ApplyData, error) {
+	var out ApplyData
+	err := c.Call(ctx, CmdTun, TunArgs{Enabled: enabled}, &out)
+	return out, err
+}
+
 // Latency measures a round trip through the named server (empty: the active
 // one). A failed probe is reported in LatencyData.Err, not as an error.
 func (c *Client) Latency(ctx context.Context, name string) (LatencyData, error) {

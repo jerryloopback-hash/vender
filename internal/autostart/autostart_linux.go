@@ -7,9 +7,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 )
+
+// userLookup is a seam for homeOf, so a test does not need a real account.
+var userLookup = user.Lookup
 
 // The systemd unit is named after the program, so `systemctl --user status
 // vender` does what a user expects.
@@ -30,11 +34,20 @@ type cmdRunner func(name string, args ...string) (string, error)
 type linuxBackend struct {
 	home      string // $HOME
 	xdgConfig string // $XDG_CONFIG_HOME (may be empty)
-	user      string // login name, for loginctl
+	user      string // login name, for the system unit's User= and for loginctl
 	exe       string // absolute path to the vender binary
-	lookPath  func(string) (string, error)
-	run       cmdRunner
+	// systemUnitDir is where the *system* unit lives. It is a field so the
+	// tests can install a system unit without root.
+	systemUnitDir string
+	// euid is os.Geteuid(); 0 means "root, so the system unit can be written".
+	// A field so a test can act as root.
+	euid     int
+	lookPath func(string) (string, error)
+	run      cmdRunner
 }
+
+// systemdSystemUnitDir is the system manager's unit directory.
+const systemdSystemUnitDir = "/etc/systemd/system"
 
 func defaultLinuxBackend() linuxBackend {
 	exe, err := os.Executable()
@@ -43,19 +56,51 @@ func defaultLinuxBackend() linuxBackend {
 	} else if abs, aerr := filepath.Abs(exe); aerr == nil {
 		exe = abs
 	}
+	user := loginName()
+	home := os.Getenv("HOME")
+
+	// Under sudo the interesting user is the one who invoked it: the config
+	// directory, the run directory and the User= of a system unit all belong to
+	// them, not to root. `sudo vender autostart on` therefore has to look at
+	// the *invoking* user's configuration.
+	if os.Geteuid() == 0 {
+		if su := strings.TrimSpace(os.Getenv("SUDO_USER")); su != "" && su != "root" {
+			user = su
+			if h := homeOf(su); h != "" {
+				home = h
+			}
+		}
+	}
 	return linuxBackend{
-		home:      os.Getenv("HOME"),
-		xdgConfig: os.Getenv("XDG_CONFIG_HOME"),
-		user:      loginName(),
-		exe:       exe,
-		lookPath:  exec.LookPath,
-		run:       runCommand,
+		home:          home,
+		xdgConfig:     os.Getenv("XDG_CONFIG_HOME"),
+		user:          user,
+		exe:           exe,
+		systemUnitDir: systemdSystemUnitDir,
+		euid:          os.Geteuid(),
+		lookPath:      exec.LookPath,
+		run:           runCommand,
 	}
 }
 
+// homeOf resolves a login name to its home directory. A failure is not fatal
+// (the unit then simply does not pin HOME), so the error is dropped.
+func homeOf(user string) string {
+	u, err := userLookup(user)
+	if err != nil {
+		return ""
+	}
+	return u.HomeDir
+}
+
 // Enable registers vender to start the daemon at login. It is idempotent.
-func Enable() error {
-	_, err := defaultLinuxBackend().enable()
+func Enable() error { return EnableWithOptions(Options{}) }
+
+// EnableWithOptions registers vender with the mechanism the Options call for:
+// the per-user one by default, a system unit when TUN mode needs the
+// capability.
+func EnableWithOptions(o Options) error {
+	_, err := defaultLinuxBackend().enableWith(o)
 	return err
 }
 
@@ -63,7 +108,14 @@ func Enable() error {
 func Disable() error { return defaultLinuxBackend().disable() }
 
 // Status reports the current autostart registration.
-func Status() (State, error) { return defaultLinuxBackend().status() }
+func Status() (State, error) { return StatusWithOptions(Options{}) }
+
+// StatusWithOptions reports the registration *and* whether it can deliver what
+// the current configuration needs, which is the only honest answer once TUN
+// mode is in play.
+func StatusWithOptions(o Options) (State, error) {
+	return defaultLinuxBackend().statusWith(o)
+}
 
 func runCommand(name string, args ...string) (string, error) {
 	out, err := exec.Command(name, args...).CombinedOutput()
@@ -101,6 +153,18 @@ func (b linuxBackend) unitPath() (string, error) {
 	return filepath.Join(home, "systemd", "user", systemdUnitName), nil
 }
 
+// systemUnitPath is the *system* manager's unit file. It has the same name as
+// the user unit because the two live in different managers, which keeps
+// `systemctl status vender` (system) and `systemctl --user status vender`
+// meaningful and does not need two names in the documentation.
+func (b linuxBackend) systemUnitPath() string {
+	dir := b.systemUnitDir
+	if dir == "" {
+		dir = systemdSystemUnitDir
+	}
+	return filepath.Join(dir, systemdUnitName)
+}
+
 func (b linuxBackend) desktopPath() (string, error) {
 	home, err := b.configHome()
 	if err != nil {
@@ -134,14 +198,94 @@ func (b linuxBackend) systemdAvailable() bool {
 
 // --- enable -----------------------------------------------------------------
 
-func (b linuxBackend) enable() (State, error) {
+func (b linuxBackend) enable() (State, error) { return b.enableWith(Options{}) }
+
+// enableWith picks the mechanism. TUN mode changes the answer: a systemd *user*
+// unit cannot be given CAP_NET_ADMIN, so the registration has to be a system
+// unit; if that cannot be installed, the user registration is still made (the
+// daemon does start at login) and the returned error says what TUN still needs.
+func (b linuxBackend) enableWith(o Options) (State, error) {
 	if b.exe == "" {
 		return State{}, errors.New("autostart: cannot determine the vender executable path (os.Executable failed)")
 	}
+	if o.TUN {
+		return b.enableSystemUnit(o)
+	}
+	return b.enableUserUnit()
+}
+
+// enableUserUnit is the default, unprivileged mechanism.
+func (b linuxBackend) enableUserUnit() (State, error) {
 	if b.systemdAvailable() {
 		return b.enableSystemd()
 	}
 	return b.enableXDG()
+}
+
+// enableSystemUnit installs the TUN-capable registration: a system service that
+// runs the daemon as the invoking user with exactly the capabilities a TUN
+// needs.
+//
+// It falls back to the per-user registration when the system unit cannot be
+// installed (the usual case: not root), and returns an error describing what is
+// missing rather than reporting a success that will not survive the next login.
+func (b linuxBackend) enableSystemUnit(o Options) (State, error) {
+	st, err := b.installSystemUnit()
+	if err == nil {
+		// A leftover user unit would fight the system one for the run
+		// directory's lock, so the now-superseded per-user entries go.
+		b.removeUserArtifacts()
+		return st, nil
+	}
+
+	fallback, ferr := b.enableUserUnit()
+	if ferr != nil {
+		return State{}, fmt.Errorf("autostart: TUN mode needs a system unit (%v), and the per-user fallback also failed: %w", err, ferr)
+	}
+	fallback.Detail += "; TUN is enabled but this registration cannot create a TUN device: " + b.capabilityNote(o)
+	return fallback, fmt.Errorf("autostart: TUN mode needs CAP_NET_ADMIN, which a systemd user unit cannot be given (%v); "+
+		"run `sudo vender autostart on` to install the system unit. Meanwhile: %s", err, b.capabilityNote(o))
+}
+
+// installSystemUnit writes /etc/systemd/system/vender.service and enables it.
+func (b linuxBackend) installSystemUnit() (State, error) {
+	path := b.systemUnitPath()
+	if b.euid != 0 {
+		return State{}, fmt.Errorf("uid %d cannot write %s: run `sudo vender autostart on`", b.euid, path)
+	}
+	if err := writeFileAtomic(path, systemdSystemUnit(b.exe, b.user, b.home)); err != nil {
+		return State{}, err
+	}
+	// From here on a failure must not leave a unit file behind: the caller
+	// falls back to the per-user registration, and two registrations (one of
+	// them a disabled system unit) would make `status` and the next boot
+	// disagree about what is installed.
+	if out, err := b.run("systemctl", "daemon-reload"); err != nil {
+		_ = removeFile(path)
+		return State{}, fmt.Errorf("autostart: systemctl daemon-reload: %w%s", err, outputSuffix(out))
+	}
+	if out, err := b.run("systemctl", "enable", "--now", systemdUnitName); err != nil {
+		_ = removeFile(path)
+		_, _ = b.run("systemctl", "daemon-reload")
+		return State{}, fmt.Errorf("autostart: systemctl enable --now %s: %w%s", systemdUnitName, err, outputSuffix(out))
+	}
+	return State{
+		Enabled:   true,
+		Mechanism: MechanismSystemdSystem,
+		Target:    path,
+		Detail: "system unit installed and enabled (User=" + b.user +
+			", AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW) because TUN mode is on; " +
+			"it starts the daemon at boot and is the only mechanism a systemd user manager cannot provide a TUN for",
+	}, nil
+}
+
+// capabilityNote describes what TUN mode still needs, quoting the caller's
+// verdict when it has one.
+func (b linuxBackend) capabilityNote(o Options) string {
+	if o.CapabilityHint != "" {
+		return o.CapabilityHint
+	}
+	return "the engine needs CAP_NET_ADMIN (run `vender tun status` for the exact commands)"
 }
 
 func (b linuxBackend) enableSystemd() (State, error) {
@@ -197,9 +341,41 @@ func (b linuxBackend) enableXDG() (State, error) {
 
 // --- disable ----------------------------------------------------------------
 
-// disable removes both artifacts. Removing the one that is not there is not an
-// error, which is what makes `off` idempotent.
+// disable removes every artifact: the system unit (which needs root), the user
+// unit and the desktop entry. Removing one that is not there is not an error,
+// which is what makes `off` idempotent.
 func (b linuxBackend) disable() error {
+	var firstErr error
+	if err := b.removeSystemUnit(); err != nil {
+		firstErr = err
+	}
+	if err := b.removeUserArtifacts(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
+
+// removeSystemUnit removes the TUN-capable registration. It needs root, and
+// says so rather than silently leaving a root-owned unit behind that would
+// start the daemon again at the next boot.
+func (b linuxBackend) removeSystemUnit() error {
+	path := b.systemUnitPath()
+	if !fileExists(path) {
+		return nil
+	}
+	if b.euid != 0 {
+		return fmt.Errorf("the system unit %s needs root to remove: run `sudo vender autostart off`", path)
+	}
+	_, _ = b.run("systemctl", "disable", "--now", systemdUnitName)
+	if err := removeFile(path); err != nil {
+		return err
+	}
+	_, _ = b.run("systemctl", "daemon-reload")
+	return nil
+}
+
+// removeUserArtifacts removes the user unit and the XDG entry, best-effort.
+func (b linuxBackend) removeUserArtifacts() error {
 	if b.systemdAvailable() {
 		if unitPath, err := b.unitPath(); err == nil {
 			if _, statErr := os.Stat(unitPath); statErr == nil {
@@ -224,24 +400,51 @@ func (b linuxBackend) disable() error {
 
 // --- status -----------------------------------------------------------------
 
-func (b linuxBackend) status() (State, error) {
+func (b linuxBackend) status() (State, error) { return b.statusWith(Options{}) }
+
+func (b linuxBackend) statusWith(o Options) (State, error) {
 	unitPath, uerr := b.unitPath()
 	desktopPath, derr := b.desktopPath()
 
+	// The system unit wins when both exist: it is the one serving a running
+	// daemon whose lock would make the user unit fail anyway.
+	if path := b.systemUnitPath(); fileExists(path) {
+		return b.systemUnitState(path, o), nil
+	}
 	if uerr == nil && fileExists(unitPath) {
-		return b.systemdState(unitPath, true), nil
+		st := b.systemdState(unitPath, true)
+		if o.TUN {
+			st.Detail += "; TUN is enabled, but a systemd *user* unit cannot create a TUN device — " +
+				b.capabilityNote(o) + "; run `sudo vender autostart on` to install the system unit instead"
+		}
+		return st, nil
 	}
 	if derr == nil && fileExists(desktopPath) {
-		return State{
+		st := State{
 			Enabled:   true,
 			Mechanism: MechanismXDGAutostart,
 			Target:    desktopPath,
 			Detail:    "XDG autostart desktop entry installed",
-		}, nil
+		}
+		if o.TUN {
+			st.Detail += "; TUN is enabled, but an XDG desktop entry cannot create a TUN device — " +
+				b.capabilityNote(o) + "; run `sudo vender autostart on` to install a system unit instead"
+		}
+		return st, nil
 	}
 
 	// Nothing is installed: report what `on` would do here, so the command is
 	// still informative.
+	if o.TUN {
+		return State{
+			Enabled:   false,
+			Mechanism: MechanismSystemdSystem,
+			Target:    b.systemUnitPath(),
+			Detail: "not registered; with TUN enabled, `vender autostart on` installs a system unit " +
+				"(needs root once) so the daemon can have CAP_NET_ADMIN. Without root it falls back to the " +
+				"per-user registration, which also needs " + b.capabilityNote(o),
+		}, nil
+	}
 	if b.systemdAvailable() && uerr == nil {
 		return b.systemdState(unitPath, false), nil
 	}
@@ -258,6 +461,26 @@ func (b linuxBackend) status() (State, error) {
 		Mechanism: MechanismUnknown,
 		Detail:    "not registered, and neither $XDG_CONFIG_HOME nor $HOME is set, so the entry cannot be placed",
 	}, nil
+}
+
+// systemUnitState reports a registered system unit, including what systemd
+// thinks of it, so `autostart status` can be checked against reality.
+func (b linuxBackend) systemUnitState(path string, o Options) State {
+	st := State{Enabled: true, Mechanism: MechanismSystemdSystem, Target: path}
+	parts := []string{"system unit installed (User=" + b.user + ", AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW)"}
+	if out, err := b.run("systemctl", "is-enabled", systemdUnitName); err == nil && out != "" {
+		parts = append(parts, "systemctl is-enabled: "+out)
+	}
+	if out, err := b.run("systemctl", "is-active", systemdUnitName); err == nil && out != "" {
+		parts = append(parts, "systemctl is-active: "+out)
+	}
+	if o.TUN {
+		parts = append(parts, "it can create a TUN device (the capability is part of the unit)")
+	} else {
+		parts = append(parts, "TUN is off, so the granted capabilities are unused; the per-user unit would do")
+	}
+	st.Detail = strings.Join(parts, "; ")
+	return st
 }
 
 func (b linuxBackend) systemdState(unitPath string, enabled bool) State {
@@ -344,6 +567,55 @@ func systemdUnit(exe string) string {
 // ExecStart on whitespace and understands double quotes with C-style escapes,
 // so a path containing a space has to be quoted.
 func systemdExec(s string) string {
+	if !strings.ContainsAny(s, " \t\"'\\") {
+		return s
+	}
+	esc := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(s)
+	return `"` + esc + `"`
+}
+
+// systemdSystemUnit is the TUN-capable unit. It runs the daemon as the invoking
+// user — not as root — and gives it exactly the two capabilities a TUN needs,
+// which is why it is preferred over running the whole daemon privileged.
+//
+//   - User= plus AmbientCapabilities= is the combination that works: systemd
+//     (as root) sets the ambient set, and ambient capabilities survive the
+//     setuid to the target user. CapabilityBoundingSet keeps everything else
+//     out of reach, so a compromise of the daemon does not become a compromise
+//     of the machine.
+//   - Environment=HOME= pins the user's home directory, so the daemon resolves
+//     the same config and run directories the user's own `vender` commands use
+//     even when systemd does not set up a login environment.
+//   - WantedBy=multi-user.target starts it at boot, before any login, which is
+//     what a system-wide TUN is usually wanted for.
+func systemdSystemUnit(exe, user, home string) string {
+	var b strings.Builder
+	b.WriteString("[Unit]\n")
+	b.WriteString("Description=vender proxy client (TUN mode)\n")
+	b.WriteString("Documentation=https://github.com/ll-lite/vender\n")
+	b.WriteString("After=network-online.target\n")
+	b.WriteString("Wants=network-online.target\n")
+	b.WriteString("\n[Service]\n")
+	b.WriteString("Type=simple\n")
+	if user != "" {
+		b.WriteString("User=" + user + "\n")
+	}
+	if home != "" {
+		b.WriteString("Environment=HOME=" + systemdEnvValue(home) + "\n")
+	}
+	b.WriteString("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW\n")
+	b.WriteString("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW\n")
+	b.WriteString("ExecStart=" + systemdExec(exe) + " daemon\n")
+	b.WriteString("Restart=on-failure\n")
+	b.WriteString("RestartSec=3\n")
+	b.WriteString("\n[Install]\n")
+	b.WriteString("WantedBy=multi-user.target\n")
+	return b.String()
+}
+
+// systemdEnvValue quotes a value for systemd's Environment= assignment, which
+// is whitespace-split and understands C-style escapes inside double quotes.
+func systemdEnvValue(s string) string {
 	if !strings.ContainsAny(s, " \t\"'\\") {
 		return s
 	}

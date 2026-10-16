@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ll-lite/vender/internal/config"
 	"github.com/ll-lite/vender/internal/rules"
 )
 
@@ -72,10 +71,11 @@ func newEngine(rc RuntimeConfig) *engine {
 // WriteConfig renders rc into <RunDir>/singbox.json atomically and records it
 // as the configuration the next Start will run.
 //
-// In rule mode it also materialises the embedded rule sets under
-// <RunDir>/rules, because sing-box's route.rule_set only reads files. The
-// files are written before the config that points at them, so a failed
-// extraction never leaves a config referring to missing rule sets.
+// It also materialises the embedded rule sets under <RunDir>/rules whenever the
+// rendered config declares any (rule mode, or a TUN route-exclusion set),
+// because sing-box's route.rule_set only reads files. The files are written
+// before the config that points at them, so a failed extraction never leaves a
+// config referring to missing rule sets.
 func (e *engine) WriteConfig(rc RuntimeConfig) error {
 	if err := rc.Validate(); err != nil {
 		return err
@@ -87,7 +87,7 @@ func (e *engine) WriteConfig(rc RuntimeConfig) error {
 	if err := os.MkdirAll(rc.RunDir, 0o700); err != nil {
 		return fmt.Errorf("core: create run dir %s: %w", rc.RunDir, err)
 	}
-	if rc.Config.Proxy.Mode == config.ModeRule {
+	if len(declaredRuleSets(rc.Config)) > 0 {
 		dir := filepath.Join(rc.RunDir, rules.RulesSubdir)
 		if _, err := rules.WriteRuleSets(dir); err != nil {
 			return fmt.Errorf("core: extract built-in rule sets: %w", err)
@@ -140,6 +140,14 @@ func (e *engine) Start() error {
 	// our own readiness probe.
 	if err := e.ensureListenFree(rc.Config.Proxy.Listen); err != nil {
 		return err
+	}
+	// TUN mode is the one thing sing-box cannot do without a kernel privilege,
+	// and its own failure message ("open tun: TUNSETIFF: operation not
+	// permitted") does not say what to do about it. Check first, and say.
+	if rc.Config.Engine.Tun.Enabled {
+		if err := CheckTUNPrivilege(rc.BinaryPath).Err(); err != nil {
+			return err
+		}
 	}
 
 	stdoutR, stdoutW, err := os.Pipe()
