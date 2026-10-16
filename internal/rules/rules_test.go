@@ -185,7 +185,7 @@ func TestCriticalListIsTinyAndDirect(t *testing.T) {
 	if len(suffixes) == 0 || len(suffixes) > 5 {
 		t.Fatalf("CriticalDirectSuffixes() = %v, want a tiny list", suffixes)
 	}
-	for _, want := range []string{"opencode.ai", "api.tavily.com"} {
+	for _, want := range []string{"opencode.ai"} {
 		found := false
 		for _, s := range suffixes {
 			if s == want {
@@ -194,6 +194,16 @@ func TestCriticalListIsTinyAndDirect(t *testing.T) {
 		}
 		if !found {
 			t.Errorf("the critical list does not contain %q", want)
+		}
+	}
+	// api.tavily.com was removed: it is not reliably reachable directly on this
+	// network, so forcing it direct broke it. It must follow the normal policy
+	// and stay out of the unoverrideable list.
+	for _, banned := range []string{"api.tavily.com"} {
+		for _, s := range suffixes {
+			if s == banned {
+				t.Errorf("the critical list still contains %q", banned)
+			}
 		}
 	}
 	rules := CriticalRules()

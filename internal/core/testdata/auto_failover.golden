@@ -21,8 +21,7 @@
       {
         "action": "route",
         "domain_suffix": [
-          "opencode.ai",
-          "api.tavily.com"
+          "opencode.ai"
         ],
         "server": "dns-cn"
       },
@@ -102,7 +101,7 @@
         "Test-Hy2"
       ],
       "url": "http://www.gstatic.com/generate_204",
-      "interval": "1m",
+      "interval": "30s",
       "tolerance": 100
     },
     {
@@ -204,8 +203,7 @@
       },
       {
         "domain_suffix": [
-          "opencode.ai",
-          "api.tavily.com"
+          "opencode.ai"
         ],
         "outbound": "direct"
       },

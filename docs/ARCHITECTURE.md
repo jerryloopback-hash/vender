@@ -168,6 +168,8 @@ proxy:
 engine:
     binary: ""                  # empty => bundled next to vender, else PATH
     bind_interface: ""          # pin the proxy outbound to an interface
+    failover_interval: 30s      # URLTest probe cadence (auto); 5s-10m
+    failover_tolerance_ms: 100  # URLTest switch threshold; 0 = engine default
     tun:                        # M6: optional system-wide capture
         enabled: false          # off by default
         stack: mixed            # system | gvisor | mixed
@@ -637,7 +639,7 @@ than a user's connection.
 Order is the policy, because the first matching rule wins. Since M5 there are
 three layers, in this order:
 
-1. the built-in **critical list** (`opencode.ai`, `api.tavily.com`) — always
+1. the built-in **critical list** (`opencode.ai`) — always
    first, so no rule, built-in or user, can route a control-plane domain through
    a dead proxy;
 2. the user's optional `rules.yaml`, merged *before* the built-in policy;
@@ -645,7 +647,7 @@ three layers, in this order:
 
 | # | Rule | Matches | Goes to |
 |---|---|---|---|
-| 1 | `critical-direct` | `domain_suffix` opencode.ai, api.tavily.com | `direct` |
+| 1 | `critical-direct` | `domain_suffix` opencode.ai | `direct` |
 | 2 | `user-direct` | `rules.yaml` `direct:` (only if non-empty) | `direct` |
 | 3 | `user-proxy` | `rules.yaml` `proxy:` | `proxy` |
 | 4 | `user-block` | `rules.yaml` `block:` | `block` |
@@ -669,13 +671,23 @@ everything and send all traffic direct.
 
 #### The critical list
 
-`criticalDirectSuffixes` is deliberately tiny. The test for adding an entry is:
-losing it would make the machine *unmanageable* (not merely inconvenient) while
-the proxy is unreachable. `opencode.ai` is the coding agent's model/API plane and
-`api.tavily.com` is the research API; cutting either off would strand an agent
-that cannot fix the very problem it is diagnosing. The list is evaluated before
-everything, and the same domains are added to the DNS policy so they are
-*resolved* directly too (see §7.3).
+`criticalDirectSuffixes` is deliberately tiny, and an entry has to satisfy **two**
+tests, not one:
+
+1. losing it would make the machine *unmanageable* (not merely inconvenient)
+   while the proxy is unreachable; **and**
+2. it is reliably reachable *directly* on the user's network.
+
+`opencode.ai` — the coding agent's model/API plane — satisfies both: cutting it
+off would strand an agent that cannot fix the very problem it is diagnosing, and
+the direct path to it works. `api.tavily.com` used to be listed and fails (2):
+forcing it direct times out on this network while the proxy reaches it fine, so
+the entry *broke* the API instead of protecting it. It was removed and now
+follows the normal policy (`built-in policy → final: proxy`), where a user can
+still override it from `rules.yaml`. A domain that fails (2) must never be in the
+unoverrideable list. The list is evaluated before everything, and the same
+domains are added to the DNS policy so they are *resolved* directly too (see
+§7.3).
 
 #### The user rules file (`rules.yaml`)
 
@@ -820,8 +832,24 @@ outbounds: [ UpCloud-SJ, UpCloud-SJ-Hy2, {urltest proxy -> [UpCloud-SJ, UpCloud-
 
 The knobs are `url: http://www.gstatic.com/generate_204` (the same probe as the
 latency test, reached *through* the member so a node that connects but cannot
-carry traffic is judged unhealthy), `interval: 1m`, and `tolerance: 100` ms —
+carry traffic is judged unhealthy), plus `interval` and `tolerance` taken from
+`engine.failover_interval` (default `30s`, range `5s`–`10m`) and
+`engine.failover_tolerance_ms` (default `100` ms, `0` = engine default, range
+`0`–`5000`). The interval is a genuine trade-off because each probe is a real
+HTTP request sent *through* its member: shorter reacts faster to a node going bad
+(the previous hardcoded `1m` could leave a bad node carrying traffic for up to a
+minute) but runs more probe traffic and can load a fragile link. The tolerance is
 above sing-box's 50 ms default so two nodes of similar latency do not flap.
+
+```yaml
+engine:
+  failover_interval: 30s
+  failover_tolerance_ms: 100
+```
+
+A malformed or out-of-range knob is rejected by `config.EngineConfig.Validate`
+before the engine is spawned, so a typo fails loudly instead of silently
+changing failover behaviour.
 
 Single-server behaviour is unchanged in shape: with a server *name*, the config
 still has a single `proxy` outbound (the golden files pin it), and the daemon

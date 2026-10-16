@@ -34,16 +34,13 @@ const (
 //
 //   - url is vender's usual "generate 204" probe, reached *through* the member,
 //     so a node that connects but cannot carry traffic is judged unhealthy.
-//   - interval of a minute is a compromise between reacting to a node going
-//     bad quickly and not re-testing so often that the probes themselves add
-//     load to a fragile link.
-//   - tolerance is raised above sing-box's 50 ms default to stop two nodes of
-//     similar latency from flapping back and forth on every jittery sample.
-const (
-	autoFailoverURL       = DefaultDelayTestURL
-	autoFailoverInterval  = "1m"
-	autoFailoverTolerance = 100
-)
+//   - interval and tolerance come from engine.failover_interval /
+//     engine.failover_tolerance_ms, with the defaults in internal/config. A
+//     shorter interval reacts faster to a node going bad but runs more probe
+//     traffic; the probes run *through* each member. A tolerance above
+//     sing-box's 50 ms default stops two nodes of similar latency from
+//     flapping on every jittery sample.
+const autoFailoverURL = DefaultDelayTestURL
 
 // singboxConfig is the subset of sing-box's configuration schema that vender
 // generates. Fields are ordered to match the documented sing-box structure so
@@ -527,8 +524,8 @@ func buildAutoOutbounds(rc RuntimeConfig) ([]any, error) {
 		Tag:       tagProxy,
 		Outbounds: members,
 		URL:       autoFailoverURL,
-		Interval:  autoFailoverInterval,
-		Tolerance: autoFailoverTolerance,
+		Interval:  rc.Config.Engine.FailoverIntervalDuration().String(),
+		Tolerance: rc.Config.Engine.FailoverTolerance(),
 	})
 	return out, nil
 }

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -60,6 +61,27 @@ func (c *Config) IsAutoServer() bool {
 	return strings.EqualFold(strings.TrimSpace(c.SelectedServer), SelectedServerAuto)
 }
 
+// Failover (URLTest) knob defaults and bounds, used when selected_server is
+// "auto". They live here — next to the sentinel they belong to — rather than in
+// core, so the documented config.yaml and the renderer cannot drift apart.
+const (
+	// DefaultFailoverInterval is how often each member is probed when
+	// engine.failover_interval is unset. 30s is short enough that a node going
+	// bad stops carrying traffic in well under the ~1m a "1m" interval could
+	// take, without probing so often that the probes themselves load a fragile
+	// link (each probe is sent *through* its member).
+	DefaultFailoverInterval = "30s"
+	// MinFailoverInterval and MaxFailoverInterval bound engine.failover_interval.
+	MinFailoverInterval = 5 * time.Second
+	MaxFailoverInterval = 10 * time.Minute
+	// DefaultFailoverToleranceMS is the URLTest tolerance when
+	// engine.failover_tolerance_ms is zero. It is above sing-box's own 50 ms
+	// default so two nodes of similar latency do not flap.
+	DefaultFailoverToleranceMS = 100
+	// MaxFailoverToleranceMS bounds engine.failover_tolerance_ms.
+	MaxFailoverToleranceMS = 5000
+)
+
 // Valid reports whether m is a known proxy mode.
 func (m ProxyMode) Valid() bool {
 	switch m {
@@ -90,9 +112,79 @@ type EngineConfig struct {
 	// connection to the server. Rendered as sing-box's outbound
 	// "bind_interface".
 	BindInterface string `yaml:"bind_interface"`
+	// FailoverInterval is how often the URLTest failover group
+	// (selected_server: auto) re-probes each member, as a Go duration string
+	// ("30s", "1m30s"). It is only consulted in auto mode. Empty means the
+	// default, DefaultFailoverInterval.
+	//
+	// Each probe is a real HTTP request sent *through* the member (the group's
+	// "url"), so the interval is a trade-off: shorter reacts faster to a node
+	// going bad, but adds probe traffic to every member and, on a fragile link,
+	// can make the link busier than the traffic it is protecting.
+	FailoverInterval string `yaml:"failover_interval"`
+	// FailoverToleranceMS is the latency difference, in milliseconds, that
+	// makes the URLTest group switch members. 0 means the default,
+	// DefaultFailoverToleranceMS. A value above sing-box's own 50 ms default
+	// stops two nodes of similar latency from flapping back and forth on every
+	// jittery sample.
+	FailoverToleranceMS int `yaml:"failover_tolerance_ms"`
 	// Tun is the optional TUN inbound (§M6): transparent, system-wide traffic
 	// capture. Off by default.
 	Tun TunConfig `yaml:"tun"`
+}
+
+// FailoverIntervalDuration returns the configured probe interval. It falls back
+// to DefaultFailoverInterval when the field is empty or unparsable, so a
+// hand-built Config still renders a usable group; a config that went through
+// Validate can never take the unparsable branch.
+func (e EngineConfig) FailoverIntervalDuration() time.Duration {
+	if v := strings.TrimSpace(e.FailoverInterval); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	d, _ := time.ParseDuration(DefaultFailoverInterval)
+	return d
+}
+
+// FailoverTolerance returns the configured URLTest tolerance, falling back to
+// the engine default when the field is zero (its "use the default" value).
+func (e EngineConfig) FailoverTolerance() int {
+	if e.FailoverToleranceMS == 0 {
+		return DefaultFailoverToleranceMS
+	}
+	return e.FailoverToleranceMS
+}
+
+// Validate checks the engine-level failover knobs. An empty failover_interval
+// means "use the default" and is accepted; a zero failover_tolerance_ms is the
+// documented "engine default" and is likewise accepted. A disabled engine has
+// no such thing as off here — the knobs are inert unless selected_server is
+// "auto", but they are cheap to check and a typo should be reported whenever
+// the file is read.
+func (e EngineConfig) Validate() []string {
+	var problems []string
+
+	if v := strings.TrimSpace(e.FailoverInterval); v != "" {
+		d, err := time.ParseDuration(v)
+		switch {
+		case err != nil:
+			problems = append(problems, fmt.Sprintf(
+				"engine.failover_interval %q is not a duration (use forms like %q or \"1m30s\")", v, DefaultFailoverInterval))
+		case d < MinFailoverInterval || d > MaxFailoverInterval:
+			problems = append(problems, fmt.Sprintf(
+				"engine.failover_interval %s is out of range: use %s to %s (default %s)",
+				d, MinFailoverInterval, MaxFailoverInterval, DefaultFailoverInterval))
+		}
+	}
+
+	if e.FailoverToleranceMS < 0 || e.FailoverToleranceMS > MaxFailoverToleranceMS {
+		problems = append(problems, fmt.Sprintf(
+			"engine.failover_tolerance_ms %d is out of range: use 0 to %d (0 means the engine default, %d)",
+			e.FailoverToleranceMS, MaxFailoverToleranceMS, DefaultFailoverToleranceMS))
+	}
+
+	return problems
 }
 
 // Config is the global vender configuration (config.yaml).
@@ -113,7 +205,12 @@ func Default() *Config {
 			Listen: DefaultListen,
 			Mode:   ModeRule,
 		},
-		Engine:         EngineConfig{Binary: "", Tun: DefaultTun()},
+		Engine: EngineConfig{
+			Binary:              "",
+			FailoverInterval:    DefaultFailoverInterval,
+			FailoverToleranceMS: DefaultFailoverToleranceMS,
+			Tun:                 DefaultTun(),
+		},
 		SelectedServer: "",
 	}
 }
@@ -136,6 +233,13 @@ func (c *Config) Normalize() {
 	c.Proxy.Mode = ProxyMode(strings.ToLower(strings.TrimSpace(string(c.Proxy.Mode))))
 	c.Engine.Binary = strings.TrimSpace(c.Engine.Binary)
 	c.Engine.BindInterface = strings.TrimSpace(c.Engine.BindInterface)
+	c.Engine.FailoverInterval = strings.TrimSpace(c.Engine.FailoverInterval)
+	if c.Engine.FailoverInterval == "" {
+		c.Engine.FailoverInterval = def.Engine.FailoverInterval
+	}
+	if c.Engine.FailoverToleranceMS == 0 {
+		c.Engine.FailoverToleranceMS = def.Engine.FailoverToleranceMS
+	}
 	c.Engine.Tun.Normalize()
 	c.SelectedServer = strings.TrimSpace(c.SelectedServer)
 	if c.IsAutoServer() {
@@ -164,6 +268,8 @@ func (c *Config) Validate() error {
 	if strings.ContainsAny(c.Engine.BindInterface, " \t/") {
 		problems = append(problems, fmt.Sprintf("engine.bind_interface %q must be an interface name without spaces or slashes", c.Engine.BindInterface))
 	}
+
+	problems = append(problems, c.Engine.Validate()...)
 
 	problems = append(problems, c.Engine.Tun.Validate()...)
 

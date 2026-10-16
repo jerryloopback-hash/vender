@@ -18,19 +18,26 @@ import (
 // Both exist for the same reason: the built-in policy must never be able to cut
 // the user off from the machine's own control plane. The critical list is a
 // handful of domains that have to work even when the proxy is dead (an agent's
-// model API, a research API); the user file is the escape hatch for everything
-// else, evaluated before the built-in policy so a user entry always wins.
+// model API); the user file is the escape hatch for everything else, evaluated
+// before the built-in policy so a user entry always wins.
 
 // criticalDirectSuffixes are the domains that must be routed directly no matter
 // what — ahead of the built-in policy, ahead of the user's own rules, and
 // resolved by the domestic resolver rather than the fake-IP one. Keep this list
 // tiny: every entry is a hole in "everything foreign goes through the proxy".
 //
-// The rule of thumb for adding one: losing it would make the machine
-// unmanageable (not merely inconvenient) while the proxy is unreachable.
+// The rule of thumb for adding one is two conditions, both required:
+//
+//	(a) losing it would make the machine unmanageable (not merely
+//	    inconvenient) while the proxy is unreachable, AND
+//	(b) it is reliably reachable *directly* on this network.
+//
+// api.tavily.com was listed here and fails (b): the direct path to it times out
+// on this network while the proxy reaches it fine, so forcing it direct broke
+// it rather than protecting it. It now follows the normal policy (built-in
+// policy -> final: proxy) and remains overridable from rules.yaml.
 var criticalDirectSuffixes = []string{
-	"opencode.ai",    // the coding agent's model/API plane
-	"api.tavily.com", // the research/search API this tool uses
+	"opencode.ai", // the coding agent's model/API plane
 }
 
 // CriticalDirectSuffixes returns the built-in "must survive a dead proxy" list.

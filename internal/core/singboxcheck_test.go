@@ -145,6 +145,10 @@ func TestAutoConfigPassesSingBoxCheck(t *testing.T) {
 			cfg := *config.Default()
 			cfg.Proxy.Mode = mode
 			cfg.SelectedServer = config.SelectedServerAuto
+			// A non-default interval and tolerance, so the check also covers
+			// the engine's own acceptance of the rendered knobs.
+			cfg.Engine.FailoverInterval = "45s"
+			cfg.Engine.FailoverToleranceMS = 250
 			rc := RuntimeConfig{
 				Config:     cfg,
 				Servers:    []config.Server{*checkTestServer(), *checkTestHy2()},

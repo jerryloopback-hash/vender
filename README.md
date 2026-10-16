@@ -446,6 +446,8 @@ Two files live in the config directory, plus an optional third:
   engine:
       binary: ""          # empty => next to vender, else PATH
       bind_interface: ""  # e.g. eth0 on a multi-homed host
+      failover_interval: 30s       # URLTest probe cadence (auto failover); 5s-10m
+      failover_tolerance_ms: 100   # URLTest switch threshold; 0 = engine default
       tun:
           enabled: false        # opt-in; see "TUN mode" below
           stack: mixed          # system | gvisor | mixed
@@ -457,6 +459,17 @@ Two files live in the config directory, plus an optional third:
           # route_exclude_address: []         # CIDRs kept out of the tunnel
           # route_exclude_address_set: []     # rule-set tags kept out (e.g. geoip-cn)
   selected_server: ""     # a name in servers.yaml, or "auto" for failover
+  ```
+
+  `engine.failover_interval` and `engine.failover_tolerance_ms` are only
+  consulted with `selected_server: auto` (see "Automatic failover" below).
+  Shorter interval = faster failover but more probe traffic, since every probe
+  is sent *through* its member:
+
+  ```yaml
+  engine:
+    failover_interval: 30s
+    failover_tolerance_ms: 100
   ```
 
   A disabled `engine.tun` block is inert: it is not validated and nothing is
@@ -521,7 +534,7 @@ The policy, in evaluation order (first match wins):
 
 | # | Rule | Matches | Goes to |
 |---|---|---|---|
-| 1 | `critical-direct` | `opencode.ai`, `api.tavily.com` | `direct` |
+| 1 | `critical-direct` | `opencode.ai` | `direct` |
 | 2 | `user-direct` | `rules.yaml` `direct:` (if any) | `direct` |
 | 3 | `user-proxy` | `rules.yaml` `proxy:` | `proxy` |
 | 4 | `user-block` | `rules.yaml` `block:` | `block` |
@@ -534,10 +547,15 @@ The policy, in evaluation order (first match wins):
 Two things about the order are load-bearing:
 
 - **The critical list is first, and tiny.** It holds the domains whose loss would
-  make the machine unmanageable rather than merely inconvenient — the coding
-  agent's own model/API plane and the research API it uses. They are resolved
-  and dialled directly, so a dead proxy can never cut them off; nothing, not even
-  a `rules.yaml` entry, can route them through the proxy.
+  make the machine unmanageable rather than merely inconvenient, and that are
+  also reliably reachable **directly** on this network. Today that is only the
+  coding agent's own model/API plane (`opencode.ai`): it is resolved and dialled
+  directly, so a dead proxy can never cut it off, and nothing — not even a
+  `rules.yaml` entry — can route it through the proxy. A domain that is not
+  reachable directly does not belong here: `api.tavily.com` used to be listed
+  and was removed, because forcing it direct timed out on this network while the
+  proxy reached it fine. It now follows the normal policy (and is still
+  overridable from `rules.yaml`).
 - **The service overrides must come before the China rule.** Several of those
   services have China-facing entries in `geosite-cn`; if the China rule ran
   first, a Steam store page or a Microsoft sign-in would be dialled directly and
@@ -581,9 +599,9 @@ sets below.
 
 Point `selected_server` at `auto` and vender renders **every** server in
 `servers.yaml` as a member of a sing-box `urltest` group, instead of pinning one.
-The engine then re-tests each node against a "generate 204" URL every minute and
-carries traffic over the fastest reachable one, so a degraded node is bypassed
-without anyone touching anything:
+The engine then re-tests each node against a "generate 204" URL and carries
+traffic over the fastest reachable one, so a degraded node is bypassed without
+anyone touching anything:
 
 ```sh
 vender servers use auto     # turn failover on (a running daemon restarts)
@@ -595,6 +613,22 @@ global-mode DNS resolver are all unchanged. In the **Nodes** screen the header
 shows which member is carrying traffic and the latency column is filled from the
 engine's own URL-test results; `A` switches to auto. Single-server setups are
 completely unaffected — the generated config is byte-identical to before.
+
+Two `engine` knobs tune the probing:
+
+```yaml
+engine:
+  failover_interval: 30s        # default; 5s-10m inclusive
+  failover_tolerance_ms: 100    # default; 0-5000, 0 = engine default
+```
+
+`failover_interval` is how often each member is probed. Every probe is a real
+HTTP request sent **through** that member, so the interval trades failover speed
+against probe traffic: shorter reacts sooner to a node going bad but keeps every
+member busier (and can load a fragile link). The default is `30s`. The allowed
+range is `5s`–`10m`; anything else is rejected at start-up. `failover_tolerance_ms`
+is the latency gap that makes the group switch members; the default (100 ms) sits
+above sing-box's own 50 ms so two nodes of similar latency do not flap.
 
 ### Embedded rule sets ("全部内置")
 

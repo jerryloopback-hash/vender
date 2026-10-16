@@ -15,7 +15,7 @@
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ built-in routing policy ────────────────────────────────────────────────────────────────────────╮
 │ actions  sniff, protocol=dns -> hijack-dns   final  proxy   selected  Interserver-LA             │
-│  1  critical-direct         domain_suffix=[opencode.ai api.tavily.com]    direct                 │
+│  1  critical-direct         domain_suffix=[opencode.ai]                   direct                 │
 │  2  private-dest-direct     ip_is_private                                 direct                 │
 │  3  ads-block               rule_set=[geosite-category-ads-all]           block                  │
 │  4  service-overrides-pro…  rule_set=[geosite-steam geosite-onedrive ge…  proxy                  │

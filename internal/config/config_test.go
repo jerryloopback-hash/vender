@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -21,6 +22,8 @@ proxy:
 engine:
     binary: ""
     bind_interface: ""
+    failover_interval: 30s
+    failover_tolerance_ms: 100
     tun:
         enabled: false
         stack: mixed
@@ -58,7 +61,7 @@ func TestConfigNormalize(t *testing.T) {
 			want: Config{
 				LogLevel: "debug",
 				Proxy:    ProxyConfig{Listen: "127.0.0.1:1080", Mode: ModeRule},
-				Engine:   EngineConfig{Tun: DefaultTun()},
+				Engine:   EngineConfig{FailoverInterval: DefaultFailoverInterval, FailoverToleranceMS: DefaultFailoverToleranceMS, Tun: DefaultTun()},
 			},
 		},
 		{
@@ -67,7 +70,16 @@ func TestConfigNormalize(t *testing.T) {
 			want: Config{
 				LogLevel: "info",
 				Proxy:    ProxyConfig{Listen: "127.0.0.1:7890", Mode: ModeGlobal},
-				Engine:   EngineConfig{Tun: DefaultTun()},
+				Engine:   EngineConfig{FailoverInterval: DefaultFailoverInterval, FailoverToleranceMS: DefaultFailoverToleranceMS, Tun: DefaultTun()},
+			},
+		},
+		{
+			name: "an explicit failover interval is kept, a zero tolerance is defaulted",
+			in:   Config{Engine: EngineConfig{FailoverInterval: " 45s "}},
+			want: Config{
+				LogLevel: LogLevelInfo,
+				Proxy:    ProxyConfig{Listen: DefaultListen, Mode: ModeRule},
+				Engine:   EngineConfig{FailoverInterval: "45s", FailoverToleranceMS: DefaultFailoverToleranceMS, Tun: DefaultTun()},
 			},
 		},
 	}
@@ -104,6 +116,17 @@ func TestConfigValidate(t *testing.T) {
 		{name: "port out of range", mutate: func(c *Config) { c.Proxy.Listen = "127.0.0.1:99999" }, wantSub: "out of range"},
 		{name: "non numeric port", mutate: func(c *Config) { c.Proxy.Listen = "127.0.0.1:http" }, wantSub: "invalid port"},
 		{name: "selected server is not checked here", mutate: func(c *Config) { c.SelectedServer = "ghost" }},
+		{name: "failover interval too small", mutate: func(c *Config) { c.Engine.FailoverInterval = "1s" }, wantSub: "out of range"},
+		{name: "failover interval too large", mutate: func(c *Config) { c.Engine.FailoverInterval = "11m" }, wantSub: "out of range"},
+		{name: "failover interval unparsable", mutate: func(c *Config) { c.Engine.FailoverInterval = "fast" }, wantSub: "not a duration"},
+		{name: "failover tolerance too large", mutate: func(c *Config) { c.Engine.FailoverToleranceMS = 5001 }, wantSub: "out of range"},
+		{name: "failover tolerance negative", mutate: func(c *Config) { c.Engine.FailoverToleranceMS = -1 }, wantSub: "out of range"},
+		{name: "empty failover interval means the default", mutate: func(c *Config) { c.Engine.FailoverInterval = "" }},
+		{name: "zero failover tolerance means the engine default", mutate: func(c *Config) { c.Engine.FailoverToleranceMS = 0 }},
+		{name: "the bounds themselves are accepted", mutate: func(c *Config) {
+			c.Engine.FailoverInterval = "5s"
+			c.Engine.FailoverToleranceMS = 5000
+		}},
 	}
 
 	for _, tt := range tests {
@@ -131,6 +154,43 @@ func TestConfigValidate(t *testing.T) {
 				t.Errorf("error type = %T, want *ValidationError", err)
 			}
 		})
+	}
+}
+
+// The documented failover defaults must be what a fresh config.yaml carries and
+// what the accessors return when the user did not choose; and the accessors
+// must never return a zero interval or tolerance (render calls them without
+// requiring a Normalize first).
+func TestFailoverDefaultsAndAccessors(t *testing.T) {
+	def := Default()
+	if def.Engine.FailoverInterval != DefaultFailoverInterval {
+		t.Errorf("default failover_interval = %q, want %q", def.Engine.FailoverInterval, DefaultFailoverInterval)
+	}
+	if def.Engine.FailoverToleranceMS != DefaultFailoverToleranceMS {
+		t.Errorf("default failover_tolerance_ms = %d, want %d", def.Engine.FailoverToleranceMS, DefaultFailoverToleranceMS)
+	}
+	if got := def.Engine.FailoverIntervalDuration().String(); got != DefaultFailoverInterval {
+		t.Errorf("default FailoverIntervalDuration() = %s, want %s", got, DefaultFailoverInterval)
+	}
+	if got := def.Engine.FailoverTolerance(); got != DefaultFailoverToleranceMS {
+		t.Errorf("default FailoverTolerance() = %d, want %d", got, DefaultFailoverToleranceMS)
+	}
+
+	// A raw zero EngineConfig (no Normalize) still resolves to the defaults.
+	var zero EngineConfig
+	if got := zero.FailoverIntervalDuration().String(); got != DefaultFailoverInterval {
+		t.Errorf("zero FailoverIntervalDuration() = %s, want %s", got, DefaultFailoverInterval)
+	}
+	if got := zero.FailoverTolerance(); got != DefaultFailoverToleranceMS {
+		t.Errorf("zero FailoverTolerance() = %d, want %d", got, DefaultFailoverToleranceMS)
+	}
+
+	// A configured value is normalised to its canonical duration string, so two
+	// spellings of the same interval render identically.
+	cfg := *Default()
+	cfg.Engine.FailoverInterval = "90s"
+	if got := cfg.Engine.FailoverIntervalDuration(); got != 90*time.Second {
+		t.Errorf("configured FailoverIntervalDuration() = %s, want 1m30s", got)
 	}
 }
 

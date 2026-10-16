@@ -963,6 +963,92 @@ func TestAutoModeRendersURLTestGroup(t *testing.T) {
 	if group.URL == "" || group.Interval == "" || group.Tolerance <= 0 {
 		t.Errorf("group knobs are incomplete: %+v", group)
 	}
+	// With no engine.failover_* set, the documented defaults are rendered.
+	if group.URL != DefaultDelayTestURL {
+		t.Errorf("group url = %q, want %q", group.URL, DefaultDelayTestURL)
+	}
+	if group.Interval != config.DefaultFailoverInterval {
+		t.Errorf("group interval = %q, want the default %q", group.Interval, config.DefaultFailoverInterval)
+	}
+	if group.Tolerance != config.DefaultFailoverToleranceMS {
+		t.Errorf("group tolerance = %d, want the default %d", group.Tolerance, config.DefaultFailoverToleranceMS)
+	}
+}
+
+// A configured engine.failover_interval / failover_tolerance_ms must reach the
+// rendered urltest group, canonicalised as sing-box expects them.
+func TestAutoModeRendersConfiguredFailoverKnobs(t *testing.T) {
+	cfg := *config.Default()
+	cfg.SelectedServer = config.SelectedServerAuto
+	cfg.Engine.FailoverInterval = "45s"
+	cfg.Engine.FailoverToleranceMS = 250
+	rc := RuntimeConfig{
+		Config: cfg,
+		Servers: []config.Server{
+			*testVLESS(),
+			{Name: "Second-Hy2", Type: config.TypeHysteria2, Address: testHost, Port: 8443, Password: testPW, SNI: "www.bing.com", Insecure: true},
+		},
+		RunDir: "/run/vender",
+	}
+	data, err := BuildConfig(rc)
+	if err != nil {
+		t.Fatalf("BuildConfig: %v", err)
+	}
+	var got struct {
+		Outbounds []struct {
+			Type      string `json:"type"`
+			Interval  string `json:"interval"`
+			Tolerance int    `json:"tolerance"`
+		} `json:"outbounds"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, o := range got.Outbounds {
+		if o.Type != "urltest" {
+			continue
+		}
+		if o.Interval != "45s" {
+			t.Errorf("rendered interval = %q, want 45s", o.Interval)
+		}
+		if o.Tolerance != 250 {
+			t.Errorf("rendered tolerance = %d, want 250", o.Tolerance)
+		}
+		return
+	}
+	t.Fatal("no urltest group in the rendered config")
+}
+
+// An out-of-range knob must be rejected before anything is rendered, naming the
+// field, so a typo fails loudly instead of silently changing behaviour.
+func TestAutoModeRejectsBadFailoverKnobs(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		mutate  func(*config.Config)
+		wantSub string
+	}{
+		{name: "interval too small", mutate: func(c *config.Config) { c.Engine.FailoverInterval = "1s" }, wantSub: "failover_interval"},
+		{name: "interval too large", mutate: func(c *config.Config) { c.Engine.FailoverInterval = "1h" }, wantSub: "failover_interval"},
+		{name: "interval unparsable", mutate: func(c *config.Config) { c.Engine.FailoverInterval = "soon" }, wantSub: "failover_interval"},
+		{name: "tolerance out of range", mutate: func(c *config.Config) { c.Engine.FailoverToleranceMS = 9000 }, wantSub: "failover_tolerance_ms"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := *config.Default()
+			cfg.SelectedServer = config.SelectedServerAuto
+			tt.mutate(&cfg)
+			_, err := BuildConfig(RuntimeConfig{
+				Config:  cfg,
+				Servers: []config.Server{*testVLESS()},
+				RunDir:  "/run/vender",
+			})
+			if err == nil {
+				t.Fatal("BuildConfig accepted a bad failover knob")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error = %v, want it to mention %q", err, tt.wantSub)
+			}
+		})
+	}
 }
 
 // A server name that collides with a reserved vender tag must not shadow it.

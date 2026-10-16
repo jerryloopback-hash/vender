@@ -21,8 +21,7 @@
       {
         "action": "route",
         "domain_suffix": [
-          "opencode.ai",
-          "api.tavily.com"
+          "opencode.ai"
         ],
         "server": "dns-cn"
       },
@@ -168,8 +167,7 @@
       },
       {
         "domain_suffix": [
-          "opencode.ai",
-          "api.tavily.com"
+          "opencode.ai"
         ],
         "outbound": "direct"
       },

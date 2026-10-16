@@ -19,8 +19,8 @@ The policy is built in and fully offline: the rule sets it matches against are
 compiled sing-box rule sets embedded in the vender binary, so no download and
 no data directory is needed at runtime. On top of that:
 
-  * a tiny built-in "critical" list (opencode.ai, api.tavily.com) is evaluated
-    first, so a dead proxy can never cut off the machine's control plane;
+  * a tiny built-in "critical" list (opencode.ai) is evaluated first, so a dead
+    proxy can never cut off the machine's control plane;
   * an optional user file, rules.yaml, is merged *before* the built-in policy,
     so a user entry always wins.
 
