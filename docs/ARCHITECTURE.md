@@ -411,7 +411,7 @@ argument for this split:
 const ProfileManual = "manual"  // built in; never stored; cannot be removed
 const ProfileAll    = "all"     // "every server"; a reserved *name*, not a profile
 
-type Profile struct { Name, URL string; FetchedAt time.Time }
+type Profile struct { Name, URL string; FetchedAt time.Time; DNS *ProfileDNS }
 type ProfileSet struct { Active string; Profiles []Profile }
 
 func (ps *ProfileSet) ActiveName() string            // never empty
@@ -475,6 +475,68 @@ be used are skipped *with a reason* rather than failing the subscription — a
 provider's list routinely contains a protocol vender does not implement, and a
 user should get the other 40 nodes.
 
+### 4.6 Profile DNS policy (`internal/config/profiledns.go`)
+
+A commercial provider's node hostnames are special "entry" domains, e.g.
+`1.k.o.5.j.m.k.d.1.hk01-ae5.entry.v51124-6.qpon`, whose **public** answers are a
+decoy: a blackhole from outside China, and a shared "China" address that does
+not carry the provider's traffic. The provider's Clash config states which
+resolver answers for them:
+
+```yaml
+dns:
+  nameserver-policy:
+    +.v51124-6.qpon: tcp://f892aaba…fyi:8080
+```
+
+M7 imported only `proxies:` and ignored that, so every Shadowsocks node was
+dialled at the wrong address and the tunnel carried no traffic. M8 captures the
+policy at import and stores it next to the profile's URL:
+
+```go
+type DNSNamespacePolicy struct { Domain, Server string }
+
+type ProfileDNS struct {
+    NamespacePolicy []DNSNamespacePolicy // dns.nameserver-policy, ordered
+    Nameservers     []string             // dns.nameserver   (captured)
+    Fallback        []string             // dns.fallback     (captured)
+    Raw             string               // the source `dns:` block, for audit
+}
+
+func ParseResolverAddress(s string) (ResolverAddress, error) // tcp/udp/tls/https/bare
+func NormalizeDNSPattern(p string) (string, bool)            // +.x / *.x / .x / x -> x
+func (d *ProfileDNS) Match(host string) string               // longest suffix wins
+func (d *ProfileDNS) SetNamespacePolicy(domain, server string) error
+func (ps *ProfileSet) DNSMap() map[string]*ProfileDNS
+func (s *Store) SetProfileDNS(name string, dns *ProfileDNS) (string, error)
+```
+
+`Profile.DNS` is nil when a profile has none, and the whole feature is a no-op
+then: an absent policy renders nothing at all. The shape written to
+`profiles.yaml` is documented on the type; the `Raw` block keeps what the
+provider actually said even if vender's parsing changes.
+
+Three decisions are worth recording:
+
+- **Only `nameserver-policy` is applied.** It is an explicit, per-domain
+  instruction, and it is what distinguishes the provider's entry domains from
+  everything else. `nameserver`/`fallback` are captured because they are part of
+  what the provider said, but pointing *every* node hostname at them would
+  reroute nodes that intentionally resolve through public DNS — the same
+  subscription carries VMess nodes under `entry.rtysjur.quest` and
+  `entry.fr0528.art` that work fine today — so vender does not.
+- **Patterns are normalized to an explicit suffix.** Clash's `+.`/`*.`/`.`
+  prefixes all become "this name and its subdomains"; a rule-set key
+  (`geosite:cn`, `rule-set:…`), which cannot be matched against a hostname, is
+  dropped from the applied policy but stays visible in `Raw`.
+- **A hand-set policy is sticky.** `ProfileImport` with a nil policy leaves an
+  existing one alone, so `profiles update` of a subscription that (now) declares
+  nothing cannot silently undo a `profiles set-dns` fix.
+
+`vender profiles list` gains a `DNS` column, `vender profiles show` prints the
+policy in full, and `vender profiles set-dns <name> --domain D --server S`
+(repeatable, `--clear`) declares or fixes it by hand.
+
 ## 5. CLI (`cmd/vender`)
 
 Built with [cobra]. Each subcommand is constructed by a method on a shared
@@ -490,9 +552,11 @@ without touching the user's real configuration.
 | `vender servers list` | implemented (M0) (`--links`) |
 | `vender servers use <name\|auto>` | implemented (M5) — selects a server, or `auto` for failover; restarts a running daemon |
 | `vender servers rm <name>` | implemented (M0) |
-| `vender profiles list` | implemented (M7) — name, node count, source URL, last-updated, active |
+| `vender profiles list` | implemented (M7; DNS column M8) — name, node count, DNS policy summary, source URL, last-updated, active |
+| `vender profiles show [name]` | implemented (M8) — one profile in full, including its DNS policy |
 | `vender profiles use <name\|all>` | implemented (M7) — makes a profile active; restarts a running daemon |
 | `vender profiles update [name]` | implemented (M7) — re-fetch and reconcile |
+| `vender profiles set-dns <name>` | implemented (M8) — set/override the profile's node-hostname DNS policy (`--clear`) |
 | `vender profiles rm <name>` | implemented (M7) — removes a profile's servers; refuses the built-in `manual` |
 | `vender rules list` | implemented (M2; merged policy in M5) — the ordered policy, DNS split and embedded sets |
 | `vender rules path` / `vender rules init` | implemented (M5) — the user rules file (`rules.yaml`) |
@@ -595,6 +659,9 @@ possible. It emits up to five top-level sections — `log`, `dns`, `inbounds`,
 - `engine.bind_interface`, when set, is passed through to the outbound, which
   pins the connection to the proxy server to a specific interface on a
   multi-homed (or TUN-hijacked) host.
+- a server whose profile declared a DNS policy for its hostname carries a
+  `domain_resolver` naming the profile's resolver, and that resolver is added to
+  `dns.servers` (§7.7). Nothing else changes when no policy applies.
 
 M3 adds a sixth top-level section, `experimental`, and only when the caller
 asks for it:
@@ -1056,6 +1123,59 @@ the renderer and by the controller's failover reporting.
 - **User rules add no rule sets.** A user entry is a domain/suffix/CIDR, so the
   embedded set list (and therefore the extraction cost) is unchanged by
   `rules.yaml`.
+
+### 7.7 Resolving a node's own hostname (M8)
+
+The client-facing split DNS above answers *the user's applications'* queries.
+The engine dialling an outbound is a different path: it must resolve the node's
+`server` address itself, and for a provider's `entry` domains that must be the
+provider's resolver (§4.6). In sing-box 1.14 the lever is the outbound's
+**`domain_resolver`**, a dial field that names a DNS server tag; the route's
+`default_domain_resolver` is the fallback for everything that names none.
+
+`core.buildProfileDNSPlan` turns the active policies into that:
+
+```
+dns.servers:  … , {tag: dns-system, type: local},
+              {tag: profile-dns-1, type: tcp, server: <provider host>,
+               server_port: 8080, domain_resolver: {server: dns-system}}
+outbounds:    {type: shadowsocks, …, server: <entry host>,
+               domain_resolver: {server: profile-dns-1}}
+```
+
+Five points are load-bearing:
+
+- **Per node, not per profile.** For each rendered server the plan looks up the
+  policy of *the profile that server belongs to* and matches its hostname
+  against the namespace policy (longest suffix wins). A node under a domain the
+  policy does not cover gets no `domain_resolver` and keeps the built-in
+  resolver — which is why this subscription's VMess nodes are unaffected.
+- **Tags are stable and ordered** (`profile-dns-1`, … by first use), so the
+  rendered document is deterministic and golden-testable.
+- **A name-based resolver needs a bootstrap.** The provider's resolver is itself
+  reached by name (`…fyi`), so it needs a `domain_resolver` of its own. vender
+  adds one `local`-type server, `dns-system`, which uses the host's own resolver
+  with no query that could be captured by the engine's own tunnel or depend on
+  the policy being bootstrapped. An IP-literal resolver does not point at it.
+- **The resolvers are reached directly.** No `detour` is emitted, so a query
+  never leaves through the proxy; and when `engine.bind_interface` is set the
+  resolver's dial is pinned to the same interface as the outbound, because on a
+  multi-homed (or TUN) host it is part of the engine's own dial path.
+- **No policy is byte-identical to M7.** The plan is empty unless a rendered
+  node matches a policy, and the only fields it can add are the ones above; a
+  golden test asserts that an absent, an empty, and an unrelated policy all
+  render exactly like M7.
+
+FakeIP is untouched and unrelated: it answers *client* address queries for
+proxied domains and never leaves the machine, while the node's own hostname is
+resolved at dial time by the provider's resolver. `global` mode gains a
+`default_domain_resolver` naming `dns-system` when a policy applies, because the
+extra resolvers otherwise leave the `direct` outbound's dial field without one —
+a hard error in sing-box 1.14.
+
+`sing-box check` (skipped without an engine binary, like §6.5) validates the
+`domain_resolver`, `local`, `tcp`-with-`server_port` and `bind_interface` shapes
+against the pinned binary in rule and global mode, single and auto.
 
 ## 8. Control channel (`internal/control`) — implemented in M3
 

@@ -25,20 +25,30 @@ nodes my provider gave me". Every server carries a profile name; the built-in
 ` + "`manual`" + ` profile holds everything imported by hand and always exists.
 
   vender profiles list             every profile, its node count and source URL
+  vender profiles show [name]      one profile in full, including its DNS policy
   vender profiles use <name>       make a profile active
   vender profiles update [name]    re-fetch a profile's subscription
+  vender profiles set-dns <name>   set/override the profile's DNS policy
   vender profiles rm <name>        remove a profile and its servers
 
 What "active" means: with ` + "`selected_server: auto`" + `, the engine runs a URLTest
 failover group over the *active profile's* servers only, so switching profiles
 switches which nodes it may use. Naming a specific server with
 ` + "`vender servers use <name>`" + ` still works and implies nothing about the
-profile. Use ` + "`vender profiles use all`" + ` to fail over over every server.`,
+profile. Use ` + "`vender profiles use all`" + ` to fail over over every server.
+
+The DNS policy is separate from the client-facing split DNS: it tells the
+engine which resolver answers for the *profile's node hostnames* (a provider's
+entry domains are resolved by the provider's own DNS, not public DNS). It is
+captured at import and overridable with ` + "`profiles set-dns`" + `.
+`,
 	}
 	cmd.AddCommand(
 		a.newProfilesListCmd(),
+		a.newProfilesShowCmd(),
 		a.newProfilesUseCmd(),
 		a.newProfilesUpdateCmd(),
+		a.newProfilesSetDNSCmd(),
 		a.newProfilesRmCmd(),
 	)
 	return cmd
@@ -67,24 +77,25 @@ func (a *app) newProfilesListCmd() *cobra.Command {
 
 			names := config.KnownProfiles(ss, ps)
 			w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "ACTIVE\tPROFILE\tNODES\tUPDATED\tSOURCE URL")
+			fmt.Fprintln(w, "ACTIVE\tPROFILE\tNODES\tDNS\tUPDATED\tSOURCE URL")
 			for _, name := range names {
 				mark := "  "
 				if strings.EqualFold(name, active) {
 					mark = "*"
 				}
-				url, updated := "", ""
+				url, updated, dns := "", "", "-"
 				if p, ok := ps.Get(name); ok {
 					url = redactURL(p.URL)
 					if !p.FetchedAt.IsZero() {
 						updated = p.FetchedAt.Format("2006-01-02 15:04")
 					}
+					dns = dnsSummary(p.DNS)
 				}
 				note := ""
 				if strings.EqualFold(name, config.ProfileManual) {
 					note = "(built-in)"
 				}
-				fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\n", mark, name, ss.CountInProfile(name), updated, firstNonEmptyStr(url, note))
+				fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\n", mark, name, ss.CountInProfile(name), dns, updated, firstNonEmptyStr(url, note))
 			}
 			if err := w.Flush(); err != nil {
 				return err
@@ -235,7 +246,7 @@ by ` + "`vender import --url`" + ` (a hand-made profile has no URL to fetch).`,
 				return fmt.Errorf("profiles update: %w", err)
 			}
 
-			stats, canonical, err := store.ProfileImport(prof.Name, prof.URL, time.Now(), res.Servers, true, false)
+			stats, canonical, err := store.ProfileImport(prof.Name, prof.URL, time.Now(), res.Servers, res.DNS, true, false)
 			if err != nil {
 				return fmt.Errorf("profiles update: %w", err)
 			}
@@ -244,6 +255,7 @@ by ` + "`vender import --url`" + ` (a hand-made profile has no URL to fetch).`,
 			printImportSkips(out, res.Skipped)
 			reportConflicts(out, stats)
 			printRemoved(out, stats.Removed)
+			printProfileDNS(out, res.DNS)
 			if n, serr := a.keepSelectionSane(store); serr != nil {
 				fmt.Fprintf(out, "  warning: %v\n", serr)
 			} else if n != "" {
@@ -306,4 +318,16 @@ func firstNonEmptyStr(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// dnsSummary is the one-column `profiles list` view of a profile's DNS policy.
+func dnsSummary(d *config.ProfileDNS) string {
+	if !d.Applied() {
+		return "-"
+	}
+	if n := len(d.NamespacePolicy); n == 1 {
+		return "1 rule"
+	} else {
+		return fmt.Sprintf("%d rules", n)
+	}
 }

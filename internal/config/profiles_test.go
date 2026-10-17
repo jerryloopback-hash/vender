@@ -228,7 +228,7 @@ func TestStoreProfileImportAndSelect(t *testing.T) {
 
 	fetched := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
 	sub := []Server{ssServer("Provider-A", ""), ssServer("Provider-B", "")}
-	stats, profile, err := store.ProfileImport("provider", "https://sub.example.com/api?token=x", fetched, sub, false, false)
+	stats, profile, err := store.ProfileImport("provider", "https://sub.example.com/api?token=x", fetched, sub, nil, false, false)
 	if err != nil {
 		t.Fatalf("ProfileImport: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestStoreProfileImportAndSelect(t *testing.T) {
 	}
 
 	// A second, identical import changes nothing.
-	stats2, _, err := store.ProfileImport("provider", "https://sub.example.com/api?token=x", fetched, sub, false, false)
+	stats2, _, err := store.ProfileImport("provider", "https://sub.example.com/api?token=x", fetched, sub, nil, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +276,7 @@ func TestStoreProfileImportAndSelect(t *testing.T) {
 
 	// A changed node is updated in place; a new one is added.
 	changed := []Server{ssServer("Provider-A", ""), ssServer("Provider-C", "")}
-	stats3, _, err := store.ProfileImport("provider", "https://sub.example.com/api?token=x", fetched, changed, false, false)
+	stats3, _, err := store.ProfileImport("provider", "https://sub.example.com/api?token=x", fetched, changed, nil, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +291,7 @@ func TestStoreProfileImportAndSelect(t *testing.T) {
 	}
 
 	// A name used in another profile is a conflict, not a silent overwrite.
-	stats4, _, err := store.ProfileImport("other", "https://o.example.com/x", fetched, []Server{ssServer("hand-node", "")}, false, false)
+	stats4, _, err := store.ProfileImport("other", "https://o.example.com/x", fetched, []Server{ssServer("hand-node", "")}, nil, false, false)
 	if err != nil {
 		t.Fatalf("import into another profile: %v", err)
 	}
@@ -343,7 +343,7 @@ func TestStoreProfileImportAndSelect(t *testing.T) {
 func TestProfileImportRefusesManual(t *testing.T) {
 	store := NewStoreAt(t.TempDir())
 	for _, name := range []string{"manual", "", "all"} {
-		if _, _, err := store.ProfileImport(name, "https://x", time.Now(), nil, false, false); err == nil {
+		if _, _, err := store.ProfileImport(name, "https://x", time.Now(), nil, nil, false, false); err == nil {
 			t.Errorf("ProfileImport(%q) = nil error, want a refusal", name)
 		}
 	}
@@ -358,7 +358,7 @@ func TestStoreRemoveProfile(t *testing.T) {
 	if err := store.SaveServers(ss); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.ProfileImport("provider", "https://x", time.Now(), []Server{ssServer("prov-1", ""), ssServer("prov-2", "")}, false, false); err != nil {
+	if _, _, err := store.ProfileImport("provider", "https://x", time.Now(), []Server{ssServer("prov-1", ""), ssServer("prov-2", "")}, nil, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.SelectProfile("provider"); err != nil {

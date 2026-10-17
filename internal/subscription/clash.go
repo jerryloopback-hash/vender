@@ -26,6 +26,112 @@ type clashDoc struct {
 	// Classic used in some exports.
 	Proxies []clashProxy `yaml:"proxies"`
 	Proxy   []clashProxy `yaml:"Proxy"`
+	// DNS is the provider's DNS policy. Only dns.nameserver-policy (the
+	// explicit per-domain instruction) actually changes how vender resolves a
+	// node hostname; dns.nameserver / dns.fallback are captured for auditing.
+	DNS *clashDNS `yaml:"dns"`
+}
+
+// clashDNS is a provider's `dns:` block, decoded by hand so the
+// nameserver-policy keeps its document order (a map would not) and so the raw
+// block can be stored verbatim.
+type clashDNS struct {
+	// Policy is the nameserver-policy in document order.
+	Policy []clashDNSPolicy
+	// Nameservers and Fallback are the default resolver lists.
+	Nameservers []string
+	Fallback    []string
+	// Raw is the `dns:` block as YAML, exactly as the provider wrote it.
+	Raw string
+}
+
+type clashDNSPolicy struct {
+	Domain  string
+	Servers []string
+}
+
+// UnmarshalYAML decodes the dns mapping generously: keys are matched
+// case-insensitively and accept both the dashed and underscored spelling, and
+// every list is also accepted as a single scalar (panels disagree).
+func (d *clashDNS) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode && node.Value == "" {
+		return nil
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	if raw, err := yaml.Marshal(node); err == nil {
+		d.Raw = string(raw)
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(node.Content[i].Value), "_", "-"))
+		val := node.Content[i+1]
+		switch key {
+		case "nameserver-policy":
+			if val.Kind == yaml.MappingNode {
+				for j := 0; j+1 < len(val.Content); j += 2 {
+					d.Policy = append(d.Policy, clashDNSPolicy{
+						Domain:  strings.TrimSpace(val.Content[j].Value),
+						Servers: nodeStrings(val.Content[j+1]),
+					})
+				}
+			}
+		case "nameserver":
+			d.Nameservers = nodeStrings(val)
+		case "fallback":
+			d.Fallback = nodeStrings(val)
+		}
+	}
+	return nil
+}
+
+// nodeStrings reads a scalar or a sequence of scalars as a string list.
+func nodeStrings(node *yaml.Node) []string {
+	if node == nil {
+		return nil
+	}
+	switch node.Kind {
+	case yaml.ScalarNode:
+		if s := strings.TrimSpace(node.Value); s != "" {
+			return []string{s}
+		}
+	case yaml.SequenceNode:
+		var out []string
+		for _, n := range node.Content {
+			if s := strings.TrimSpace(n.Value); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// profileDNS converts the decoded dns block into the policy vender stores.
+// Only the nameserver-policy is applied; the default lists ride along as
+// metadata. It returns nil when the provider declared nothing usable.
+func (d *clashDNS) profileDNS() *config.ProfileDNS {
+	if d == nil {
+		return nil
+	}
+	out := &config.ProfileDNS{Nameservers: d.Nameservers, Fallback: d.Fallback, Raw: d.Raw}
+	for _, p := range d.Policy {
+		if len(p.Servers) == 0 {
+			continue
+		}
+		// A pattern may list several servers (Clash tries them in order);
+		// vender's outbound resolver is a single endpoint, so the first is
+		// used and the rest stay visible in Raw.
+		out.NamespacePolicy = append(out.NamespacePolicy, config.DNSNamespacePolicy{
+			Domain: p.Domain,
+			Server: p.Servers[0],
+		})
+	}
+	out.Normalize()
+	if out.IsEmpty() {
+		return nil
+	}
+	return out
 }
 
 type clashProxy struct {
@@ -103,6 +209,7 @@ func ParseClash(data []byte) (Result, error) {
 	if len(res.Servers) == 0 && len(nodes) == 0 {
 		return res, fmt.Errorf("subscription: no `proxies:` list in the Clash YAML")
 	}
+	res.DNS = doc.DNS.profileDNS()
 	return res, nil
 }
 

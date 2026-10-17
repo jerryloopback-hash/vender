@@ -65,6 +65,10 @@ type Skipped struct {
 type Result struct {
 	Servers []config.Server
 	Skipped []Skipped
+	// DNS is the DNS policy the subscription declared for its node hostnames
+	// (see config.ProfileDNS). It is nil for a link list, which carries no
+	// such policy, and for a Clash document that does not declare one.
+	DNS *config.ProfileDNS
 }
 
 // ErrEmpty marks a subscription that parsed to nothing usable.

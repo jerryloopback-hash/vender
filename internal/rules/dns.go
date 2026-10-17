@@ -37,16 +37,34 @@ const (
 type DNSServer struct {
 	// Tag is how DNS rules refer to this server.
 	Tag string
-	// Type is a sing-box DNS transport: "udp", "tls", "https" or "fakeip".
+	// Type is a sing-box DNS transport: "udp", "tls", "https", "fakeip" or
+	// "local".
 	Type string
 	// Server is the resolver address. An IP literal, so the resolver itself
-	// never needs a resolver. Empty for the fakeip type, which has no upstream.
+	// never needs a resolver. Empty for the fakeip and local types, which
+	// have no upstream address.
 	Server string
+	// Port is the resolver's port. Zero keeps sing-box's per-type default
+	// (53 for udp/tcp, 853 for tls, 443 for https).
+	Port int
+	// Path is the DoH endpoint path (type "https" only); empty keeps
+	// sing-box's /dns-query.
+	Path string
 	// Detour is the outbound tag the query is sent through; empty means
 	// "direct". A DNS server with an empty detour must not be given an empty
 	// `direct` outbound: sing-box 1.14 rejects "detour to an empty direct
 	// outbound".
 	Detour string
+	// BindInterface pins the resolver's own dial to an interface, exactly as
+	// it does for an outbound. It is set for a profile's own resolvers when
+	// engine.bind_interface is, so they are reached directly on a multi-homed
+	// or TUN host.
+	BindInterface string
+	// DomainResolver resolves *this resolver's own* endpoint hostname through
+	// another DNS server. It is what lets a name-based resolver (the
+	// provider's DNS is one) be reached directly, without a bootstrap that
+	// depends on the split policy.
+	DomainResolver string
 	// Inet4Range/Inet6Range are the FakeIP pools (type "fakeip" only).
 	Inet4Range string
 	Inet6Range string

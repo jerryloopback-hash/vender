@@ -25,13 +25,15 @@ The pinned engine is **sing-box 1.14.3** (see `scripts/fetch-sing-box.sh`).
 
 ## Status
 
-`vender` is at **M7**: the configuration layer and share-link parser (M0), the
+`vender` is at **M8**: the configuration layer and share-link parser (M0), the
 engine (M1), **smart routing out of the box** (M2), an **animated terminal UI**
 (M3), **start at login on Linux and Windows 11**, **Windows system-proxy
 control** and **release packaging** (M4), an optional **TUN mode** — transparent,
-system-wide capture on top of the same engine and the same policy (M6), and now
+system-wide capture on top of the same engine and the same policy (M6),
 **subscription import, named profiles and the three remaining outbound
-protocols** (M7).
+protocols** (M7), and now **a provider's own DNS policy for its node
+hostnames**, so a Shadowsocks subscription resolves the way the provider
+requires instead of to a decoy address (M8).
 
 M5 hardens the whole thing against a bad link: a tiny **critical list** and an
 optional **`rules.yaml`** that no proxy can cut off, a **DNS split that never
@@ -58,6 +60,7 @@ left.
 | **M5** | **Robustness**: critical "must survive a dead proxy" list, user `rules.yaml`, proxy-independent split DNS (FakeIP), `selected_server: auto` failover and node health in the TUI |
 | **M6** | **Optional TUN mode** (transparent system-wide capture, `vender tun on\|off\|status`, TUN-aware autostart) |
 | **M7** | **Subscription import and profiles**, plus Shadowsocks / VMess / Trojan outbounds (`vender import --url`, `vender profiles …`). Deferred to a later line: latency ranking, log rotation, signed builds |
+| **M8** | **A provider's DNS policy for its node hostnames**: captured at import into `profiles.yaml`, applied through the outbound's `domain_resolver`, overridable with `vender profiles set-dns` and visible in `vender profiles list` / `show` |
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and the
 interfaces between milestones.
@@ -220,11 +223,50 @@ the subscription URL's host. A profile's metadata is kept in `profiles.yaml`
 that file alone always tells you which nodes belong together.
 
 ```sh
-./vender profiles list           # ACTIVE / PROFILE / NODES / UPDATED / SOURCE URL
+./vender profiles list           # ACTIVE / PROFILE / NODES / DNS / UPDATED / SOURCE URL
+./vender profiles show provider  # one profile in full, including its DNS policy
 ./vender profiles use provider   # make it active
 ./vender profiles update         # re-fetch: add new, update changed, drop gone
 ./vender profiles rm provider    # remove the profile and its servers
 ```
+
+### Profile DNS policy (the provider's own DNS)
+
+Some providers give their nodes hostnames that **public DNS answers wrongly** —
+a "blackhole" address from outside China, or a shared address that does not
+carry their traffic. The provider says which resolver to use in the `dns` block
+of its config:
+
+```yaml
+dns:
+  nameserver-policy:
+    +.v51124-6.qpon: tcp://f892…fyi:8080
+```
+
+vender **captures that policy at import** and stores it with the profile in
+`profiles.yaml`; the table above shows it as a `DNS` column, and
+`profiles show` prints it in full (including the raw block, for auditing).
+Without it, every one of that provider's Shadowsocks nodes resolves to a decoy
+address and its tunnel carries no traffic.
+
+This is a **separate thing from the split DNS** that answers your applications'
+lookups. The policy here is only about the engine resolving a *node's own
+hostname* when it dials it; your client queries still follow the built-in
+policy (FakeIP for anything proxied). Nodes under a domain the policy does not
+cover — a provider's VMess nodes on a public CDN domain, for instance — keep
+using the built-in resolver, unchanged.
+
+A provider whose policy is missing or wrong is fixable by hand:
+
+```sh
+./vender profiles set-dns provider --domain v51124-6.qpon --server 'tcp://dns.example:8080'
+./vender profiles set-dns provider --clear    # go back to the built-in resolver
+```
+
+`--domain` is a suffix pattern (`+.x` / `*.x` / bare `x` all mean the domain and
+its subdomains); `--domain`/`--server` may be repeated to declare several rules.
+A hand-set policy survives a later `profiles update` of a subscription that does
+not declare one.
 
 **What "active" means.** It changes exactly one thing: with
 `selected_server: auto`, the failover group is built over the **active profile's**

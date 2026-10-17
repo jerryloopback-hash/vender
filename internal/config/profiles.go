@@ -44,6 +44,10 @@ type Profile struct {
 	// FetchedAt is when the subscription was last successfully fetched. The
 	// zero value means "never fetched" (the profile was created by hand).
 	FetchedAt time.Time `yaml:"fetched_at,omitempty"`
+	// DNS is the profile's captured DNS policy: which resolver answers for
+	// the profile's node hostnames. It is nil for a profile without one, and
+	// a nil policy changes nothing (see profiledns.go).
+	DNS *ProfileDNS `yaml:"dns,omitempty"`
 }
 
 // ProfileSet is the contents of profiles.yaml.
@@ -83,6 +87,10 @@ func (ps *ProfileSet) Normalize() {
 		}
 		seen[key] = true
 		p.URL = strings.TrimSpace(p.URL)
+		p.DNS.Normalize()
+		if p.DNS.IsEmpty() {
+			p.DNS = nil
+		}
 		out = append(out, p)
 	}
 	ps.Profiles = out
@@ -139,10 +147,22 @@ func (ps *ProfileSet) Upsert(p Profile) *Profile {
 		if !p.FetchedAt.IsZero() {
 			existing.FetchedAt = p.FetchedAt
 		}
+		if p.DNS != nil {
+			existing.DNS = p.DNS.Clone()
+			existing.DNS.Normalize()
+			if existing.DNS.IsEmpty() {
+				existing.DNS = nil
+			}
+		}
 		return existing
 	}
 	p.Name = strings.TrimSpace(p.Name)
 	p.URL = strings.TrimSpace(p.URL)
+	p.DNS = p.DNS.Clone()
+	p.DNS.Normalize()
+	if p.DNS.IsEmpty() {
+		p.DNS = nil
+	}
 	ps.Profiles = append(ps.Profiles, p)
 	return &ps.Profiles[len(ps.Profiles)-1]
 }
@@ -171,6 +191,57 @@ func (ps *ProfileSet) RegisteredNames() []string {
 		out = append(out, ps.Profiles[i].Name)
 	}
 	return out
+}
+
+// DNSMap returns each profile's DNS policy keyed by the lower-cased profile
+// name. It is what the daemon and the controller hand to the renderer, so a
+// server can look up the policy of the profile it belongs to. Profiles without
+// an applied policy are omitted, which is what makes "no policy" a no-op.
+func (ps *ProfileSet) DNSMap() map[string]*ProfileDNS {
+	if ps == nil {
+		return nil
+	}
+	out := make(map[string]*ProfileDNS)
+	for i := range ps.Profiles {
+		if ps.Profiles[i].DNS.Applied() {
+			out[strings.ToLower(ps.Profiles[i].Name)] = ps.Profiles[i].DNS
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// SetDNS replaces a profile's DNS policy (nil clears it), creating the registry
+// entry when the profile is known only through its servers. It returns the
+// canonical profile name.
+func (ps *ProfileSet) SetDNS(name string, dns *ProfileDNS) (string, error) {
+	if ps == nil {
+		return "", fmt.Errorf("no profile registry")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || strings.EqualFold(name, ProfileManual) {
+		return "", fmt.Errorf("the built-in %q profile has no subscription and no DNS policy to set", ProfileManual)
+	}
+	p, ok := ps.Get(name)
+	if !ok {
+		p = ps.Upsert(Profile{Name: name})
+		if p == nil {
+			return "", fmt.Errorf("profile name %q is not valid", name)
+		}
+	}
+	if dns != nil {
+		cp := dns.Clone()
+		cp.Normalize()
+		if cp.IsEmpty() {
+			cp = nil
+		}
+		p.DNS = cp
+	} else {
+		p.DNS = nil
+	}
+	return p.Name, nil
 }
 
 // KnownProfiles returns every profile vender knows about: the built-in manual
@@ -381,6 +452,15 @@ func (ps *ProfileSet) Validate() error {
 			continue
 		}
 		seen[key] = true
+		if derr := p.DNS.Validate(); derr != nil {
+			if ve, ok := derr.(*ValidationError); ok {
+				for _, prob := range ve.Problems {
+					problems = append(problems, fmt.Sprintf("profile %q: %s", name, prob))
+				}
+			} else {
+				problems = append(problems, fmt.Sprintf("profile %q: %v", name, derr))
+			}
+		}
 	}
 	if len(problems) > 0 {
 		return &ValidationError{Subject: ProfilesFileName, Problems: problems}

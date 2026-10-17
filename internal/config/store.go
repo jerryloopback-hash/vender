@@ -46,7 +46,8 @@ const serversHeader = "# vender server list. Contains credentials: keep this fil
 
 // profilesHeader is prepended to profiles.yaml.
 const profilesHeader = "# vender profile registry: which server groups exist, where each subscription\n" +
-	"# came from, and which profile `selected_server: auto` currently scopes to.\n" +
+	"# came from, its captured DNS policy for the profile's node hostnames, and\n" +
+	"# which profile `selected_server: auto` currently scopes to.\n" +
 	"# Contains no server credentials, but a subscription URL may carry a token, so\n" +
 	"# it is written with mode 0600. Managed by `vender import --url` / `vender profiles`.\n"
 
@@ -428,13 +429,18 @@ func (ss *ServerSet) RemoveServersExcept(profile string, keep []string) []string
 	return removed
 }
 
-// ProfileImport adds servers under a profile, records its URL and fetch time,
-// and persists both files. When replace is true the profile's previous servers
-// are dropped first (a bulk subscription refresh); otherwise new and changed
-// entries are merged in and nothing is removed.
+// ProfileImport adds servers under a profile, records its URL, fetch time and
+// captured DNS policy, and persists both files. When replace is true the
+// profile's previous servers are dropped first (a bulk subscription refresh);
+// otherwise new and changed entries are merged in and nothing is removed.
+//
+// dns is the policy captured from the subscription. A nil dns leaves an
+// existing policy alone, so a manual `profiles set-dns` override survives a
+// refresh of a subscription that does not declare one; a non-nil dns replaces
+// it (including with an empty policy, if the source stopped declaring one).
 //
 // It returns the stats and the (normalized) profile name that was used.
-func (s *Store) ProfileImport(profile, url string, fetchedAt time.Time, servers []Server, replace, force bool) (ImportStats, string, error) {
+func (s *Store) ProfileImport(profile, url string, fetchedAt time.Time, servers []Server, dns *ProfileDNS, replace, force bool) (ImportStats, string, error) {
 	profile = normalizeProfileName(profile)
 	if profile == "" {
 		profile = ProfileManual
@@ -464,8 +470,17 @@ func (s *Store) ProfileImport(profile, url string, fetchedAt time.Time, servers 
 	}
 	merged.Removed = stats.Removed
 	stats = merged
-	if ps.Upsert(Profile{Name: profile, URL: url, FetchedAt: fetchedAt}) == nil {
+	prof := ps.Upsert(Profile{Name: profile, URL: url, FetchedAt: fetchedAt})
+	if prof == nil {
 		return stats, profile, fmt.Errorf("profile name %q is not valid", profile)
+	}
+	if dns != nil {
+		cp := dns.Clone()
+		cp.Normalize()
+		if cp.IsEmpty() {
+			cp = nil
+		}
+		prof.DNS = cp
 	}
 	if err := s.SaveServers(ss); err != nil {
 		return stats, profile, err
@@ -474,6 +489,35 @@ func (s *Store) ProfileImport(profile, url string, fetchedAt time.Time, servers 
 		return stats, profile, err
 	}
 	return stats, profile, nil
+}
+
+// SetProfileDNS replaces a profile's DNS policy in profiles.yaml, creating the
+// registry entry when the profile is known only through servers.yaml. A nil
+// policy clears it. It returns the canonical profile name.
+func (s *Store) SetProfileDNS(name string, dns *ProfileDNS) (string, error) {
+	ps, err := s.LoadProfiles()
+	if err != nil {
+		return "", err
+	}
+	ss, err := s.LoadServers()
+	if err != nil {
+		return "", err
+	}
+	canonical, ok := KnownProfileName(ss, ps, name)
+	if !ok {
+		return "", fmt.Errorf("%w: profile %q (see `vender profiles list`)", ErrNotFound, name)
+	}
+	if canonical == ProfileAll {
+		return "", fmt.Errorf("refusing to set a DNS policy on %q: name a single profile", ProfileAll)
+	}
+	name, err = ps.SetDNS(canonical, dns)
+	if err != nil {
+		return "", err
+	}
+	if err := s.SaveProfiles(ps); err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 // SelectProfile sets profiles.yaml's active profile: the pool

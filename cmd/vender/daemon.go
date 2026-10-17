@@ -111,6 +111,7 @@ func (a *app) runDaemon(cmd *cobra.Command) error {
 		Server:     srv,
 		Servers:    allServers,
 		UserRules:  userRules,
+		ProfileDNS: profiles.DNSMap(),
 		BinaryPath: binaryPath,
 		RunDir:     runDir,
 	}

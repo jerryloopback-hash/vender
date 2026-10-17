@@ -28,6 +28,17 @@ const (
 	tagMixed = "mixed-in"
 	// tagTun is the tag of the optional TUN inbound.
 	tagTun = "tun-in"
+
+	// tagDNSSystem is the local, system-backed resolver vender adds when a
+	// profile resolver's own address is a name: it resolves the provider's DNS
+	// endpoint, which must not depend on the split policy (or the proxy) that
+	// is being bootstrapped. It is a `local` server, so it uses the host's own
+	// resolver with no network query that could be captured by the engine's
+	// own tunnel.
+	tagDNSSystem = "dns-system"
+	// profileDNSTagPrefix names the resolvers captured from a profile's
+	// subscription: profile-dns-1, profile-dns-2, … in first-use order.
+	profileDNSTagPrefix = "profile-dns-"
 )
 
 // Failover knobs for the URLTest group (selected_server: "auto").
@@ -85,10 +96,20 @@ type singboxDNSServer struct {
 	Tag    string `json:"tag"`
 	Type   string `json:"type"`
 	Server string `json:"server,omitempty"`
+	// ServerPort is the resolver's port; absent keeps sing-box's per-type
+	// default.
+	ServerPort int `json:"server_port,omitempty"`
+	// Path is the DoH endpoint path (type "https" only).
+	Path string `json:"path,omitempty"`
 	// Detour is the outbound the query leaves through. It is omitted for the
 	// domestic and FakeIP resolvers, which are local; sing-box 1.14 rejects a
 	// detour to the empty `direct` outbound vender otherwise emits.
 	Detour string `json:"detour,omitempty"`
+	// BindInterface pins the resolver's own dial, like an outbound's.
+	BindInterface string `json:"bind_interface,omitempty"`
+	// DomainResolver resolves this resolver's own endpoint name (a provider's
+	// DNS is reached by name) without going through the split policy.
+	DomainResolver *singboxDomainResolver `json:"domain_resolver,omitempty"`
 	// Inet4Range/Inet6Range are the FakeIP pools (type "fakeip" only).
 	Inet4Range string `json:"inet4_range,omitempty"`
 	Inet6Range string `json:"inet6_range,omitempty"`
@@ -195,25 +216,27 @@ type singboxRule struct {
 // --- outbound dialects -----------------------------------------------------
 
 type vlessOutbound struct {
-	Type          string     `json:"type"`
-	Tag           string     `json:"tag"`
-	Server        string     `json:"server"`
-	ServerPort    int        `json:"server_port"`
-	UUID          string     `json:"uuid"`
-	Flow          string     `json:"flow,omitempty"`
-	BindInterface string     `json:"bind_interface,omitempty"`
-	TLS           *tlsConfig `json:"tls,omitempty"`
+	Type           string                 `json:"type"`
+	Tag            string                 `json:"tag"`
+	Server         string                 `json:"server"`
+	ServerPort     int                    `json:"server_port"`
+	UUID           string                 `json:"uuid"`
+	Flow           string                 `json:"flow,omitempty"`
+	DomainResolver *singboxDomainResolver `json:"domain_resolver,omitempty"`
+	BindInterface  string                 `json:"bind_interface,omitempty"`
+	TLS            *tlsConfig             `json:"tls,omitempty"`
 }
 
 type hysteria2Outbound struct {
-	Type          string     `json:"type"`
-	Tag           string     `json:"tag"`
-	Server        string     `json:"server"`
-	ServerPort    int        `json:"server_port"`
-	Password      string     `json:"password"`
-	Obfs          *hy2Obfs   `json:"obfs,omitempty"`
-	BindInterface string     `json:"bind_interface,omitempty"`
-	TLS           *tlsConfig `json:"tls,omitempty"`
+	Type           string                 `json:"type"`
+	Tag            string                 `json:"tag"`
+	Server         string                 `json:"server"`
+	ServerPort     int                    `json:"server_port"`
+	Password       string                 `json:"password"`
+	Obfs           *hy2Obfs               `json:"obfs,omitempty"`
+	DomainResolver *singboxDomainResolver `json:"domain_resolver,omitempty"`
+	BindInterface  string                 `json:"bind_interface,omitempty"`
+	TLS            *tlsConfig             `json:"tls,omitempty"`
 }
 
 type hy2Obfs struct {
@@ -225,41 +248,44 @@ type hy2Obfs struct {
 // SIP003 plugins are deliberately not rendered (a link needing one is rejected
 // at parse time).
 type shadowsocksOutbound struct {
-	Type          string `json:"type"`
-	Tag           string `json:"tag"`
-	Server        string `json:"server"`
-	ServerPort    int    `json:"server_port"`
-	Method        string `json:"method"`
-	Password      string `json:"password"`
-	BindInterface string `json:"bind_interface,omitempty"`
+	Type           string                 `json:"type"`
+	Tag            string                 `json:"tag"`
+	Server         string                 `json:"server"`
+	ServerPort     int                    `json:"server_port"`
+	Method         string                 `json:"method"`
+	Password       string                 `json:"password"`
+	DomainResolver *singboxDomainResolver `json:"domain_resolver,omitempty"`
+	BindInterface  string                 `json:"bind_interface,omitempty"`
 }
 
 // vmessOutbound renders a VMess server. Security is the vmess cipher ("auto",
 // "aes-128-gcm", ...), AlterID its "aid".
 type vmessOutbound struct {
-	Type          string          `json:"type"`
-	Tag           string          `json:"tag"`
-	Server        string          `json:"server"`
-	ServerPort    int             `json:"server_port"`
-	UUID          string          `json:"uuid"`
-	Security      string          `json:"security,omitempty"`
-	AlterID       int             `json:"alter_id,omitempty"`
-	BindInterface string          `json:"bind_interface,omitempty"`
-	TLS           *tlsConfig      `json:"tls,omitempty"`
-	Transport     *v2rayTransport `json:"transport,omitempty"`
+	Type           string                 `json:"type"`
+	Tag            string                 `json:"tag"`
+	Server         string                 `json:"server"`
+	ServerPort     int                    `json:"server_port"`
+	UUID           string                 `json:"uuid"`
+	Security       string                 `json:"security,omitempty"`
+	AlterID        int                    `json:"alter_id,omitempty"`
+	DomainResolver *singboxDomainResolver `json:"domain_resolver,omitempty"`
+	BindInterface  string                 `json:"bind_interface,omitempty"`
+	TLS            *tlsConfig             `json:"tls,omitempty"`
+	Transport      *v2rayTransport        `json:"transport,omitempty"`
 }
 
 // trojanOutbound renders a Trojan server. TLS is always present: Trojan has no
 // plaintext variant.
 type trojanOutbound struct {
-	Type          string          `json:"type"`
-	Tag           string          `json:"tag"`
-	Server        string          `json:"server"`
-	ServerPort    int             `json:"server_port"`
-	Password      string          `json:"password"`
-	BindInterface string          `json:"bind_interface,omitempty"`
-	TLS           *tlsConfig      `json:"tls,omitempty"`
-	Transport     *v2rayTransport `json:"transport,omitempty"`
+	Type           string                 `json:"type"`
+	Tag            string                 `json:"tag"`
+	Server         string                 `json:"server"`
+	ServerPort     int                    `json:"server_port"`
+	Password       string                 `json:"password"`
+	DomainResolver *singboxDomainResolver `json:"domain_resolver,omitempty"`
+	BindInterface  string                 `json:"bind_interface,omitempty"`
+	TLS            *tlsConfig             `json:"tls,omitempty"`
+	Transport      *v2rayTransport        `json:"transport,omitempty"`
 }
 
 // v2rayTransport is the transport block shared by vmess and trojan. Which
@@ -360,6 +386,18 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 	direct := plainOutbound{Type: "direct", Tag: tagDirect}
 	block := plainOutbound{Type: "block", Tag: tagBlock}
 
+	// The profile DNS plan is built before the outbounds because it decides
+	// each outbound's own `domain_resolver`, and again before the DNS section
+	// because it contributes the resolvers those outbounds point at. Servers
+	// are registered in render order so the tags (profile-dns-1, …) are
+	// stable.
+	plan := newProfileDNSPlan(rc)
+	for _, srv := range rc.renderedServers() {
+		if _, err := plan.resolverFor(srv); err != nil {
+			return nil, err
+		}
+	}
+
 	final := tagDirect
 	switch {
 	case rc.Config.Proxy.Mode == config.ModeDirect:
@@ -368,14 +406,14 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 		cfg.Outbounds = []any{direct, block}
 	case rc.Config.IsAutoServer():
 		// Auto mode renders every server plus a URLTest group tagged `proxy`.
-		outbounds, err := buildAutoOutbounds(rc)
+		outbounds, err := buildAutoOutbounds(rc, plan)
 		if err != nil {
 			return nil, err
 		}
 		cfg.Outbounds = append(outbounds, direct, block)
 		final = tagProxy
 	default:
-		proxy, err := buildOutbound(rc)
+		proxy, err := buildOutbound(rc, plan)
 		if err != nil {
 			return nil, err
 		}
@@ -413,7 +451,7 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 
 	switch rc.Config.Proxy.Mode {
 	case config.ModeRule:
-		dns, err := buildDNS(rules.RuleModeDNS(rc.UserRules))
+		dns, err := buildDNS(withProfileResolvers(rules.RuleModeDNS(rc.UserRules), plan))
 		if err != nil {
 			return nil, err
 		}
@@ -438,17 +476,26 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 		}
 
 	case config.ModeGlobal:
-		dns, err := buildDNS(rules.GlobalDNS())
+		dns, err := buildDNS(withProfileResolvers(rules.GlobalDNS(), plan))
 		if err != nil {
 			return nil, err
 		}
 		cfg.DNS = dns
-		cfg.Route = singboxRoute{
+		route := singboxRoute{
 			RuleSet:             sets,
 			AutoDetectInterface: autoDetect,
 			Rules:               globalRules(tun),
 			Final:               final,
 		}
+		// Global mode normally lets sing-box infer the resolver from the one
+		// DNS server it has. A profile policy adds more, which leaves the
+		// direct outbound's dial field without one — a hard error in sing-box
+		// 1.14 — so the local bootstrap resolver is named explicitly. It is
+		// direct and local, so nothing global-mode's promise depends on.
+		if plan.applied() {
+			route.DefaultDomainResolver = &singboxDomainResolver{Server: tagDNSSystem}
+		}
+		cfg.Route = route
 
 	default: // config.ModeDirect
 		// Direct mode must not proxy, so it gets no actions either: with
@@ -467,6 +514,21 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 		return nil, fmt.Errorf("core: encode sing-box config: %w", err)
 	}
 	return append(data, '\n'), nil
+}
+
+// withProfileResolvers appends a profile DNS plan's resolvers to a DNS policy.
+// It is the one place the profile policy meets the built-in split DNS; without
+// a policy the plan is empty and the policy is returned unchanged.
+func withProfileResolvers(policy rules.DNS, plan *profileDNSPlan) rules.DNS {
+	extra := plan.entries()
+	if len(extra) == 0 {
+		return policy
+	}
+	servers := make([]rules.DNSServer, 0, len(policy.Servers)+len(extra))
+	servers = append(servers, policy.Servers...)
+	servers = append(servers, extra...)
+	policy.Servers = servers
+	return policy
 }
 
 // buildTunInbound renders the optional TUN inbound from vender's own
@@ -542,18 +604,18 @@ func validateTunRuleSets(cfg config.Config) error {
 }
 
 // buildOutbound renders the selected server as the proxy outbound.
-func buildOutbound(rc RuntimeConfig) (any, error) {
+func buildOutbound(rc RuntimeConfig, plan *profileDNSPlan) (any, error) {
 	if rc.Server == nil {
 		return nil, errors.New("core: proxy mode requires a selected server")
 	}
-	return buildOutboundFor(rc, rc.Server, tagProxy)
+	return buildOutboundFor(rc, rc.Server, tagProxy, plan)
 }
 
 // buildAutoOutbounds renders every configured server as its own outbound and
 // wraps them in a URLTest group tagged `proxy`. The group's own tag is the one
 // the policy refers to, so switching a server out for the group changes only
 // this function.
-func buildAutoOutbounds(rc RuntimeConfig) ([]any, error) {
+func buildAutoOutbounds(rc RuntimeConfig, plan *profileDNSPlan) ([]any, error) {
 	out := make([]any, 0, len(rc.Servers)+1)
 	members := make([]string, 0, len(rc.Servers))
 	seen := make(map[string]bool, len(rc.Servers))
@@ -564,7 +626,7 @@ func buildAutoOutbounds(rc RuntimeConfig) ([]any, error) {
 			return nil, fmt.Errorf("core: two servers map to the outbound tag %q", tag)
 		}
 		seen[tag] = true
-		ob, err := buildOutboundFor(rc, srv, tag)
+		ob, err := buildOutboundFor(rc, srv, tag, plan)
 		if err != nil {
 			return nil, err
 		}
@@ -595,19 +657,25 @@ func ServerOutboundTag(srv *config.Server) string {
 }
 
 // buildOutboundFor renders one server as an outbound with the given tag.
-func buildOutboundFor(rc RuntimeConfig, srv *config.Server, tag string) (any, error) {
+func buildOutboundFor(rc RuntimeConfig, srv *config.Server, tag string, plan *profileDNSPlan) (any, error) {
 	iface := rc.Config.Engine.BindInterface
+	resolverTag, err := plan.resolverFor(srv)
+	if err != nil {
+		return nil, err
+	}
+	dnsResolver := domainResolverRef(resolverTag)
 
 	switch srv.Type {
 	case config.TypeVLESS:
 		out := vlessOutbound{
-			Type:          "vless",
-			Tag:           tag,
-			Server:        srv.Address,
-			ServerPort:    srv.Port,
-			UUID:          srv.UUID,
-			Flow:          srv.Flow,
-			BindInterface: iface,
+			Type:           "vless",
+			Tag:            tag,
+			Server:         srv.Address,
+			ServerPort:     srv.Port,
+			UUID:           srv.UUID,
+			Flow:           srv.Flow,
+			BindInterface:  iface,
+			DomainResolver: dnsResolver,
 		}
 		tls, err := vlessTLS(srv)
 		if err != nil {
@@ -618,12 +686,13 @@ func buildOutboundFor(rc RuntimeConfig, srv *config.Server, tag string) (any, er
 
 	case config.TypeHysteria2:
 		out := hysteria2Outbound{
-			Type:          "hysteria2",
-			Tag:           tag,
-			Server:        srv.Address,
-			ServerPort:    srv.Port,
-			Password:      srv.Password,
-			BindInterface: iface,
+			Type:           "hysteria2",
+			Tag:            tag,
+			Server:         srv.Address,
+			ServerPort:     srv.Port,
+			Password:       srv.Password,
+			BindInterface:  iface,
+			DomainResolver: dnsResolver,
 			TLS: &tlsConfig{
 				Enabled:                    true,
 				ServerName:                 srv.SNI,
@@ -639,39 +708,42 @@ func buildOutboundFor(rc RuntimeConfig, srv *config.Server, tag string) (any, er
 
 	case config.TypeShadowsocks:
 		return shadowsocksOutbound{
-			Type:          "shadowsocks",
-			Tag:           tag,
-			Server:        srv.Address,
-			ServerPort:    srv.Port,
-			Method:        srv.Method,
-			Password:      srv.Password,
-			BindInterface: iface,
+			Type:           "shadowsocks",
+			Tag:            tag,
+			Server:         srv.Address,
+			ServerPort:     srv.Port,
+			Method:         srv.Method,
+			Password:       srv.Password,
+			BindInterface:  iface,
+			DomainResolver: dnsResolver,
 		}, nil
 
 	case config.TypeVMess:
 		return vmessOutbound{
-			Type:          "vmess",
-			Tag:           tag,
-			Server:        srv.Address,
-			ServerPort:    srv.Port,
-			UUID:          srv.UUID,
-			Security:      srv.Cipher,
-			AlterID:       srv.AlterID,
-			BindInterface: iface,
-			TLS:           v2rayTLS(srv),
-			Transport:     v2rayTransportFor(srv),
+			Type:           "vmess",
+			Tag:            tag,
+			Server:         srv.Address,
+			ServerPort:     srv.Port,
+			UUID:           srv.UUID,
+			Security:       srv.Cipher,
+			AlterID:        srv.AlterID,
+			BindInterface:  iface,
+			DomainResolver: dnsResolver,
+			TLS:            v2rayTLS(srv),
+			Transport:      v2rayTransportFor(srv),
 		}, nil
 
 	case config.TypeTrojan:
 		return trojanOutbound{
-			Type:          "trojan",
-			Tag:           tag,
-			Server:        srv.Address,
-			ServerPort:    srv.Port,
-			Password:      srv.Password,
-			BindInterface: iface,
-			TLS:           v2rayTLS(srv),
-			Transport:     v2rayTransportFor(srv),
+			Type:           "trojan",
+			Tag:            tag,
+			Server:         srv.Address,
+			ServerPort:     srv.Port,
+			Password:       srv.Password,
+			BindInterface:  iface,
+			DomainResolver: dnsResolver,
+			TLS:            v2rayTLS(srv),
+			Transport:      v2rayTransportFor(srv),
 		}, nil
 
 	default:
@@ -798,18 +870,22 @@ func buildDNS(policy rules.DNS) (*singboxDNS, error) {
 		if s.Tag == "" {
 			return nil, fmt.Errorf("core: DNS server %q is incomplete", s.Tag)
 		}
-		// A fakeip server has no upstream address (it answers locally);
-		// every other transport needs one.
-		if s.Type != "fakeip" && s.Server == "" {
+		// A fakeip server answers locally and a local server delegates to the
+		// host resolver; neither has an upstream address.
+		if s.Type != "fakeip" && s.Type != "local" && s.Server == "" {
 			return nil, fmt.Errorf("core: DNS server %q has no address", s.Tag)
 		}
 		out.Servers = append(out.Servers, singboxDNSServer{
-			Tag:        s.Tag,
-			Type:       s.Type,
-			Server:     s.Server,
-			Detour:     s.Detour,
-			Inet4Range: s.Inet4Range,
-			Inet6Range: s.Inet6Range,
+			Tag:            s.Tag,
+			Type:           s.Type,
+			Server:         s.Server,
+			ServerPort:     s.Port,
+			Path:           s.Path,
+			Detour:         s.Detour,
+			BindInterface:  s.BindInterface,
+			DomainResolver: domainResolverRef(s.DomainResolver),
+			Inet4Range:     s.Inet4Range,
+			Inet6Range:     s.Inet6Range,
 		})
 	}
 	for _, r := range policy.Rules {

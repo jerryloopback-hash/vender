@@ -1,0 +1,22 @@
+# A Clash / Mihomo file whose provider also states a DNS policy, the way a
+# commercial provider ("机场") does. Dummy values only; the domain patterns,
+# resolver schemes and the audit-only nameserver/fallback lists are the shapes
+# the parser must accept.
+dns:
+  enable: true
+  nameserver:
+    - 119.29.29.29
+    - 223.5.5.5
+  fallback:
+    - 8.8.8.8
+  nameserver-policy:
+    +.v51124-6.qpon: tcp://dns.provider.example:8080
+    '*.rtysjur.quest': https://doh.provider.example/dns-query
+    legacy.entry: 203.0.113.53
+    multi.entry:
+      - udp://resolver1.example:5353
+      - tcp://resolver2.example:53
+    'geosite:cn': tcp://should-be-dropped.example:53
+proxies:
+  - {name: Dns-SS, type: ss, server: 1.k.o.5.hk01-ae5.entry.v51124-6.qpon, port: 19276, cipher: aes-256-gcm, password: dummy-ss-pass}
+  - {name: Dns-VMess, type: vmess, server: 1kw2i0k.g06.jp02.entry.rtysjur.quest, port: 443, uuid: 11111111-1111-1111-1111-111111111111, alterId: 0, cipher: auto, tls: false}

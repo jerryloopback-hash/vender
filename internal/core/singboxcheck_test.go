@@ -267,3 +267,63 @@ func checkTestServer() *config.Server {
 		ShortID:   "0123456789abcdef",
 	}
 }
+
+// TestProfileDNSPassesSingBoxCheck runs the engine's own validator over the
+// config a profile DNS policy produces. It is the check that matters most for
+// this feature: `domain_resolver` on an outbound, a `tcp` DNS server reached by
+// name, and the `local` bootstrap are all fields whose exact name and placement
+// only the pinned binary can confirm.
+func TestProfileDNSPassesSingBoxCheck(t *testing.T) {
+	singbox := findSingBox()
+	if singbox == "" {
+		t.Skip("no sing-box binary (set VENDER_TEST_SINGBOX, or run scripts/fetch-sing-box.sh)")
+	}
+
+	policy := &config.ProfileDNS{NamespacePolicy: []config.DNSNamespacePolicy{
+		{Domain: "v51124-6.qpon", Server: "tcp://dns.provider.example:8080"},
+		{Domain: "1.2.3.4.in-addr.arpa", Server: "https://dns.example/dns-query"},
+	}}
+	policy.Normalize()
+	ss := &config.Server{
+		Name: "Check-Entry-SS", Type: config.TypeShadowsocks,
+		Address: "1.k.o.5.hk01-ae5.entry.v51124-6.qpon", Port: 19276,
+		Method: "aes-256-gcm", Password: "check-test-password", Profile: "provider",
+	}
+	ss.Normalize()
+
+	for _, mode := range []config.ProxyMode{config.ModeRule, config.ModeGlobal} {
+		for _, auto := range []bool{false, true} {
+			name := string(mode) + "/auto=" + boolText(auto)
+			t.Run(name, func(t *testing.T) {
+				dir := t.TempDir()
+				cfg := *config.Default()
+				cfg.Proxy.Mode = mode
+				if auto {
+					cfg.SelectedServer = config.SelectedServerAuto
+				}
+				rc := RuntimeConfig{
+					Config:     cfg,
+					Server:     ss,
+					ProfileDNS: map[string]*config.ProfileDNS{"provider": policy},
+					BinaryPath: singbox,
+					RunDir:     dir,
+				}
+				if auto {
+					rc.Server = nil
+					rc.Servers = []config.Server{*ss}
+				}
+				eng, err := New(rc)
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				if err := eng.WriteConfig(rc); err != nil {
+					t.Fatalf("WriteConfig: %v", err)
+				}
+				out, err := exec.Command(singbox, "check", "-c", ConfigPath(dir)).CombinedOutput()
+				if err != nil {
+					t.Fatalf("sing-box check rejected the profile-DNS %s config: %v\n%s", name, err, out)
+				}
+			})
+		}
+	}
+}

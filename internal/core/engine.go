@@ -41,6 +41,12 @@ type RuntimeConfig struct {
 	// UserRules is the parsed rules.yaml, or nil when the file is absent. Its
 	// lists are merged ahead of the built-in policy.
 	UserRules *rules.UserRules `json:"user_rules,omitempty"`
+	// ProfileDNS carries each profile's captured DNS policy, keyed by the
+	// lower-cased profile name. A server is resolved by the policy of the
+	// profile it belongs to, so a named server in another profile keeps its
+	// own provider's resolver. An empty (or absent) map changes nothing:
+	// without a policy the rendered config is byte-identical to M7's.
+	ProfileDNS map[string]*config.ProfileDNS `json:"profile_dns,omitempty"`
 	// BinaryPath is the resolved sing-box executable (config.Engine.Binary,
 	// else bundled next to the vender executable, else PATH).
 	BinaryPath string `json:"binary_path"`
@@ -92,6 +98,20 @@ func (rc RuntimeConfig) Validate() error {
 	for i := range rc.Servers {
 		if err := rc.Servers[i].Validate(); err != nil {
 			return err
+		}
+	}
+	// A profile DNS policy is validated here (not only in the config layer)
+	// because the renderer turns it into a resolver address; a hand-edited
+	// profiles.yaml with a bad one must fail before the engine starts, naming
+	// the profile.
+	for name, p := range rc.ProfileDNS {
+		if err := p.Validate(); err != nil {
+			return fmt.Errorf("core: profile %q: %w", name, err)
+		}
+		for _, addr := range p.ResolverAddresses() {
+			if _, err := config.ParseResolverAddress(addr); err != nil {
+				return fmt.Errorf("core: profile %q: %w", name, err)
+			}
 		}
 	}
 	if rc.ClashListen != "" {

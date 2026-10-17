@@ -262,3 +262,94 @@ func TestCLIImportSubscriptionErrors(t *testing.T) {
 		t.Error("a link plus --url = nil error, want a refusal")
 	}
 }
+
+// clashSubscription is a synthetic Clash provider body with the DNS policy a
+// commercial provider ships, so the CLI can be driven without a socket.
+func clashSubscription() string {
+	return `dns:
+  nameserver:
+    - 119.29.29.29
+  nameserver-policy:
+    +.v51124-6.qpon: tcp://dns.provider.example:8080
+proxies:
+  - {name: Clash-SS, type: ss, server: 1.k.o.5.hk01-ae5.entry.v51124-6.qpon, port: 19276, cipher: aes-256-gcm, password: dummy}
+  - {name: Clash-VMess, type: vmess, server: node.example.net, port: 443, uuid: ` + testUUID + `, alterId: 0, cipher: auto, tls: false}
+`
+}
+
+// The import must capture and report the DNS policy, and `profiles list` /
+// `show` must surface it; `set-dns` must then override it by hand.
+func TestCLIProfilesDNS(t *testing.T) {
+	dir := t.TempDir()
+	withSubscriptionTransport(t, clashSubscription(), 200)
+
+	out, err := runCLI(t, "import", "--url", "https://sub.example.com/x", "--profile", "provider", "--config-dir", dir)
+	if err != nil {
+		t.Fatalf("import: %v\n%s", err, out)
+	}
+	for _, want := range []string{"captured a DNS policy", "v51124-6.qpon -> tcp://dns.provider.example:8080"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("import output does not mention %q:\n%s", want, out)
+		}
+	}
+	ps, err := config.NewStoreAt(dir).LoadProfiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := ps.Get("provider"); p.DNS == nil || p.DNS.NamespacePolicy[0].Domain != "v51124-6.qpon" {
+		t.Fatalf("the imported policy was not persisted: %+v", p.DNS)
+	}
+
+	out, err = runCLI(t, "profiles", "list", "--config-dir", dir)
+	if err != nil {
+		t.Fatalf("profiles list: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "DNS") || !strings.Contains(out, "1 rule") {
+		t.Errorf("profiles list does not surface the policy:\n%s", out)
+	}
+
+	out, err = runCLI(t, "profiles", "show", "provider", "--config-dir", dir)
+	if err != nil {
+		t.Fatalf("profiles show: %v\n%s", err, out)
+	}
+	for _, want := range []string{"v51124-6.qpon -> tcp://dns.provider.example:8080", "nameservers"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("profiles show does not mention %q:\n%s", want, out)
+		}
+	}
+
+	// Override: add one rule and replace the model example.
+	out, err = runCLI(t, "profiles", "set-dns", "provider",
+		"--domain", "*.other.example", "--server", "udp://203.0.113.53:5353", "--config-dir", dir)
+	if err != nil {
+		t.Fatalf("profiles set-dns: %v\n%s", err, out)
+	}
+	ps, _ = config.NewStoreAt(dir).LoadProfiles()
+	p, _ := ps.Get("provider")
+	if p.DNS == nil || len(p.DNS.NamespacePolicy) != 2 {
+		t.Fatalf("set-dns did not add the rule: %+v", p.DNS)
+	}
+	if got := p.DNS.Match("a.other.example"); got != "udp://203.0.113.53:5353" {
+		t.Errorf("Match(a.other.example) = %q", got)
+	}
+	if m := p.DNS.Match("1.entry.v51124-6.qpon"); m != "tcp://dns.provider.example:8080" {
+		t.Errorf("the captured rule was lost: Match = %q", m)
+	}
+
+	// --clear removes it and the server falls back to the built-in resolver.
+	if out, err = runCLI(t, "profiles", "set-dns", "provider", "--clear", "--config-dir", dir); err != nil {
+		t.Fatalf("profiles set-dns --clear: %v\n%s", err, out)
+	}
+	ps, _ = config.NewStoreAt(dir).LoadProfiles()
+	if p, _ := ps.Get("provider"); p.DNS != nil {
+		t.Errorf("--clear left a policy: %+v", p.DNS)
+	}
+
+	// Misuse is refused.
+	if _, err := runCLI(t, "profiles", "set-dns", "provider", "--domain", "a.example", "--config-dir", dir); err == nil {
+		t.Error("set-dns with a domain and no server = nil error")
+	}
+	if _, err := runCLI(t, "profiles", "set-dns", "provider", "--clear", "--domain", "a.example", "--server", "udp://x:53", "--config-dir", dir); err == nil {
+		t.Error("set-dns --clear with a rule = nil error")
+	}
+}

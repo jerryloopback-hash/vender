@@ -242,3 +242,80 @@ func findServer(t *testing.T, servers []config.Server, name string) *config.Serv
 	t.Fatalf("no server named %q in %v", name, serverNames(servers))
 	return nil
 }
+
+// A Clash file whose provider states a DNS policy: vender must capture
+// dns.nameserver-policy (both the +. and *. suffix forms, every resolver
+// scheme, and multiple servers for one domain), keep the default lists for
+// auditing, and drop a rule-set-keyed policy it cannot match a hostname
+// against.
+func TestParseClashCapturesDNSPolicy(t *testing.T) {
+	res, format, err := Parse(readFixture(t, "clash_dns.yaml"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if format != FormatClash {
+		t.Fatalf("format = %q, want %q", format, FormatClash)
+	}
+	dns := res.DNS
+	if dns == nil {
+		t.Fatal("ParseClash captured no DNS policy")
+	}
+	want := []config.DNSNamespacePolicy{
+		// The first server of a multi-server rule is used; the rest stay in Raw.
+		{Domain: "v51124-6.qpon", Server: "tcp://dns.provider.example:8080"},
+		{Domain: "rtysjur.quest", Server: "https://doh.provider.example/dns-query"},
+		{Domain: "legacy.entry", Server: "203.0.113.53"},
+		{Domain: "multi.entry", Server: "udp://resolver1.example:5353"},
+	}
+	if len(dns.NamespacePolicy) != len(want) {
+		t.Fatalf("namespace_policy = %+v, want %+v", dns.NamespacePolicy, want)
+	}
+	for i := range want {
+		if dns.NamespacePolicy[i] != want[i] {
+			t.Errorf("namespace_policy[%d] = %+v, want %+v", i, dns.NamespacePolicy[i], want[i])
+		}
+	}
+	if len(dns.Nameservers) != 2 || dns.Nameservers[0] != "119.29.29.29" {
+		t.Errorf("nameservers = %v, want the two captured defaults", dns.Nameservers)
+	}
+	if len(dns.Fallback) != 1 || dns.Fallback[0] != "8.8.8.8" {
+		t.Errorf("fallback = %v, want [8.8.8.8]", dns.Fallback)
+	}
+	for _, want := range []string{"nameserver-policy", "nameserver", "fallback", "geosite:cn"} {
+		if !strings.Contains(dns.Raw, want) {
+			t.Errorf("Raw does not keep %q:\n%s", want, dns.Raw)
+		}
+	}
+
+	// The matched node resolves through the provider; the rtysjur node through
+	// the *. rule; a node under no pattern through nothing.
+	if got := dns.Match("1.k.o.5.hk01-ae5.entry.v51124-6.qpon"); got != "tcp://dns.provider.example:8080" {
+		t.Errorf("Match(qpon node) = %q", got)
+	}
+	if got := dns.Match("1kw2i0k.g06.jp02.entry.rtysjur.quest"); got != "https://doh.provider.example/dns-query" {
+		t.Errorf("Match(rtysjur node) = %q", got)
+	}
+	if got := dns.Match("node.example.net"); got != "" {
+		t.Errorf("Match(unmatched) = %q, want empty", got)
+	}
+}
+
+// A Clash file with no dns block, and a link list, carry no policy: an absent
+// policy must stay nil so it renders nothing.
+func TestSubscriptionsWithoutDNSHaveNoPolicy(t *testing.T) {
+	res, _, err := Parse(readFixture(t, "clash.yaml"))
+	if err != nil {
+		t.Fatalf("Parse(clash): %v", err)
+	}
+	if res.DNS != nil {
+		t.Errorf("a Clash file without a dns block produced a policy: %+v", res.DNS)
+	}
+
+	links, _, err := Parse(readFixture(t, "links.txt"))
+	if err != nil {
+		t.Fatalf("Parse(links): %v", err)
+	}
+	if links.DNS != nil {
+		t.Errorf("a link list produced a policy: %+v", links.DNS)
+	}
+}

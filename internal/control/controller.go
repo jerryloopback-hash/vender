@@ -472,6 +472,7 @@ func (c *Controller) render() (core.RuntimeConfig, error) {
 		Server:      srv,
 		Servers:     all,
 		UserRules:   userRules,
+		ProfileDNS:  profiles.DNSMap(),
 		BinaryPath:  c.binary,
 		RunDir:      c.runDir,
 		ClashListen: c.clashAddr,

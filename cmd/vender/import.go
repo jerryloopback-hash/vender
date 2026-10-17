@@ -170,7 +170,7 @@ func (a *app) importSubscription(cmd *cobra.Command, rawURL, profile, prefix str
 		}
 	}
 
-	stats, canonical, err := store.ProfileImport(profileName, rawURL, time.Now(), servers, false, force)
+	stats, canonical, err := store.ProfileImport(profileName, rawURL, time.Now(), servers, res.DNS, false, force)
 	if err != nil {
 		return fmt.Errorf("import: %w", err)
 	}
@@ -179,12 +179,25 @@ func (a *app) importSubscription(cmd *cobra.Command, rawURL, profile, prefix str
 	printImportStats(out, stats)
 	printImportSkips(out, res.Skipped)
 	reportConflicts(out, stats)
+	printProfileDNS(out, res.DNS)
 	fmt.Fprintf(out, "Profile %q saved to %s\n", canonical, store.ProfilesPath())
 	fmt.Fprintf(out, "  servers in %s (mode 0600)\n", store.ServersPath())
 	fmt.Fprintf(out, "\nNext:\n")
 	fmt.Fprintf(out, "  vender profiles use %s     # auto failover over this profile\n", canonical)
 	fmt.Fprintf(out, "  vender profiles list       # see every profile and its node count\n")
 	return nil
+}
+
+// printProfileDNS reports the DNS policy a subscription declared for its node
+// hostnames, so an import says whether it captured one.
+func printProfileDNS(out interface{ Write([]byte) (int, error) }, dns *config.ProfileDNS) {
+	if !dns.Applied() {
+		return
+	}
+	fmt.Fprintf(out, "  captured a DNS policy for node hostnames: %d rule(s)\n", len(dns.NamespacePolicy))
+	for _, e := range dns.NamespacePolicy {
+		fmt.Fprintf(out, "    %s -> %s\n", e.Domain, e.Server)
+	}
 }
 
 // printImportStats renders the per-node summary line.

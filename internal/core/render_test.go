@@ -292,7 +292,82 @@ func goldenCases(t *testing.T) []goldenCase {
 				RunDir:  "/run/vender",
 			},
 		},
+		{
+			// M8: a profile whose subscription declared a DNS policy. The
+			// node's own hostname is resolved by the provider's resolver (a
+			// tcp DNS endpoint reached by name, hence the `dns-system`
+			// bootstrap), while everything else — the client split DNS — is
+			// untouched. bind_interface is set so the golden also pins that
+			// the profile resolver is pinned the way the outbound is.
+			name: "profile-dns", file: "profile_dns.golden",
+			rc: RuntimeConfig{
+				Config: func() config.Config {
+					c := *config.Default()
+					c.Engine.BindInterface = "wlp0s20f3"
+					return c
+				}(),
+				Server:     entryServer(),
+				ProfileDNS: map[string]*config.ProfileDNS{"provider": providerDNS()},
+				RunDir:     "/run/vender",
+			},
+		},
+		{
+			// M8: auto mode over a profile with a policy. The matching node
+			// gets the provider resolver; the node under a public domain does
+			// not, so it keeps resolving through the built-in resolver and
+			// keeps working.
+			name: "profile-dns-auto", file: "profile_dns_auto.golden",
+			rc: RuntimeConfig{
+				Config: func() config.Config {
+					c := *config.Default()
+					c.SelectedServer = config.SelectedServerAuto
+					return c
+				}(),
+				Servers:    []config.Server{*entryServer(), *publicServer()},
+				ProfileDNS: map[string]*config.ProfileDNS{"provider": providerDNS()},
+				RunDir:     "/run/vender",
+			},
+		},
 	}
+}
+
+// providerDNS is the shape a commercial provider's Clash config produces: one
+// nameserver-policy entry pointing at the provider's own resolver (reached by
+// name, on a non-53 port) plus the captured default lists.
+func providerDNS() *config.ProfileDNS {
+	dns := &config.ProfileDNS{
+		NamespacePolicy: []config.DNSNamespacePolicy{
+			{Domain: "v51124-6.qpon", Server: "tcp://dns.provider.example:8080"},
+		},
+		Nameservers: []string{"119.29.29.29", "223.5.5.5"},
+		Fallback:    []string{"8.8.8.8"},
+		Raw:         "nameserver-policy:\n  +.v51124-6.qpon: tcp://dns.provider.example:8080\nnameserver:\n  - 119.29.29.29\n",
+	}
+	dns.Normalize()
+	return dns
+}
+
+// entryServer is a provider node under the entry domain the policy covers.
+func entryServer() *config.Server {
+	srv := &config.Server{
+		Name: "Prov-SS", Type: config.TypeShadowsocks,
+		Address: "1.k.o.5.hk01-ae5.entry.v51124-6.qpon", Port: 19276,
+		Method: "aes-256-gcm", Password: "provider-password", Profile: "provider",
+	}
+	srv.Normalize()
+	return srv
+}
+
+// publicServer is a provider node under a domain the policy does not cover: it
+// must fall back to the built-in resolver rather than be rerouted.
+func publicServer() *config.Server {
+	srv := &config.Server{
+		Name: "Prov-VM", Type: config.TypeVMess,
+		Address: "1kw2i0k.g06.jp02.entry.example.net", Port: 443,
+		UUID: testUUID, Cipher: "auto", Security: config.SecurityNone, Profile: "provider",
+	}
+	srv.Normalize()
+	return srv
 }
 
 func TestBuildConfigGolden(t *testing.T) {
@@ -1162,5 +1237,206 @@ func TestAutoModeValidation(t *testing.T) {
 	cfg2 := *config.Default()
 	if _, err := BuildConfig(RuntimeConfig{Config: cfg2, RunDir: "/run/vender"}); err == nil {
 		t.Error("single-server mode with no server did not fail")
+	}
+}
+
+// A runtime with no profile policy must render exactly as M7 did: an empty map
+// and an absent map are the same, and a policy for a profile no server belongs
+// to cannot leak into an outbound.
+func TestProfileDNSAbsentIsByteIdentical(t *testing.T) {
+	base := RuntimeConfig{Config: *config.Default(), Server: entryServer(), RunDir: "/run/vender"}
+	without, err := BuildConfig(base)
+	if err != nil {
+		t.Fatalf("BuildConfig: %v", err)
+	}
+
+	base.ProfileDNS = map[string]*config.ProfileDNS{}
+	empty, err := BuildConfig(base)
+	if err != nil {
+		t.Fatalf("BuildConfig (empty map): %v", err)
+	}
+	if string(empty) != string(without) {
+		t.Error("an empty ProfileDNS map changed the rendered config")
+	}
+
+	base.ProfileDNS = map[string]*config.ProfileDNS{"another-provider": providerDNS()}
+	unrelated, err := BuildConfig(base)
+	if err != nil {
+		t.Fatalf("BuildConfig (unrelated profile): %v", err)
+	}
+	if string(unrelated) != string(without) {
+		t.Error("a policy for an unrelated profile changed the rendered config")
+	}
+	for _, key := range []string{`"domain_resolver"`, "profile-dns-", "dns-system"} {
+		if strings.Contains(string(unrelated), key) {
+			t.Errorf("config rendered without an applicable policy contains %q", key)
+		}
+	}
+}
+
+// The profile resolver applies to the node hostname it matches and only to
+// that node: a public-domain node keeps the built-in resolver.
+func TestProfileDNSAppliesPerNode(t *testing.T) {
+	cfg := *config.Default()
+	cfg.SelectedServer = config.SelectedServerAuto
+	rc := RuntimeConfig{
+		Config:     cfg,
+		Servers:    []config.Server{*entryServer(), *publicServer()},
+		ProfileDNS: map[string]*config.ProfileDNS{"provider": providerDNS()},
+		RunDir:     "/run/vender",
+	}
+	data, err := BuildConfig(rc)
+	if err != nil {
+		t.Fatalf("BuildConfig: %v", err)
+	}
+	var cfgOut struct {
+		DNS struct {
+			Servers []map[string]any `json:"servers"`
+		} `json:"dns"`
+		Outbounds []map[string]any `json:"outbounds"`
+	}
+	if err := json.Unmarshal(data, &cfgOut); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	var provider, system int
+	for _, s := range cfgOut.DNS.Servers {
+		switch s["tag"] {
+		case "profile-dns-1":
+			provider++
+			if s["type"] != "tcp" || s["server"] != "dns.provider.example" || s["server_port"] != float64(8080) {
+				t.Errorf("profile resolver rendered as %v", s)
+			}
+			dr, _ := s["domain_resolver"].(map[string]any)
+			if dr["server"] != "dns-system" {
+				t.Errorf("profile resolver bootstrap = %v, want dns-system", s["domain_resolver"])
+			}
+		case "dns-system":
+			system++
+			if s["type"] != "local" {
+				t.Errorf("dns-system type = %v, want local", s["type"])
+			}
+		}
+	}
+	if provider != 1 || system != 1 {
+		t.Fatalf("dns.servers has %d profile resolver(s), %d dns-system, want 1 and 1", provider, system)
+	}
+
+	byTag := map[string]map[string]any{}
+	for _, o := range cfgOut.Outbounds {
+		if tag, ok := o["tag"].(string); ok {
+			byTag[tag] = o
+		}
+	}
+	if dr, ok := byTag["Prov-SS"]["domain_resolver"].(map[string]any); !ok || dr["server"] != "profile-dns-1" {
+		t.Errorf("entry node domain_resolver = %v, want profile-dns-1", byTag["Prov-SS"]["domain_resolver"])
+	}
+	if _, ok := byTag["Prov-VM"]["domain_resolver"]; ok {
+		t.Errorf("public-domain node was given a domain_resolver: %v", byTag["Prov-VM"]["domain_resolver"])
+	}
+}
+
+// A resolver given as an IP literal needs no bootstrap of its own: the
+// dns-system server is present (the plan always emits it) but the resolver does
+// not point at it.
+func TestProfileDNSIPResolverHasNoBootstrap(t *testing.T) {
+	dns := &config.ProfileDNS{NamespacePolicy: []config.DNSNamespacePolicy{
+		{Domain: "v51124-6.qpon", Server: "udp://203.0.113.53:5353"},
+	}}
+	rc := RuntimeConfig{
+		Config:     *config.Default(),
+		Server:     entryServer(),
+		ProfileDNS: map[string]*config.ProfileDNS{"provider": dns},
+		RunDir:     "/run/vender",
+	}
+	data, err := BuildConfig(rc)
+	if err != nil {
+		t.Fatalf("BuildConfig: %v", err)
+	}
+	var out struct {
+		DNS struct {
+			Servers []map[string]any `json:"servers"`
+		} `json:"dns"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	found := false
+	for _, s := range out.DNS.Servers {
+		if s["tag"] == "profile-dns-1" {
+			found = true
+			if s["type"] != "udp" || s["server"] != "203.0.113.53" || s["server_port"] != float64(5353) {
+				t.Errorf("resolver rendered as %v", s)
+			}
+			if _, ok := s["domain_resolver"]; ok {
+				t.Errorf("an IP resolver must not carry a domain_resolver: %v", s)
+			}
+		}
+	}
+	if !found {
+		t.Error("the profile resolver was not emitted")
+	}
+}
+
+// In global mode the profile resolvers make the DNS server set ambiguous, so
+// the direct outbound's resolver must be named explicitly — this is the shape
+// sing-box 1.14 accepts (and rejects without it).
+func TestProfileDNSGlobalNamesDefaultResolver(t *testing.T) {
+	cfg := *config.Default()
+	cfg.Proxy.Mode = config.ModeGlobal
+	rc := RuntimeConfig{
+		Config:     cfg,
+		Server:     entryServer(),
+		ProfileDNS: map[string]*config.ProfileDNS{"provider": providerDNS()},
+		RunDir:     "/run/vender",
+	}
+	data, err := BuildConfig(rc)
+	if err != nil {
+		t.Fatalf("BuildConfig: %v", err)
+	}
+	var out struct {
+		Route struct {
+			DefaultDomainResolver *struct {
+				Server string `json:"server"`
+			} `json:"default_domain_resolver"`
+		} `json:"route"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.Route.DefaultDomainResolver == nil || out.Route.DefaultDomainResolver.Server != "dns-system" {
+		t.Fatalf("global default_domain_resolver = %+v, want dns-system", out.Route.DefaultDomainResolver)
+	}
+
+	// Without a policy, global mode stays exactly as it was: no default
+	// resolver at all.
+	rc.ProfileDNS = nil
+	plain, err := BuildConfig(rc)
+	if err != nil {
+		t.Fatalf("BuildConfig (no policy): %v", err)
+	}
+	if strings.Contains(string(plain), "dns-system") {
+		t.Error("global mode without a policy gained a dns-system resolver")
+	}
+}
+
+// A bad resolver value must fail the render with a message naming the profile,
+// not reach the engine.
+func TestProfileDNSInvalidResolverFails(t *testing.T) {
+	dns := &config.ProfileDNS{NamespacePolicy: []config.DNSNamespacePolicy{
+		{Domain: "v51124-6.qpon", Server: "dhcp://eth0"},
+	}}
+	rc := RuntimeConfig{
+		Config:     *config.Default(),
+		Server:     entryServer(),
+		ProfileDNS: map[string]*config.ProfileDNS{"provider": dns},
+		RunDir:     "/run/vender",
+	}
+	_, err := BuildConfig(rc)
+	if err == nil {
+		t.Fatal("BuildConfig accepted an unsupported resolver scheme")
+	}
+	if !strings.Contains(err.Error(), "profile") {
+		t.Errorf("error %q does not name the profile", err)
 	}
 }
