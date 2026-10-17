@@ -10,35 +10,41 @@ the host's traffic system-wide. TUN mode is **off by default** and the local
 inbound is always there, so the usual way to use vender is still opt-in per
 application and easy to reason about.
 
-Two outbound protocols are supported:
+Two outbound protocols were the original scope; **M7 adds the three the rest of
+the world uses** — the ones a commercial provider ("机场") hands out:
 
 | Type | Transport | Notes |
 |---|---|---|
 | `vless` | TCP | VLESS + Vision + REALITY (also plain `tls` / `none`) |
 | `hysteria2` | UDP | Hysteria2, optionally with `salamander` obfuscation |
+| `shadowsocks` | TCP | `ss://` in both spellings (SIP002 and fully-base64), including the `2022-blake3-*` ciphers. SIP003 plugins are rejected with a clear message |
+| `vmess` | TCP / WS / gRPC | `vmess://` (the v2rayN base64 JSON), with optional TLS |
+| `trojan` | TCP / WS / gRPC | `trojan://`, always over TLS |
 
 The pinned engine is **sing-box 1.14.3** (see `scripts/fetch-sing-box.sh`).
 
 ## Status
 
-`vender` is at **M6 + M5 (robustness)**: the configuration layer and share-link
-parser (M0), the engine (M1), **smart routing out of the box** (M2), an
-**animated terminal UI** (M3), **start at login on Linux and Windows 11**,
-**Windows system-proxy control** and **release packaging** (M4), and an optional
-**TUN mode** — transparent, system-wide capture on top of the same engine and the
-same policy (M6). M5 hardens the whole thing against a bad link: a tiny
-**critical list** and an optional **`rules.yaml`** that no proxy can cut off, a
-**DNS split that never depends on the proxy** (FakeIP for proxied names, direct
-resolution for direct ones), and **`selected_server: auto`** node failover. The
-rule sets the default policy matches against are **embedded in the binary**, so a
-working default needs no download at runtime; the TUI attaches to the running
-daemon over a local control channel and can switch servers, change mode, turn TUN
+`vender` is at **M7**: the configuration layer and share-link parser (M0), the
+engine (M1), **smart routing out of the box** (M2), an **animated terminal UI**
+(M3), **start at login on Linux and Windows 11**, **Windows system-proxy
+control** and **release packaging** (M4), an optional **TUN mode** — transparent,
+system-wide capture on top of the same engine and the same policy (M6), and now
+**subscription import, named profiles and the three remaining outbound
+protocols** (M7).
+
+M5 hardens the whole thing against a bad link: a tiny **critical list** and an
+optional **`rules.yaml`** that no proxy can cut off, a **DNS split that never
+depends on the proxy** (FakeIP for proxied names, direct resolution for direct
+ones), and **`selected_server: auto`** node failover. The rule sets the default
+policy matches against are **embedded in the binary**, so a working default needs
+no download at runtime; the TUI attaches to the running daemon over a local
+control channel and can switch servers, change mode, switch profile, turn TUN
 mode on and off, start and stop the engine, tail its log, show live traffic and
 toggle start-at-login.
 
 Everything the CLI offers is implemented; there are no `not implemented` stubs
-left. (Subscription URLs and bulk import are not part of this line: `import`
-takes one link at a time.)
+left.
 
 ## Roadmap
 
@@ -51,7 +57,7 @@ takes one link at a time.)
 | M4 | **Autostart** (systemd user unit / XDG autostart on Linux; Task Scheduler logon task / Run key on Windows), **Windows system proxy** (WinINET), **release packaging** and a per-user installer |
 | **M5** | **Robustness**: critical "must survive a dead proxy" list, user `rules.yaml`, proxy-independent split DNS (FakeIP), `selected_server: auto` failover and node health in the TUI |
 | **M6** | **Optional TUN mode** (transparent system-wide capture, `vender tun on\|off\|status`, TUN-aware autostart) |
-| M7 | Hardening & release: subscription import, latency ranking, log rotation, signed builds |
+| **M7** | **Subscription import and profiles**, plus Shadowsocks / VMess / Trojan outbounds (`vender import --url`, `vender profiles …`). Deferred to a later line: latency ranking, log rotation, signed builds |
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and the
 interfaces between milestones.
@@ -99,7 +105,8 @@ documentation travels with the binaries.
 
 Dependencies are deliberately few: `cobra` and `yaml.v3` for the CLI, plus
 `bubbletea`, `lipgloss` and `bubbles` for the TUI. The control channel,
-autostart and the Windows registry work use only the standard library.
+autostart and the Windows registry work use only the standard library —
+subscription fetching is `net/http` and adds no module at all.
 
 ## Installing sing-box
 
@@ -138,12 +145,24 @@ If none is found, the error names all three locations.
 # Add a server from a share link (the name comes from the link's #fragment)
 ./vender import 'vless://<uuid>@<host>:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=<sni>&fp=chrome&pbk=<public-key>&sid=<short-id>&type=tcp#My-Node'
 ./vender import 'hysteria2://<password>@<host>:8443/?sni=<sni>&obfs=salamander&obfs-password=<secret>&insecure=1#My-Node-Hy2'
+./vender import 'ss://<base64(method:password)>@<host>:8388#My-SS-Node'
+./vender import 'vmess://<base64 json>#My-VMess-Node'
+./vender import 'trojan://<password>@<host>:443?sni=<sni>#My-Trojan-Node'
+
+# ... or import a whole subscription into a profile (see "Subscriptions and profiles")
+./vender import --url 'https://provider.example/sub?token=...' --profile provider
 
 ./vender servers list          # table of configured servers, * marks the active one
 ./vender servers list --links  # print the share link of every server (contains secrets)
 ./vender servers use My-Node   # make a server active (restarts a running daemon)
-./vender servers use auto      # or fail over automatically across all of them
+./vender servers use auto      # or fail over automatically (within the active profile)
 ./vender servers rm My-Node    # remove a server by name
+
+./vender profiles list         # every profile, its node count and its subscription URL
+./vender profiles use provider # make a profile active
+./vender profiles update       # re-fetch the active profile's subscription
+./vender profiles rm provider  # remove a profile and its servers
+
 ./vender rules list            # the merged routing policy and the embedded rule sets
 ./vender rules init            # write a commented per-user rules.yaml
 ./vender version               # build information
@@ -169,6 +188,59 @@ the test suite stays away from your real setup.
 
 The first server imported also becomes the active one; removing the active
 server clears the selection.
+
+## Subscriptions and profiles
+
+A commercial provider hands you one URL that returns many nodes. Import it whole
+and file it under a **profile**:
+
+```sh
+./vender import --url 'https://provider.example/api/v1/client/subscribe?token=...' --profile provider
+```
+
+The subscription is fetched **as a v2ray client** (User-Agent `v2rayN/6.0`), so a
+panel returns share links rather than an HTML or Clash page, and all three shapes
+are auto-detected and accepted:
+
+| Shape | What it looks like |
+|---|---|
+| base64 of newline-separated share links | the classic v2ray subscription |
+| plain newline-separated share links | the same, uncompressed |
+| Clash / Mihomo **YAML** | a `proxies:` list (`ss`, `vmess`, `trojan`, `vless`, `hysteria2`) |
+
+Nodes vender cannot use are **skipped with a reason**, per node, and the rest are
+imported: a `wireguard` node, an `ss` node that needs a SIP003 plugin, or a link
+whose protocol-critical field is missing are all reported by name. The import
+summary says exactly what happened (`added N, updated N, unchanged N, skipped N`).
+
+Every server carries a **`profile`** (absent means the built-in `manual`
+profile), and new nodes are tagged with the profile you chose — the default is
+the subscription URL's host. A profile's metadata is kept in `profiles.yaml`
+(the URL and the last fetch time); **membership** lives in `servers.yaml`, so
+that file alone always tells you which nodes belong together.
+
+```sh
+./vender profiles list           # ACTIVE / PROFILE / NODES / UPDATED / SOURCE URL
+./vender profiles use provider   # make it active
+./vender profiles update         # re-fetch: add new, update changed, drop gone
+./vender profiles rm provider    # remove the profile and its servers
+```
+
+**What "active" means.** It changes exactly one thing: with
+`selected_server: auto`, the failover group is built over the **active profile's**
+servers only, so `profiles use provider` + `servers use auto` means "fail over
+between my provider's nodes". Naming a specific server still works and implies
+nothing about the profile. `vender profiles use all` widens the group to every
+server. A refresh never leaves the selection broken: if `config.yaml` selected a
+node the subscription no longer publishes, the selection falls back to `auto`.
+
+`vender profiles rm` refuses to remove the built-in `manual` profile, so there is
+always at least one profile left. The TUI's Settings screen lists profiles and
+switches them with `p`.
+
+**Compatibility.** A `servers.yaml` written before this feature — no `profile`
+key anywhere — loads unchanged as all-manual, and `auto` keeps failing over over
+every server, so an existing setup behaves exactly as it did.
 
 ## System proxy
 
@@ -281,15 +353,15 @@ An animated Bubble Tea interface with four screens:
 
 | Key | Screen | What it shows |
 |---|---|---|
-| `1` | **Dashboard** | daemon and engine state, the selected server, the mode, uptime, and a **live up/down traffic graph** with human-readable rates and session totals |
-| `2` | **Nodes** | every configured server with its type, protocol, endpoint and latency. `enter` makes one active (the daemon restarts the engine in place), `t` measures latency |
+| `1` | **Dashboard** | daemon and engine state, the selected server, the active profile, the mode, uptime, and a **live up/down traffic graph** with human-readable rates and session totals |
+| `2` | **Nodes** | every configured server with its profile, type, protocol, endpoint and latency. `enter` makes one active (the daemon restarts the engine in place), `A` switches to auto failover, `t` measures latency |
 | `3` | **Logs** | the engine's own output, streamed live, with follow mode (`f`) and a filter (`/`) |
-| `4` | **Settings** | the routing mode, the listener, the **TUN inbound** (state, device, and whether this machine can actually create it — `u` toggles it), a read-only view of the **active built-in policy**, and the **start-at-login registration** (`a` toggles it) |
+| `4` | **Settings** | the routing mode, the **profiles** (node counts and a `p` key to switch the active one), the listener, the **TUN inbound** (state, device, and whether this machine can actually create it — `u` toggles it), a read-only view of the **active built-in policy**, and the **start-at-login registration** (`a` toggles it) |
 
 Other keys: `tab` / `shift+tab` between screens, `?` for help, `t` to test
 latency, `s` / `x` / `R` to start, stop and restart the engine, `m` to cycle
-the mode, `u` on Settings to toggle TUN mode, `a` on Settings to toggle
-start-at-login, `q` or Ctrl-C to quit.
+the mode, `p` on Settings to switch the active profile, `u` on Settings to toggle
+TUN mode, `a` on Settings to toggle start-at-login, `q` or Ctrl-C to quit.
 
 The TUI is a **client**: it never runs sing-box itself, it asks the daemon. So
 it can attach and detach at any time, and two of them can be open at once. It
@@ -306,11 +378,11 @@ secret. Nothing outside the daemon talks to it.
 The daemon publishes a small endpoint at `<run-dir>/control.json` (mode `0600`)
 holding a loopback TCP address and a random token, regenerated on every start
 and deleted on exit. Clients speak newline-delimited, versioned JSON over that
-connection: `status`, `servers`, `select`, `mode`, `tun`, `latency`, `start`,
-`stop`, `restart` and `rules` are request/response, while `logs` and `traffic` are
-subscriptions that take their connection over. A request without the token is
-rejected. See `docs/ARCHITECTURE.md` §8 for the protocol and for why it is
-loopback TCP rather than a unix socket.
+connection: `status`, `servers`, `select`, `mode`, `tun`, `profile`, `latency`,
+`start`, `stop`, `restart` and `rules` are request/response, while `logs` and
+`traffic` are subscriptions that take their connection over. A request without
+the token is rejected. See `docs/ARCHITECTURE.md` §8 for the protocol and for
+why it is loopback TCP rather than a unix socket.
 
 `vender tui` piped somewhere (no terminal) prints a one-line-per-field snapshot
 instead of failing.
@@ -434,7 +506,7 @@ editable configuration:
 | Linux | `~/.cache/vender/` (or `$XDG_CACHE_HOME/vender`) |
 | Windows | `%LocalAppData%\vender\` |
 
-Two files live in the config directory, plus an optional third:
+Two files live in the config directory, plus two optional ones:
 
 - `config.yaml` — global settings (world-readable, no secrets):
 
@@ -478,7 +550,8 @@ Two files live in the config directory, plus an optional third:
 
 - `servers.yaml` — the server list, **written with mode `0600`** because it
   holds credentials (UUIDs, passwords, REALITY public keys). Managed by
-  `vender import` and `vender servers rm`; hand-editing is supported:
+  `vender import` and `vender servers rm`; hand-editing is supported. The
+  `profile` key is optional and absent means the built-in `manual` profile:
 
   ```yaml
   servers:
@@ -495,10 +568,42 @@ Two files live in the config directory, plus an optional third:
         short_id: 0123456789abcdef
         network: tcp
         header_type: none
+      - name: Provider-SS
+        type: shadowsocks
+        server: 203.0.113.20
+        port: 8388
+        method: aes-256-gcm
+        password: ...
+        profile: provider          # absent => the built-in "manual" profile
   ```
 
-Hand-edited files are validated on load, and problems are reported all at once
-with the field that is wrong.
+  Per-type field notes:
+
+  | Type | Fields |
+  |---|---|
+  | `vless` | `uuid`, `flow`, `security` (`none`/`tls`/`reality`), `sni`, `fingerprint`, `public_key`, `short_id`, `spider_x`, `network` (TCP only), `header_type` |
+  | `hysteria2` | `password`, `obfs`, `obfs_password`, `sni`, `insecure`, `pin_sha256`, `alpn` |
+  | `shadowsocks` | `method` (the cipher, e.g. `aes-256-gcm` or `2022-blake3-aes-256-gcm`), `password` |
+  | `vmess` | `uuid`, `cipher` (the `scy`, `auto` by default), `alter_id`, `security` (`none`/`tls`), `sni`, `fingerprint`, `insecure`, `network` (`tcp`/`ws`/`grpc`), `header_type` (`none`/`http`), `path`, `host`, `alpn` |
+  | `trojan` | `password`, `sni`, `security` (always `tls`), `fingerprint`, `insecure`, `network` (`tcp`/`ws`/`grpc`), `path`, `host`, `alpn` |
+
+  Hand-edited files are validated on load, and problems are reported all at once
+  with the field that is wrong (for example `ss: method is required for
+  shadowsocks`, or `vmess: network \"kcp\" is not supported for vmess`).
+
+- `profiles.yaml` — the **profile registry**: which profiles exist, the
+  subscription URL each came from, when it was last fetched, and which one is
+  active. It is written `0600` (a subscription URL can carry a token) and it is
+  safe to delete: membership is derived from `servers.yaml`, so the worst case is
+  losing the URL and going back to the built-in `manual` profile.
+
+  ```yaml
+  active: provider
+  profiles:
+      - name: provider
+        url: https://provider.example/api/v1/client/subscribe?token=...
+        fetched_at: 2026-10-17T09:30:00+08:00
+  ```
 
 - `rules.yaml` — **optional** user routing rules. It is merged *before* the
   built-in policy, so an entry here always wins; only the built-in critical list
@@ -597,22 +702,26 @@ sets below.
 
 ### Automatic failover (`selected_server: auto`)
 
-Point `selected_server` at `auto` and vender renders **every** server in
-`servers.yaml` as a member of a sing-box `urltest` group, instead of pinning one.
-The engine then re-tests each node against a "generate 204" URL and carries
-traffic over the fastest reachable one, so a degraded node is bypassed without
-anyone touching anything:
+Point `selected_server` at `auto` and vender renders the **active profile's**
+servers as members of a sing-box `urltest` group, instead of pinning one. The
+engine then re-tests each node against a "generate 204" URL and carries traffic
+over the fastest reachable one, so a degraded node is bypassed without anyone
+touching anything:
 
 ```sh
-vender servers use auto     # turn failover on (a running daemon restarts)
-vender servers use My-Node  # pin a single server again
+vender servers use auto      # turn failover on (a running daemon restarts)
+vender profiles use provider # scope it to one profile (see "Subscriptions and profiles")
+vender profiles use all      # ... or to every server, whatever its profile
+vender servers use My-Node   # pin a single server again
 ```
 
 The group reuses the `proxy` tag, so the routing policy, `route.final` and the
 global-mode DNS resolver are all unchanged. In the **Nodes** screen the header
 shows which member is carrying traffic and the latency column is filled from the
 engine's own URL-test results; `A` switches to auto. Single-server setups are
-completely unaffected — the generated config is byte-identical to before.
+completely unaffected — the generated config is byte-identical to before, and an
+existing installation (every server in the built-in `manual` profile) keeps
+failing over over every server.
 
 Two `engine` knobs tune the probing:
 
@@ -681,10 +790,14 @@ scripts/fetch-rules.sh --print-size # the embedded total
 ### What is deliberately not here yet
 
 - **No per-rule outbound choice.** The proxy is either the selected server or,
-  in auto mode, one URLTest group over all of them; there is no "Chinese traffic
-  through node A, the rest through node B".
-- **No subscription URLs or bulk import.** Servers are added one share link at a
-  time (`vender import`).
+  in auto mode, one URLTest group over the active profile's servers; there is no
+  "Chinese traffic through node A, the rest through node B".
+- **No SIP003 plugins for Shadowsocks.** A link that needs one (obfs, v2ray-plugin)
+  is rejected with a message naming the plugin rather than connecting without the
+  obfuscation the server expects. Ask your provider for a plain node, or use a
+  VMess/Trojan node with a WS transport instead.
+- **No latency ranking or log rotation yet**, and Windows builds are not signed:
+  those remain for a later line.
 - **No `mode: global` rules.** `global` means everything through the proxy, so
   it emits no routing rules at all — only a proxied DNS resolver. `direct` emits
   no proxy outbound and no DNS block.

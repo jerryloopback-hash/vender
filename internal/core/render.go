@@ -221,6 +221,58 @@ type hy2Obfs struct {
 	Password string `json:"password,omitempty"`
 }
 
+// shadowsocksOutbound renders a Shadowsocks server. The method is the cipher;
+// SIP003 plugins are deliberately not rendered (a link needing one is rejected
+// at parse time).
+type shadowsocksOutbound struct {
+	Type          string `json:"type"`
+	Tag           string `json:"tag"`
+	Server        string `json:"server"`
+	ServerPort    int    `json:"server_port"`
+	Method        string `json:"method"`
+	Password      string `json:"password"`
+	BindInterface string `json:"bind_interface,omitempty"`
+}
+
+// vmessOutbound renders a VMess server. Security is the vmess cipher ("auto",
+// "aes-128-gcm", ...), AlterID its "aid".
+type vmessOutbound struct {
+	Type          string          `json:"type"`
+	Tag           string          `json:"tag"`
+	Server        string          `json:"server"`
+	ServerPort    int             `json:"server_port"`
+	UUID          string          `json:"uuid"`
+	Security      string          `json:"security,omitempty"`
+	AlterID       int             `json:"alter_id,omitempty"`
+	BindInterface string          `json:"bind_interface,omitempty"`
+	TLS           *tlsConfig      `json:"tls,omitempty"`
+	Transport     *v2rayTransport `json:"transport,omitempty"`
+}
+
+// trojanOutbound renders a Trojan server. TLS is always present: Trojan has no
+// plaintext variant.
+type trojanOutbound struct {
+	Type          string          `json:"type"`
+	Tag           string          `json:"tag"`
+	Server        string          `json:"server"`
+	ServerPort    int             `json:"server_port"`
+	Password      string          `json:"password"`
+	BindInterface string          `json:"bind_interface,omitempty"`
+	TLS           *tlsConfig      `json:"tls,omitempty"`
+	Transport     *v2rayTransport `json:"transport,omitempty"`
+}
+
+// v2rayTransport is the transport block shared by vmess and trojan. Which
+// field carries the destination depends on the type: ws uses a Host header,
+// http (a TCP stream with an HTTP header) a host list, grpc a service name.
+type v2rayTransport struct {
+	Type        string            `json:"type"`
+	Path        string            `json:"path,omitempty"`
+	Host        []string          `json:"host,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	ServiceName string            `json:"service_name,omitempty"`
+}
+
 type plainOutbound struct {
 	Type string `json:"type"`
 	Tag  string `json:"tag"`
@@ -585,8 +637,93 @@ func buildOutboundFor(rc RuntimeConfig, srv *config.Server, tag string) (any, er
 		}
 		return out, nil
 
+	case config.TypeShadowsocks:
+		return shadowsocksOutbound{
+			Type:          "shadowsocks",
+			Tag:           tag,
+			Server:        srv.Address,
+			ServerPort:    srv.Port,
+			Method:        srv.Method,
+			Password:      srv.Password,
+			BindInterface: iface,
+		}, nil
+
+	case config.TypeVMess:
+		return vmessOutbound{
+			Type:          "vmess",
+			Tag:           tag,
+			Server:        srv.Address,
+			ServerPort:    srv.Port,
+			UUID:          srv.UUID,
+			Security:      srv.Cipher,
+			AlterID:       srv.AlterID,
+			BindInterface: iface,
+			TLS:           v2rayTLS(srv),
+			Transport:     v2rayTransportFor(srv),
+		}, nil
+
+	case config.TypeTrojan:
+		return trojanOutbound{
+			Type:          "trojan",
+			Tag:           tag,
+			Server:        srv.Address,
+			ServerPort:    srv.Port,
+			Password:      srv.Password,
+			BindInterface: iface,
+			TLS:           v2rayTLS(srv),
+			Transport:     v2rayTransportFor(srv),
+		}, nil
+
 	default:
 		return nil, fmt.Errorf("core: unsupported server type %q", srv.Type)
+	}
+}
+
+// v2rayTLS renders the TLS block shared by vmess and trojan, or nil when the
+// transport is plaintext (a trojan server is never plaintext, because
+// config.Server.Normalize forces security=tls for it).
+func v2rayTLS(srv *config.Server) *tlsConfig {
+	if srv.Security != config.SecurityTLS {
+		return nil
+	}
+	return &tlsConfig{
+		Enabled:    true,
+		ServerName: srv.SNI,
+		Insecure:   srv.Insecure,
+		ALPN:       srv.ALPN,
+		UTLS:       utls(srv.Fingerprint),
+	}
+}
+
+// v2rayTransportFor renders the transport block shared by vmess and trojan, or
+// nil for a bare TCP stream with no HTTP header.
+func v2rayTransportFor(srv *config.Server) *v2rayTransport {
+	switch {
+	case srv.Network == config.NetworkWS:
+		out := &v2rayTransport{Type: "ws", Path: srv.Path}
+		if out.Path == "" {
+			out.Path = "/"
+		}
+		if srv.Host != "" {
+			out.Headers = map[string]string{"Host": srv.Host}
+		}
+		return out
+
+	case srv.Network == config.NetworkGRPC:
+		return &v2rayTransport{Type: "grpc", ServiceName: srv.Path}
+
+	case srv.HeaderType == config.HeaderTypeHTTP:
+		out := &v2rayTransport{Type: "http", Path: srv.Path}
+		if out.Path == "" {
+			out.Path = "/"
+		}
+		if srv.Host != "" {
+			out.Host = []string{srv.Host}
+		}
+		return out
+
+	default:
+		return nil
 	}
 }
 

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"reflect"
 	"strings"
@@ -15,6 +16,14 @@ const (
 	testPW   = "22222222-3333-4444-5555-666666666666"
 	testHost = "203.0.113.10"
 )
+
+// b64 is the standard-base64 encoding panels use for ss:// and vmess://
+// payloads.
+func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+
+// ss2022TestKey is a valid 32-byte Shadowsocks-2022 key (base64 of 32 zero
+// bytes), used for the cipher's fixed-length password.
+const ss2022TestKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 func TestParseShareLinkVLESSReality(t *testing.T) {
 	link := "vless://" + testUUID + "@" + testHost + ":443" +
@@ -291,8 +300,17 @@ func TestParseShareLinkErrors(t *testing.T) {
 	}{
 		{name: "empty", link: "   ", wantErr: ErrInvalidLink},
 		{name: "not a url", link: "this is not a link", wantErr: ErrInvalidLink},
-		{name: "unsupported vmess", link: "vmess://" + testUUID + "@" + testHost + ":443", wantErr: ErrUnsupportedScheme},
-		{name: "unsupported ss", link: "ss://YWVzOnBhc3M@" + testHost + ":8388", wantErr: ErrUnsupportedScheme},
+		{name: "unsupported wireguard", link: "wireguard://" + testUUID + "@" + testHost + ":443", wantErr: ErrUnsupportedScheme},
+		{name: "ss without an endpoint", link: "ss://" + b64("aes-256-gcm:pass"), wantErr: ErrInvalidLink},
+		{name: "ss with a bad userinfo", link: "ss://bm90LWEtY2lwaGVy@" + testHost + ":8388#x", wantErr: ErrInvalidLink, wantSub: "method:password"},
+		{name: "ss with a plugin", link: "ss://" + b64("aes-256-gcm:pass") + "@" + testHost + ":8388/?plugin=obfs-local%3Bobfs%3Dhttp#x",
+			wantErr: ErrInvalidLink, wantSub: "plugin"},
+		{name: "vmess with a non-base64 payload", link: "vmess://@@@not-base64@@@", wantErr: ErrInvalidLink, wantSub: "base64"},
+		{name: "vmess with no port", link: "vmess://" + b64(`{"v":"2","add":"`+testHost+`","id":"`+testUUID+`"}`),
+			wantErr: ErrInvalidLink, wantSub: "invalid port"},
+		{name: "vmess with an unsupported network", link: "vmess://" + b64(`{"v":"2","add":"`+testHost+`","port":443,"id":"`+testUUID+`","net":"kcp"}`),
+			wantErr: ErrInvalidLink, wantSub: "not supported"},
+		{name: "trojan without a password", link: "trojan://@" + testHost + ":443#x", wantErr: ErrInvalidLink, wantSub: "missing password"},
 		{
 			name: "vless without uuid", link: "vless://" + testHost + ":443?security=tls#x",
 			wantErr: ErrInvalidLink, wantSub: "missing uuid",
@@ -360,8 +378,9 @@ func TestParseShareLinkErrors(t *testing.T) {
 }
 
 func TestParseShareLinkRejectsUnsupportedTransport(t *testing.T) {
-	// ws/grpc links parse fine but cannot be used by M1; validation catches it
-	// so `vender import` fails loudly instead of writing a broken server.
+	// A vless ws/grpc link parses fine but vless is TCP-only in vender;
+	// validation catches it so `vender import` fails loudly instead of writing
+	// a server that silently misbehaves. (vmess and trojan do support ws.)
 	link := "vless://" + testUUID + "@" + testHost + ":443?security=tls&sni=www.example.com&type=ws&path=%2Fws#WS-Node"
 	got, err := ParseShareLink(link)
 	if err != nil {
@@ -376,6 +395,156 @@ func TestParseShareLinkRejectsUnsupportedTransport(t *testing.T) {
 	}
 }
 
+func TestParseShareLinkShadowsocksSIP002(t *testing.T) {
+	// The form the user's provider serves: base64(method:password) userinfo.
+	link := "ss://" + b64("aes-256-gcm:dummy-password") + "@" + testHost + ":8388#Provider-Node"
+	got, err := ParseShareLink(link)
+	if err != nil {
+		t.Fatalf("ParseShareLink: %v", err)
+	}
+	want := Server{
+		Name: "Provider-Node", Type: TypeShadowsocks, Address: testHost, Port: 8388,
+		Method: "aes-256-gcm", Password: "dummy-password",
+	}
+	if !reflect.DeepEqual(*got, want) {
+		t.Errorf("parsed server mismatch\n got: %#v\nwant: %#v", *got, want)
+	}
+	if err := got.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+
+	// A 2022 cipher, whose password is a base64 key rather than a passphrase.
+	key := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	s2022 := "ss://" + b64("2022-blake3-aes-256-gcm:"+key) + "@" + testHost + ":8389#SS2022"
+	got2022, err := ParseShareLink(s2022)
+	if err != nil {
+		t.Fatalf("ParseShareLink(2022): %v", err)
+	}
+	if got2022.Method != "2022-blake3-aes-256-gcm" || got2022.Password != key {
+		t.Errorf("2022 parse = %#v", *got2022)
+	}
+	if !IsShadowsocks2022(got2022.Method) {
+		t.Errorf("IsShadowsocks2022(%q) = false", got2022.Method)
+	}
+
+	// Plain (un-encoded) userinfo is accepted too, as some panels emit it.
+	plain := "ss://aes-128-gcm:pass@" + testHost + ":8388#Plain"
+	if p, err := ParseShareLink(plain); err != nil || p.Method != "aes-128-gcm" || p.Password != "pass" {
+		t.Errorf("plain userinfo parse = %#v, %v", p, err)
+	}
+}
+
+func TestParseShareLinkShadowsocksLegacy(t *testing.T) {
+	// The fully-base64 legacy form: no userinfo, no port separator to split on.
+	link := "ss://" + b64("chacha20-ietf-poly1305:legacy-pass@"+testHost+":8388") + "#Legacy-Node"
+	got, err := ParseShareLink(link)
+	if err != nil {
+		t.Fatalf("ParseShareLink: %v", err)
+	}
+	want := Server{
+		Name: "Legacy-Node", Type: TypeShadowsocks, Address: testHost, Port: 8388,
+		Method: "chacha20-ietf-poly1305", Password: "legacy-pass",
+	}
+	if !reflect.DeepEqual(*got, want) {
+		t.Errorf("legacy parse mismatch\n got: %#v\nwant: %#v", *got, want)
+	}
+}
+
+func TestParseShareLinkVMess(t *testing.T) {
+	// A realistic v2rayN payload: the port and aid are strings, the alpn is a
+	// string, and the transport is WebSocket over TLS.
+	payload := `{"v":"2","ps":"RealWorld-WS","add":"` + testHost + `","port":"443",` +
+		`"id":"` + testUUID + `","aid":"0","scy":"auto","net":"ws","type":"none",` +
+		`"host":"cdn.example.com","path":"/ray","tls":"tls","sni":"cdn.example.com","alpn":"h2,http/1.1"}`
+	link := "vmess://" + b64(payload)
+
+	got, err := ParseShareLink(link)
+	if err != nil {
+		t.Fatalf("ParseShareLink: %v", err)
+	}
+	want := Server{
+		Name: "RealWorld-WS", Type: TypeVMess, Address: testHost, Port: 443,
+		UUID: testUUID, Cipher: "auto", Security: SecurityTLS, SNI: "cdn.example.com",
+		Fingerprint: "chrome", Network: NetworkWS, HeaderType: HeaderTypeNone,
+		Path: "/ray", Host: "cdn.example.com", ALPN: []string{"h2", "http/1.1"},
+	}
+	if !reflect.DeepEqual(*got, want) {
+		t.Errorf("vmess parse mismatch\n got: %#v\nwant: %#v", *got, want)
+	}
+	if err := got.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+
+	t.Run("grpc service name travels in path", func(t *testing.T) {
+		p := `{"v":"2","ps":"G","add":"` + testHost + `","port":443,"id":"` + testUUID + `","net":"grpc","path":"my-svc","tls":true}`
+		g, err := ParseShareLink("vmess://" + b64(p))
+		if err != nil {
+			t.Fatalf("ParseShareLink: %v", err)
+		}
+		if g.Network != NetworkGRPC || g.Path != "my-svc" || g.Security != SecurityTLS {
+			t.Errorf("grpc parse = %#v", *g)
+		}
+	})
+
+	t.Run("http network becomes tcp with an http header", func(t *testing.T) {
+		p := `{"v":"2","ps":"H","add":"` + testHost + `","port":80,"id":"` + testUUID + `","net":"http","path":"/x","host":"h.example.com"}`
+		g, err := ParseShareLink("vmess://" + b64(p))
+		if err != nil {
+			t.Fatalf("ParseShareLink: %v", err)
+		}
+		if g.Network != NetworkTCP || g.HeaderType != HeaderTypeHTTP || g.Path != "/x" {
+			t.Errorf("http parse = %#v", *g)
+		}
+		if g.Security != SecurityNone {
+			t.Errorf("Security = %q, want none without tls", g.Security)
+		}
+	})
+
+	t.Run("the name falls back to the fragment", func(t *testing.T) {
+		p := `{"v":"2","add":"` + testHost + `","port":443,"id":"` + testUUID + `"}`
+		g, err := ParseShareLink("vmess://" + b64(p) + "#From-Fragment")
+		if err != nil {
+			t.Fatalf("ParseShareLink: %v", err)
+		}
+		if g.Name != "From-Fragment" {
+			t.Errorf("Name = %q", g.Name)
+		}
+	})
+}
+
+func TestParseShareLinkTrojan(t *testing.T) {
+	link := "trojan://dummy-password@" + testHost + ":443" +
+		"?sni=www.example.com&type=ws&path=%2Ftrojan&host=www.example.com" +
+		"&allowInsecure=1&alpn=h2&fp=chrome#Trojan-WS"
+	got, err := ParseShareLink(link)
+	if err != nil {
+		t.Fatalf("ParseShareLink: %v", err)
+	}
+	want := Server{
+		Name: "Trojan-WS", Type: TypeTrojan, Address: testHost, Port: 443,
+		Password: "dummy-password", Security: SecurityTLS, SNI: "www.example.com",
+		Fingerprint: "chrome", Insecure: true, Network: NetworkWS,
+		HeaderType: HeaderTypeNone, Path: "/trojan", Host: "www.example.com",
+		ALPN: []string{"h2"},
+	}
+	if !reflect.DeepEqual(*got, want) {
+		t.Errorf("trojan parse mismatch\n got: %#v\nwant: %#v", *got, want)
+	}
+	if err := got.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+
+	t.Run("a bare trojan link is still TLS over TCP", func(t *testing.T) {
+		g, err := ParseShareLink("trojan://pw@" + testHost + ":8443#T")
+		if err != nil {
+			t.Fatalf("ParseShareLink: %v", err)
+		}
+		if g.Security != SecurityTLS || g.Network != NetworkTCP || g.HeaderType != HeaderTypeNone {
+			t.Errorf("bare trojan = %#v", *g)
+		}
+	})
+}
+
 func TestShareLinkRoundTrip(t *testing.T) {
 	links := []string{
 		"vless://" + testUUID + "@" + testHost + ":443?encryption=none&flow=xtls-rprx-vision" +
@@ -388,6 +557,14 @@ func TestShareLinkRoundTrip(t *testing.T) {
 			"&obfs-password=cafebabe&insecure=1#RT-Hy2",
 		"hy2://" + testPW + "@" + testHost + ":443/?sni=www.example.com&pinSHA256=DUMMYPIN&alpn=h3#RT-Hy2-Alias",
 		"hysteria2://" + testPW + "@host.example.org:8443/#RT-NoParams",
+		// M7: the new protocols, including both Shadowsocks spellings.
+		"ss://" + b64("aes-256-gcm:p@ss-word") + "@" + testHost + ":8388#RT-SS-SIP002",
+		"ss://" + b64("2022-blake3-aes-256-gcm:"+ss2022TestKey+"@"+testHost+":8389") + "#RT-SS-Legacy",
+		"vmess://" + b64(`{"v":"2","ps":"RT-VMess","add":"`+testHost+`","port":"443","id":"`+testUUID+
+			`","aid":"0","scy":"auto","net":"ws","type":"none","host":"cdn.example.com","path":"/rt","tls":"tls","sni":"cdn.example.com","alpn":["h2"]}`),
+		"vmess://" + b64(`{"v":"2","ps":"RT-VMess-TCP","add":"`+testHost+`","port":8443,"id":"`+testUUID+`"}`),
+		"trojan://dummy-password@" + testHost + ":443?sni=www.example.com&type=grpc&path=svc#RT-Trojan",
+		"trojan://dummy-password@" + testHost + ":8443#RT-Trojan-TCP",
 	}
 
 	for _, link := range links {

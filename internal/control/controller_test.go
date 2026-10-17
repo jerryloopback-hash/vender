@@ -505,6 +505,134 @@ func TestControllerEngineFailureIsReported(t *testing.T) {
 	}
 }
 
+// newProfileFixture is newFixture plus a subscription profile: two
+// hand-imported nodes (manual) and two provider nodes, with profiles.yaml
+// present but inactive (so auto still scopes to manual until SetProfile).
+func newProfileFixture(t *testing.T) *fixture {
+	t.Helper()
+	cfgDir, runDir := t.TempDir(), t.TempDir()
+	store := config.NewStoreAt(cfgDir)
+	if err := store.EnsureDir(); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
+	}
+	manual := config.Server{
+		Name: "Hand-A", Type: config.TypeHysteria2, Address: testHost, Port: 8443,
+		Password: "password", SNI: "www.bing.com", Insecure: true,
+	}
+	provA := config.Server{
+		Name: "Prov-A", Type: config.TypeShadowsocks, Address: "203.0.113.20", Port: 8388,
+		Method: "aes-256-gcm", Password: "dummy-ss-pass", Profile: "provider",
+	}
+	provB := config.Server{
+		Name: "Prov-B", Type: config.TypeTrojan, Address: "203.0.113.21", Port: 443,
+		Password: "dummy-trojan-pass", Security: config.SecurityTLS, SNI: "cdn.example.com",
+		Fingerprint: "chrome", Network: "tcp", Profile: "provider",
+	}
+	ss := config.NewServerSet()
+	for _, s := range []config.Server{manual, provA, provB} {
+		if err := ss.Add(s, false); err != nil {
+			t.Fatalf("Add(%s): %v", s.Name, err)
+		}
+	}
+	if err := store.SaveServers(ss); err != nil {
+		t.Fatalf("SaveServers: %v", err)
+	}
+	ps := config.NewProfileSet()
+	ps.Upsert(config.Profile{Name: "provider", URL: "https://sub.example.com/x", FetchedAt: time.Now()})
+	if err := store.SaveProfiles(ps); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+	cfg := config.Default()
+	cfg.SelectedServer = config.SelectedServerAuto
+	if err := store.SaveConfig(cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	eng := newFakeEngine()
+	ctrl, err := NewController(ControllerOptions{
+		Store: store, RunDir: runDir, Engine: eng, BinaryPath: "/bin/true", Version: "test",
+	})
+	if err != nil {
+		t.Fatalf("NewController: %v", err)
+	}
+	t.Cleanup(ctrl.Close)
+	return &fixture{ctrl: ctrl, engine: eng, store: store, cfgDir: cfgDir, runDir: runDir}
+}
+
+// TestControllerProfileSwitchScopesAuto is the M7 rule in code: with
+// selected_server "auto", switching the active profile switches which servers
+// the engine's URLTest group is built from — and nothing else.
+func TestControllerProfileSwitchScopesAuto(t *testing.T) {
+	f := newProfileFixture(t)
+	if err := f.ctrl.StartEngine(); err != nil {
+		t.Fatalf("StartEngine: %v", err)
+	}
+
+	// The default active profile is manual, so the group has one member.
+	if got := f.engine.lastWrite().Servers; len(got) != 1 || got[0].Name != "Hand-A" {
+		t.Fatalf("default auto pool = %v, want [Hand-A]", serverNames(got))
+	}
+	st := f.ctrl.Status()
+	if st.Profile != config.ProfileManual || st.ProfileServers != 1 {
+		t.Errorf("status profile = %q/%d, want manual/1", st.Profile, st.ProfileServers)
+	}
+
+	// Switching profiles restarts the engine with the new pool.
+	if err := f.ctrl.SetProfile("provider"); err != nil {
+		t.Fatalf("SetProfile: %v", err)
+	}
+	got := serverNames(f.engine.lastWrite().Servers)
+	if len(got) != 2 || got[0] != "Prov-A" || got[1] != "Prov-B" {
+		t.Fatalf("auto pool after SetProfile = %v, want [Prov-A Prov-B]", got)
+	}
+	st = f.ctrl.Status()
+	if st.Profile != "provider" || st.ProfileServers != 2 {
+		t.Errorf("status profile = %q/%d, want provider/2", st.Profile, st.ProfileServers)
+	}
+	// The registry's URL is not leaked through the status.
+	if strings.Contains(fmt.Sprint(st.Profiles), "sub.example.com") {
+		t.Errorf("status leaked a subscription URL: %v", st.Profiles)
+	}
+	// All three profiles are known to a client.
+	if got := st.Profiles; len(got) != 2 || got[0] != config.ProfileManual || got[1] != "provider" {
+		t.Errorf("status profiles = %v", got)
+	}
+
+	// A specific server still works regardless of the active profile.
+	if err := f.ctrl.SelectServer("Hand-A"); err != nil {
+		t.Fatalf("SelectServer(Hand-A): %v", err)
+	}
+	if srv := f.engine.lastWrite().Server; srv == nil || srv.Name != "Hand-A" {
+		t.Errorf("single-server outbound = %v", srv)
+	}
+	if err := f.ctrl.SelectServer(config.SelectedServerAuto); err != nil {
+		t.Fatalf("SelectServer(auto): %v", err)
+	}
+
+	// "all" widens the pool without touching the profiles themselves.
+	if err := f.ctrl.SetProfile("all"); err != nil {
+		t.Fatalf("SetProfile(all): %v", err)
+	}
+	if got := serverNames(f.engine.lastWrite().Servers); len(got) != 3 {
+		t.Errorf("auto pool for all = %v, want 3 servers", got)
+	}
+
+	// A typo is refused before anything is written.
+	if err := f.ctrl.SetProfile("ghost"); err == nil {
+		t.Fatal("SetProfile(ghost) = nil error")
+	} else if KindOf(err) != KindNotFound {
+		t.Errorf("kind = %q, want not_found", KindOf(err))
+	}
+}
+
+func serverNames(servers []config.Server) []string {
+	out := make([]string, 0, len(servers))
+	for _, s := range servers {
+		out = append(out, s.Name)
+	}
+	return out
+}
+
 func TestControllerCallRoutesEveryCommand(t *testing.T) {
 	f := newFixture(t)
 

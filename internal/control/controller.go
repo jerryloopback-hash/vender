@@ -91,6 +91,7 @@ type Controller struct {
 	mu         sync.RWMutex
 	cfg        config.Config
 	servers    *config.ServerSet
+	profiles   *config.ProfileSet
 	running    bool
 	restarting bool
 	stopping   bool
@@ -216,6 +217,43 @@ func (c *Controller) SelectServer(name string) error {
 		}
 		return Errorf(KindInternal, "control: %v", err)
 	}
+	return c.applyLocked()
+}
+
+// SetProfile makes a profile active, persists it to profiles.yaml, and
+// restarts the engine if it is running. With selected_server "auto" that
+// changes which nodes the failover group may use, so a running engine has to
+// be re-rendered — hence the same render-and-restart path as a mode switch.
+//
+// An unknown name is refused before anything is written, so a typo cannot
+// leave the config pointing at a profile that does not exist.
+func (c *Controller) SetProfile(name string) error {
+	c.ops.Lock()
+	defer c.ops.Unlock()
+
+	ps, err := c.store.LoadProfiles()
+	if err != nil {
+		return Errorf(KindInternal, "control: %v", err)
+	}
+	ss, err := c.store.LoadServers()
+	if err != nil {
+		return Errorf(KindInternal, "control: %v", err)
+	}
+	canonical, ok := config.KnownProfileName(ss, ps, name)
+	if !ok {
+		return Errorf(KindNotFound, "control: no profile named %q (see `vender profiles list`)", name)
+	}
+	if canonical == config.ProfileAll {
+		ps.Active = config.ProfileAll
+	} else if strings.EqualFold(canonical, config.ProfileManual) {
+		ps.Active = ""
+	} else {
+		ps.Active = canonical
+	}
+	if err := c.store.SaveProfiles(ps); err != nil {
+		return Errorf(KindInternal, "control: %v", err)
+	}
+	c.note(fmt.Sprintf("profile %s", ps.ActiveName()))
 	return c.applyLocked()
 }
 
@@ -405,11 +443,15 @@ func (c *Controller) render() (core.RuntimeConfig, error) {
 	if err != nil {
 		return core.RuntimeConfig{}, Errorf(KindInternal, "control: %v", err)
 	}
+	profiles, err := c.store.LoadProfiles()
+	if err != nil {
+		return core.RuntimeConfig{}, Errorf(KindInternal, "control: %v", err)
+	}
 
 	var srv *config.Server
 	var all []config.Server
 	if cfg.Proxy.Mode != config.ModeDirect {
-		s, as, serr := cfg.Selection(servers)
+		s, as, serr := cfg.SelectionInProfile(servers, profiles.ActiveName())
 		if serr != nil {
 			kind := KindBadRequest
 			if errors.Is(serr, config.ErrNotFound) {
@@ -442,6 +484,7 @@ func (c *Controller) render() (core.RuntimeConfig, error) {
 	c.mu.Lock()
 	c.cfg = *cfg
 	c.servers = servers
+	c.profiles = profiles
 	c.mu.Unlock()
 	return rc, nil
 }
@@ -725,6 +768,18 @@ func (c *Controller) Status() StatusData {
 	if servers != nil {
 		st.ServerCount = servers.Len()
 	}
+	// Profile state: which profile is active, how many servers auto failover
+	// would use, and every known profile name (so a client can cycle them).
+	var ps *config.ProfileSet
+	ps, _ = c.store.LoadProfiles()
+	if ps == nil {
+		ps = config.NewProfileSet()
+	}
+	st.Profile = ps.ActiveName()
+	st.Profiles = config.KnownProfiles(servers, ps)
+	if servers != nil {
+		st.ProfileServers = servers.CountInProfile(ps.ActiveName())
+	}
 	if !startedAt.IsZero() && running {
 		st.StartedAt = startedAt.Format(time.RFC3339)
 		st.UptimeSecs = int(time.Since(startedAt).Seconds())
@@ -776,6 +831,7 @@ func (c *Controller) Servers() ServersData {
 			Endpoint: srv.Endpoint(),
 			Detail:   srv.Detail(),
 			Active:   strings.EqualFold(srv.Name, selected),
+			Profile:  srv.ProfileName(),
 		})
 	}
 	return out
@@ -1034,6 +1090,15 @@ func (c *Controller) Call(ctx context.Context, cmd string, args json.RawMessage)
 			return nil, err
 		}
 		return ApplyData{Action: CmdTun, Status: c.Status()}, nil
+	case CmdProfile:
+		var a ProfileArgs
+		if err := decodeArgs(args, &a); err != nil {
+			return nil, err
+		}
+		if err := c.SetProfile(a.Name); err != nil {
+			return nil, err
+		}
+		return ApplyData{Action: CmdProfile, Status: c.Status()}, nil
 	case CmdLatency:
 		var a LatencyArgs
 		if err := decodeArgs(args, &a); err != nil {

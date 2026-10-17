@@ -38,6 +38,46 @@ func goldenCases(t *testing.T) []goldenCase {
 		Fingerprint: "firefox",
 	}
 
+	// M7 outbound types. Each one is a real-world shape: the provider's
+	// Shadowsocks node, a vmess WebSocket node behind TLS, a vmess gRPC node,
+	// a vmess TCP stream with an HTTP header, and a Trojan node over TLS.
+	ss := &config.Server{
+		Name: "Test-SS", Type: config.TypeShadowsocks, Address: testHost, Port: 8388,
+		Method: "aes-256-gcm", Password: "ss-password",
+	}
+	ss2022 := &config.Server{
+		Name: "Test-SS2022", Type: config.TypeShadowsocks, Address: testHost, Port: 8389,
+		Method: "2022-blake3-aes-256-gcm", Password: ss2022Key,
+	}
+	vmessWS := &config.Server{
+		Name: "Test-VMess-WS", Type: config.TypeVMess, Address: testHost, Port: 443,
+		UUID: testUUID, Cipher: "auto", Security: config.SecurityTLS,
+		SNI: "www.example.com", Fingerprint: "chrome",
+		Network: config.NetworkWS, Path: "/vmess", Host: "www.example.com",
+	}
+	vmessGRPC := &config.Server{
+		Name: "Test-VMess-GRPC", Type: config.TypeVMess, Address: testHost, Port: 8443,
+		UUID: testUUID, Cipher: "chacha20-poly1305", AlterID: 4,
+		Security: config.SecurityNone, Network: config.NetworkGRPC, Path: "svc-name",
+	}
+	vmessHTTP := &config.Server{
+		Name: "Test-VMess-HTTP", Type: config.TypeVMess, Address: testHost, Port: 80,
+		UUID: testUUID, Cipher: "auto", Security: config.SecurityNone,
+		Network: config.NetworkTCP, HeaderType: config.HeaderTypeHTTP,
+		Path: "/", Host: "cdn.example.com",
+	}
+	trojanWS := &config.Server{
+		Name: "Test-Trojan-WS", Type: config.TypeTrojan, Address: testHost, Port: 443,
+		Password: "trojan-password", Security: config.SecurityTLS,
+		SNI: "www.example.com", Fingerprint: "chrome", Insecure: true,
+		Network: config.NetworkWS, Path: "/trojan", Host: "www.example.com",
+	}
+	trojanTCP := &config.Server{
+		Name: "Test-Trojan", Type: config.TypeTrojan, Address: testHost, Port: 8443,
+		Password: "trojan-password", Security: config.SecurityTLS,
+		SNI: "www.example.com", Network: config.NetworkTCP,
+	}
+
 	return []goldenCase{
 		{
 			name: "vless-reality",
@@ -203,6 +243,53 @@ func goldenCases(t *testing.T) []goldenCase {
 					return c
 				}(),
 				Server: reality, RunDir: "/run/vender",
+			},
+		},
+
+		// M7: the new outbound types, one golden per distinct shape.
+		{
+			name: "shadowsocks", file: "shadowsocks.golden",
+			rc: RuntimeConfig{Config: *config.Default(), Server: ss, RunDir: "/run/vender"},
+		},
+		{
+			name: "shadowsocks-2022", file: "shadowsocks_2022.golden",
+			rc: RuntimeConfig{Config: *config.Default(), Server: ss2022, RunDir: "/run/vender"},
+		},
+		{
+			name: "vmess-ws-tls", file: "vmess_ws.golden",
+			rc: RuntimeConfig{Config: *config.Default(), Server: vmessWS, RunDir: "/run/vender"},
+		},
+		{
+			name: "vmess-grpc", file: "vmess_grpc.golden",
+			rc: RuntimeConfig{Config: *config.Default(), Server: vmessGRPC, RunDir: "/run/vender"},
+		},
+		{
+			name: "vmess-http-header", file: "vmess_http.golden",
+			rc: RuntimeConfig{Config: *config.Default(), Server: vmessHTTP, RunDir: "/run/vender"},
+		},
+		{
+			name: "trojan-ws", file: "trojan_ws.golden",
+			rc: RuntimeConfig{Config: *config.Default(), Server: trojanWS, RunDir: "/run/vender"},
+		},
+		{
+			name: "trojan-tcp", file: "trojan_tcp.golden",
+			rc: RuntimeConfig{Config: *config.Default(), Server: trojanTCP, RunDir: "/run/vender"},
+		},
+		{
+			// M7: auto failover scoped to a profile. The renderer only ever
+			// sees the *pool* (RuntimeConfig.Servers), so this pins that a
+			// mix of the new protocols renders as one outbound each inside a
+			// URLTest group tagged `proxy` — exactly what
+			// config.SelectionInProfile passes in for an active profile.
+			name: "auto-profile-mixed", file: "auto_profile_mixed.golden",
+			rc: RuntimeConfig{
+				Config: func() config.Config {
+					c := *config.Default()
+					c.SelectedServer = config.SelectedServerAuto
+					return c
+				}(),
+				Servers: []config.Server{*ss, *vmessWS, *trojanWS},
+				RunDir:  "/run/vender",
 			},
 		},
 	}

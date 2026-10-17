@@ -388,12 +388,15 @@ func TestCLIImportRejectsBadLinks(t *testing.T) {
 		link    string
 		wantSub string
 	}{
-		{name: "unsupported scheme", link: "vmess://" + testUUID + "@" + testHost + ":443#x", wantSub: "unsupported share link scheme"},
+		{name: "unsupported scheme", link: "wireguard://" + testUUID + "@" + testHost + ":443#x", wantSub: "unsupported share link scheme"},
 		{name: "garbage", link: "hello", wantSub: "missing scheme"},
 		{name: "bad uuid", link: "vless://nope@" + testHost + ":443#x", wantSub: "not a UUID"},
 		{name: "reality without public key", link: "vless://" + testUUID + "@" + testHost + ":443?security=reality&sni=www.example.com#x", wantSub: "public_key"},
 		{name: "hy2 without password", link: "hysteria2://" + testHost + ":8443/#x", wantSub: "missing password"},
-		{name: "ws transport is out of scope", link: "vless://" + testUUID + "@" + testHost + ":443?security=tls&sni=www.example.com&type=ws#x", wantSub: "tcp only"},
+		{name: "vless ws transport is out of scope", link: "vless://" + testUUID + "@" + testHost + ":443?security=tls&sni=www.example.com&type=ws#x", wantSub: "tcp only"},
+		{name: "vmess with a broken payload", link: "vmess://@@@not-base64@@@", wantSub: "vmess"},
+		{name: "ss with a plugin", link: "ss://YWVzLTI1Ni1nY206cGFzcw@203.0.113.10:8388/?plugin=obfs-local#x", wantSub: "plugin"},
+		{name: "trojan without a password", link: "trojan://@203.0.113.10:443#x", wantSub: "missing password"},
 	}
 
 	for _, tt := range tests {

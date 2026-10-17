@@ -167,9 +167,9 @@ func TestServerValidate(t *testing.T) {
 		}(), wantSub: "control characters"},
 		{name: "unknown type", srv: func() Server {
 			s := validHy2()
-			s.Type = "trojan"
+			s.Type = "wireguard"
 			return s
-		}(), wantSub: "not one of vless, hysteria2"},
+		}(), wantSub: "not one of vless, hysteria2, shadowsocks, vmess, trojan"},
 		{name: "empty server", srv: func() Server {
 			s := validHy2()
 			s.Address = ""
@@ -246,6 +246,47 @@ func TestServerValidate(t *testing.T) {
 			s.ObfsPassword = "cafebabe"
 			return s
 		}()},
+		{name: "valid shadowsocks", srv: Server{
+			Name: "ss", Type: TypeShadowsocks, Address: testHost, Port: 8388,
+			Method: "aes-256-gcm", Password: "dummy",
+		}},
+		{name: "valid shadowsocks 2022", srv: Server{
+			Name: "ss2022", Type: TypeShadowsocks, Address: testHost, Port: 8388,
+			Method: "2022-blake3-aes-256-gcm", Password: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		}},
+		{name: "shadowsocks without a method", srv: Server{
+			Name: "ss", Type: TypeShadowsocks, Address: testHost, Port: 8388, Password: "dummy",
+		}, wantSub: "method is required"},
+		{name: "shadowsocks with an unknown cipher", srv: Server{
+			Name: "ss", Type: TypeShadowsocks, Address: testHost, Port: 8388,
+			Method: "rot13", Password: "dummy",
+		}, wantSub: "not a Shadowsocks cipher"},
+		{name: "shadowsocks without a password", srv: Server{
+			Name: "ss", Type: TypeShadowsocks, Address: testHost, Port: 8388, Method: "aes-256-gcm",
+		}, wantSub: "password is required"},
+		{name: "valid vmess over ws with tls", srv: Server{
+			Name: "vm", Type: TypeVMess, Address: testHost, Port: 443, UUID: testUUID,
+			Cipher: "auto", Security: SecurityTLS, SNI: "www.example.com",
+			Network: NetworkWS, HeaderType: HeaderTypeNone, Path: "/ray",
+		}},
+		{name: "vmess without a uuid", srv: Server{
+			Name: "vm", Type: TypeVMess, Address: testHost, Port: 443, Cipher: "auto",
+		}, wantSub: "uuid is required for vmess"},
+		{name: "vmess with reality is rejected", srv: Server{
+			Name: "vm", Type: TypeVMess, Address: testHost, Port: 443, UUID: testUUID,
+			Security: SecurityReality, SNI: "www.example.com", Network: NetworkTCP,
+		}, wantSub: "not one of none, tls"},
+		{name: "vmess with an unsupported network", srv: Server{
+			Name: "vm", Type: TypeVMess, Address: testHost, Port: 443, UUID: testUUID,
+			Network: "kcp",
+		}, wantSub: "not supported for vmess"},
+		{name: "valid trojan", srv: Server{
+			Name: "tr", Type: TypeTrojan, Address: testHost, Port: 443,
+			Password: "dummy", Security: SecurityTLS, SNI: "www.example.com", Network: NetworkTCP,
+		}},
+		{name: "trojan without a password", srv: Server{
+			Name: "tr", Type: TypeTrojan, Address: testHost, Port: 443, Security: SecurityTLS,
+		}, wantSub: "password is required for trojan"},
 	}
 
 	for _, tt := range tests {

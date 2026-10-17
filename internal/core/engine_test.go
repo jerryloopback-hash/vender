@@ -14,6 +14,10 @@ const (
 	testUUID = "11111111-1111-1111-1111-111111111111"
 	testPW   = "22222222-3333-4444-5555-666666666666"
 	testHost = "203.0.113.10"
+	// ss2022Key is a valid 32-byte Shadowsocks-2022 pre-shared key (base64 of
+	// 32 zero bytes). sing-box validates the length, so the golden/check
+	// fixtures need a well-formed one; it is used by no server anywhere.
+	ss2022Key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 )
 
 // testVLESS is a complete REALITY server entry used by several tests.

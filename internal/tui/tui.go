@@ -115,6 +115,7 @@ func runPlain(ctx context.Context, opts Options, w io.Writer) error {
 	snap := loadSnapshot(opts)
 	fmt.Fprintf(w, "listen       %s\n", orDash(snap.Listen))
 	fmt.Fprintf(w, "mode         %s\n", orDash(snap.Mode))
+	fmt.Fprintf(w, "profile      %s\n", orDash(activeProfileOf(snap)))
 	fmt.Fprintf(w, "tun          %s (stack %s, device %s, auto_route %s)\n",
 		onOffWord(snap.Tun.Enabled), orDash(snap.Tun.Stack), orDash(snap.Tun.InterfaceName),
 		onOffWord(snap.Tun.AutoRouteEnabled()))
@@ -147,6 +148,15 @@ func runPlain(ctx context.Context, opts Options, w io.Writer) error {
 		st.EngineRunning, st.EngineHealthy, st.EnginePid, humanDuration(st.UptimeSecs))
 	fmt.Fprintf(w, "selected     %s\n", orDash(st.Selected))
 	return nil
+}
+
+// activeProfileOf is the snapshot's active profile, for the plain (non-TTY)
+// snapshot.
+func activeProfileOf(snap configSnapshot) string {
+	if snap.Profiles == nil {
+		return config.ProfileManual
+	}
+	return snap.Profiles.ActiveName()
 }
 
 // rendererFor picks the lipgloss renderer for a writer. A non-terminal or

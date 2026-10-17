@@ -1,0 +1,67 @@
+# A Clash / Mihomo proxy-provider file, as a provider that ignores the v2ray
+# user agent serves it. Dummy values only.
+proxies:
+  - name: Clash-SS
+    type: ss
+    server: 203.0.113.20
+    port: 8388
+    cipher: aes-256-gcm
+    password: dummy-ss-pass
+    udp: true
+  - name: Clash-VMess-WS
+    type: vmess
+    server: 203.0.113.21
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    alterId: 0
+    cipher: auto
+    tls: true
+    servername: cdn.example.com
+    network: ws
+    ws-opts:
+      path: /ray
+      headers:
+        Host: cdn.example.com
+    client-fingerprint: chrome
+  - name: Clash-Trojan
+    type: trojan
+    server: 203.0.113.22
+    port: 443
+    password: dummy-trojan-pass
+    sni: www.example.com
+    skip-cert-verify: true
+    alpn: [h2, http/1.1]
+  - name: Clash-VLESS-Reality
+    type: vless
+    server: 203.0.113.23
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    flow: xtls-rprx-vision
+    tls: true
+    servername: www.example.com
+    client-fingerprint: chrome
+    network: tcp
+    reality-opts:
+      public-key: DUMMY-FAKE-PUBLIC-KEY-FOR-TESTS-ONLY-0000000000
+      short-id: 0123456789abcdef
+  - name: Clash-Hysteria2
+    type: hysteria2
+    server: 203.0.113.24
+    port: 8443
+    password: dummy-hy2-pass
+    sni: www.example.com
+    skip-cert-verify: true
+  - name: Clash-SS-Plugin
+    type: ss
+    server: 203.0.113.25
+    port: 8388
+    cipher: aes-256-gcm
+    password: dummy-ss-pass
+    plugin: obfs
+    plugin-opts:
+      mode: http
+  - name: Clash-WireGuard
+    type: wireguard
+    server: 203.0.113.26
+    port: 51820
+    private-key: dummy

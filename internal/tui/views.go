@@ -213,6 +213,7 @@ func (m Model) daemonPanel(w int) string {
 	line3 := m.theme.subtle.Render("mode     ") + m.theme.value.Render(orDash(st.Mode)) +
 		m.theme.subtle.Render("   listen ") + m.theme.value.Render(orDash(st.Listen)) +
 		m.theme.subtle.Render("   tun ") + m.tunBadge() +
+		m.theme.subtle.Render("   profile ") + m.theme.value.Render(orDash(m.activeProfile())) +
 		m.theme.subtle.Render("   servers ") + m.theme.value.Render(fmt.Sprintf("%d (%d active)", st.ServerCount, activeCount(m.servers)))
 	line4 := m.theme.subtle.Render("latency  ") + m.latencyBadge() +
 		m.theme.subtle.Render("   engine ") + m.theme.value.Render(orDash(st.EngineVersion))
@@ -329,12 +330,13 @@ func (m Model) serverText() string {
 		return m.theme.dim.Render("(not used in direct mode)")
 	}
 	if m.proxies.Auto {
+		pool := m.profileCount(m.activeProfile())
 		cur := m.activeNode()
 		if cur == "" {
-			return m.theme.accent.Render("auto") + m.theme.subtle.Render("  failover over "+fmt.Sprint(len(m.servers))+" servers")
+			return m.theme.accent.Render("auto") + m.theme.subtle.Render(fmt.Sprintf("  failover over %d servers of profile %s", pool, m.activeProfile()))
 		}
 		return m.theme.accent.Render("auto") + m.theme.subtle.Render("  → ") + m.theme.value.Render(cur) +
-			m.theme.dim.Render(fmt.Sprintf("   (%d candidates)", len(m.servers)))
+			m.theme.dim.Render(fmt.Sprintf("   (%d candidates in profile %s)", pool, m.activeProfile()))
 	}
 	name := m.selectedName()
 	if name == "" {
@@ -435,6 +437,9 @@ func (m Model) nodesView() string {
 	}
 	head := " " + m.theme.title.Render(title) + "   " +
 		m.theme.subtle.Render("↑/↓ move · enter select · A auto · t latency · r reload")
+	head += "\n  " + m.theme.subtle.Render("profile  ") + m.theme.value.Render(m.activeProfile()) +
+		m.theme.dim.Render(fmt.Sprintf("   (%d of %d servers; `selected_server: auto` fails over over these)",
+			m.profileCount(m.activeProfile()), len(m.servers)))
 	if m.proxies.Auto {
 		cur := m.activeNode()
 		if cur == "" {
@@ -481,15 +486,17 @@ func newNodesTable(th theme) table.Model {
 // absorbs whatever is left over.
 func nodeColumns(inner int) []table.Column {
 	marker, typ, active, latency := 2, 10, 7, 12
-	protocol := clampInt(inner/5, 8, 20)
-	endpoint := clampInt(inner/4, 10, 24)
-	name := inner - (marker + typ + protocol + endpoint + active + latency)
+	protocol := clampInt(inner/6, 8, 16)
+	endpoint := clampInt(inner/5, 10, 20)
+	profile := clampInt(inner/8, 6, 12)
+	name := inner - (marker + typ + protocol + endpoint + profile + active + latency)
 	if name < 8 {
 		name = 8
 	}
 	return []table.Column{
 		{Title: "", Width: marker},
 		{Title: "NAME", Width: name},
+		{Title: "PROFILE", Width: profile},
 		{Title: "TYPE", Width: typ},
 		{Title: "PROTOCOL", Width: protocol},
 		{Title: "ENDPOINT", Width: endpoint},
@@ -522,7 +529,7 @@ func (m Model) nodeTableRows() []table.Row {
 		if s.Active {
 			active = "●"
 		}
-		rows = append(rows, table.Row{mark, s.Name, s.Type, s.Protocol, s.Endpoint, active, s.Latency})
+		rows = append(rows, table.Row{mark, s.Name, s.Profile, s.Type, s.Protocol, s.Endpoint, active, s.Latency})
 	}
 	return rows
 }
@@ -640,17 +647,81 @@ func (m Model) settingsView() string {
 		m.theme.subtle.Render("engine binary      ")+m.theme.value.Render(orDash(m.snap.Binary))+
 			m.theme.subtle.Render("   log ")+m.theme.value.Render(orDash(m.snap.LogLevel)),
 		m.theme.subtle.Render("config dir         ")+m.theme.value.Render(m.snap.ConfigDir)+
-			m.theme.subtle.Render("   bind ")+m.theme.value.Render(orDash(m.snap.BindInterface)),
+			m.theme.subtle.Render("   bind ")+m.theme.value.Render(orDash(m.snap.BindInterface))+
+			m.theme.subtle.Render("   profile ")+m.theme.value.Render(m.activeProfile()),
 	)
 
 	policy := m.policyLines(mode)
 
-	return strings.Join([]string{
-		m.theme.panel("routing mode", w, modeLines...),
+	panels := []string{m.theme.panel("routing mode", w, modeLines...)}
+	// The profiles panel appears only once there is a subscription profile to
+	// switch between; until then a single "profile manual" note in the
+	// inbounds panel is enough, and the Settings screen stays short.
+	if lines := m.profilePanelLines(); lines != nil {
+		panels = append(panels, m.theme.panel("profiles", w, lines...))
+	}
+	panels = append(panels,
 		m.theme.panel("inbounds", w, inbounds...),
 		m.theme.panel("built-in routing policy", w, policy...),
 		m.theme.panel("autostart", w, m.autostartLines()...),
-	}, "\n")
+	)
+	return strings.Join(panels, "\n")
+}
+
+// profilePanelLines renders the profile panel: every known profile, its node
+// count, which one is active, and what "active" means for `selected_server:
+// auto`. Switching goes through the daemon (p), because the failover group's
+// members are engine state.
+//
+// It returns nil when the only profiles are the built-in "manual" and the
+// "all" pseudo-profile, which is a fresh install: there is nothing to switch
+// to, so the panel would be noise.
+func (m Model) profilePanelLines() []string {
+	active := m.activeProfile()
+	names := append(m.profileNames(), config.ProfileAll)
+	seen := map[string]bool{}
+	var lines []string
+	for _, name := range names {
+		if seen[strings.ToLower(name)] {
+			continue
+		}
+		seen[strings.ToLower(name)] = true
+
+		mark := m.theme.dim.Render("( )")
+		if strings.EqualFold(name, active) {
+			mark = m.theme.ok.Render("(●)")
+		}
+		note := ""
+		if p, ok := m.snap.Profiles.Get(name); ok && p.URL != "" {
+			note = redactSubscription(p.URL)
+		} else {
+			switch {
+			case strings.EqualFold(name, config.ProfileManual):
+				note = "built-in (imported by hand)"
+			case strings.EqualFold(name, config.ProfileAll):
+				note = "every server"
+			}
+		}
+		lines = append(lines, fmt.Sprintf("%s %s %s  %s",
+			mark,
+			m.theme.value.Render(pad(name, 16)),
+			m.theme.subtle.Render(fmt.Sprintf("%3d nodes", m.profileCount(name))),
+			m.theme.dim.Render(truncate(note, max(10, m.panelWidth()-40)))))
+	}
+	if len(seen) <= 2 {
+		return nil
+	}
+	lines = append(lines, m.theme.dim.Render("p switch profile · the active profile scopes the auto failover group"))
+	return lines
+}
+
+// redactSubscription hides the query string of a subscription URL, which is
+// where a provider's token usually lives.
+func redactSubscription(raw string) string {
+	if i := strings.Index(raw, "?"); i >= 0 {
+		return raw[:i] + "?…"
+	}
+	return raw
 }
 
 // tunLines renders the TUN inbound's state inside the inbounds panel. It is the
@@ -915,6 +986,7 @@ func (m Model) helpOverlay() string {
 		{
 			"Settings",
 			"  ←/→, h/l   choose a mode     enter  apply",
+			"  p          switch the active profile (scopes auto failover)",
 			"  u          toggle TUN mode (transparent, system-wide capture)",
 			"  a          toggle start at login (systemd unit / XDG entry / Run key)",
 		},
@@ -962,7 +1034,7 @@ func (m Model) keyMap() help.KeyMap {
 		return km{short: append([]key.Binding{f, b("/", "filter"), b("t", "clear")}, common...)}
 	case screenSettings:
 		return km{short: append([]key.Binding{
-			b("←/→", "mode"), b("enter", "apply"), b("u", "tun"), b("a", "start at login"),
+			b("←/→", "mode"), b("enter", "apply"), b("p", "profile"), b("u", "tun"), b("a", "start at login"),
 		}, common...)}
 	default:
 		short := []key.Binding{b("t", "latency"), b("s/x", "start/stop"), b("m", "mode")}

@@ -119,6 +119,89 @@ func boolText(b bool) string {
 	return "off"
 }
 
+// checkTestServers returns one server per supported outbound type, each shaped
+// the way a real subscription link produces it. They are used by the engine
+// acceptance test for M7's new protocols.
+func checkTestServers() []*config.Server {
+	vmess := &config.Server{
+		Name: "Check-VMess", Type: config.TypeVMess, Address: testHost, Port: 443,
+		UUID: testUUID, Cipher: "auto", Security: config.SecurityTLS,
+		SNI: "www.example.com", Fingerprint: "chrome",
+		Network: config.NetworkWS, Path: "/vmess", Host: "www.example.com",
+	}
+	vmess.Normalize()
+	trojan := &config.Server{
+		Name: "Check-Trojan", Type: config.TypeTrojan, Address: testHost, Port: 443,
+		Password: "check-test-password", Security: config.SecurityTLS,
+		SNI: "www.example.com", Insecure: true, ALPN: []string{"h2", "http/1.1"},
+	}
+	trojan.Normalize()
+	ss := &config.Server{
+		Name: "Check-SS", Type: config.TypeShadowsocks, Address: testHost, Port: 8388,
+		Method: "aes-256-gcm", Password: "check-test-password",
+	}
+	ss.Normalize()
+	ss2022 := &config.Server{
+		Name: "Check-SS2022", Type: config.TypeShadowsocks, Address: testHost, Port: 8389,
+		Method: "2022-blake3-aes-256-gcm", Password: ss2022Key,
+	}
+	ss2022.Normalize()
+	return []*config.Server{checkTestServer(), checkTestHy2(), ss, ss2022, vmess, trojan}
+}
+
+// TestNewOutboundTypesPassSingBoxCheck runs the engine's own validator over a
+// config rendered for each M7 outbound type, singly and inside an auto-failover
+// group. A golden file can only agree with itself; `sing-box check` is what
+// proves the field names and value shapes are ones the pinned engine accepts.
+func TestNewOutboundTypesPassSingBoxCheck(t *testing.T) {
+	singbox := findSingBox()
+	if singbox == "" {
+		t.Skip("no sing-box binary (set VENDER_TEST_SINGBOX, or run scripts/fetch-sing-box.sh)")
+	}
+
+	for _, srv := range checkTestServers() {
+		srv := srv
+		t.Run(string(srv.Type)+"/"+srv.Name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := *config.Default()
+			rc := RuntimeConfig{Config: cfg, Server: srv, BinaryPath: singbox, RunDir: dir}
+			eng, err := New(rc)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if err := eng.WriteConfig(rc); err != nil {
+				t.Fatalf("WriteConfig: %v", err)
+			}
+			out, err := exec.Command(singbox, "check", "-c", ConfigPath(dir)).CombinedOutput()
+			if err != nil {
+				t.Fatalf("sing-box check rejected the %s config: %v\n%s", srv.Type, err, out)
+			}
+		})
+	}
+
+	t.Run("auto-failover-mixed-profile", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := *config.Default()
+		cfg.SelectedServer = config.SelectedServerAuto
+		pool := make([]config.Server, 0, len(checkTestServers()))
+		for _, s := range checkTestServers() {
+			pool = append(pool, *s)
+		}
+		rc := RuntimeConfig{Config: cfg, Servers: pool, BinaryPath: singbox, RunDir: dir}
+		eng, err := New(rc)
+		if err != nil {
+			t.Fatalf("New (auto): %v", err)
+		}
+		if err := eng.WriteConfig(rc); err != nil {
+			t.Fatalf("WriteConfig (auto): %v", err)
+		}
+		out, err := exec.Command(singbox, "check", "-c", ConfigPath(dir)).CombinedOutput()
+		if err != nil {
+			t.Fatalf("sing-box check rejected the mixed auto config: %v\n%s", err, out)
+		}
+	})
+}
+
 // checkTestHy2 is a Hysteria2 server the engine accepts, used as the second
 // member of an auto-failover group.
 func checkTestHy2() *config.Server {

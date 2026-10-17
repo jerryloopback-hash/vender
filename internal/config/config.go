@@ -315,16 +315,34 @@ func (c *Config) ValidateAgainst(ss *ServerSet) error {
 // It is the single place the daemon and the controller agree on what
 // selected_server means, so `core` never has to know about the sentinel.
 func (c *Config) Selection(ss *ServerSet) (*Server, []Server, error) {
+	return c.SelectionInProfile(ss, "")
+}
+
+// SelectionInProfile is Selection with the failover pool scoped to one
+// profile: with selected_server "auto", the URLTest group is built over the
+// servers of activeProfile only (an empty activeProfile means "every server",
+// which is the pre-M7 behaviour and what an absent profiles.yaml yields).
+//
+// A named server is resolved against the whole set regardless of profile: a
+// user who names a server means that server.
+func (c *Config) SelectionInProfile(ss *ServerSet, activeProfile string) (*Server, []Server, error) {
 	if c.Proxy.Mode == ModeDirect {
 		return nil, nil, nil
 	}
 	if c.IsAutoServer() {
-		if ss == nil || ss.Len() == 0 {
-			return nil, nil, fmt.Errorf("selected_server %q needs at least one server in servers.yaml", SelectedServerAuto)
+		var pool []Server
+		if ss != nil {
+			pool = ss.InProfile(activeProfile)
 		}
-		all := make([]Server, len(ss.Servers))
-		copy(all, ss.Servers)
-		return nil, all, nil
+		if len(pool) == 0 {
+			profile := strings.TrimSpace(activeProfile)
+			if profile == "" {
+				return nil, nil, fmt.Errorf("selected_server %q needs at least one server in servers.yaml", SelectedServerAuto)
+			}
+			return nil, nil, fmt.Errorf("selected_server %q needs at least one server in profile %q (switch profiles with `vender profiles use`, or add nodes)",
+				SelectedServerAuto, profile)
+		}
+		return nil, pool, nil
 	}
 	if c.SelectedServer == "" {
 		return nil, nil, fmt.Errorf("no server selected for proxy mode %q:\n"+

@@ -59,6 +59,7 @@ func (a *app) runStatus(cmd *cobra.Command) error {
 	fmt.Fprintf(out, "listen       %s (%s)\n", cfg.Proxy.Listen, listenLabel(listening))
 	fmt.Fprintf(out, "mode         %s\n", cfg.Proxy.Mode)
 	fmt.Fprintf(out, "tun          %s\n", tunLabel(cfg, running))
+	fmt.Fprintf(out, "profile      %s\n", activeProfileLabel(store))
 	fmt.Fprintf(out, "server       %s\n", selectedServerLabel(cfg, store))
 
 	switch {
@@ -71,6 +72,21 @@ func (a *app) runStatus(cmd *cobra.Command) error {
 	default:
 		return nil
 	}
+}
+
+// activeProfileLabel renders the active profile and how many servers it holds,
+// which is what `selected_server: auto` scopes to.
+func activeProfileLabel(store *config.Store) string {
+	ps, err := store.LoadProfiles()
+	if err != nil {
+		return "unknown (" + err.Error() + ")"
+	}
+	ss, serr := store.LoadServers()
+	if serr != nil {
+		return ps.ActiveName()
+	}
+	active := ps.ActiveName()
+	return fmt.Sprintf("%s (%d servers)", active, ss.CountInProfile(active))
 }
 
 func stateLabel(running bool) string {
@@ -109,7 +125,12 @@ func selectedServerLabel(cfg *config.Config, store *config.Store) string {
 		return cfg.SelectedServer + " (servers.yaml unreadable: " + err.Error() + ")"
 	}
 	if cfg.IsAutoServer() {
-		return fmt.Sprintf("auto (failover over %d servers)", ss.Len())
+		ps, err := store.LoadProfiles()
+		if err != nil {
+			return fmt.Sprintf("auto (failover over %d servers)", ss.Len())
+		}
+		active := ps.ActiveName()
+		return fmt.Sprintf("auto (failover over %d servers in profile %q)", ss.CountInProfile(active), active)
 	}
 	srv, ok := ss.Get(cfg.SelectedServer)
 	if !ok {

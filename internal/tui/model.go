@@ -53,7 +53,7 @@ const defaultRefreshInterval = time.Second
 // milestoneTag is the build milestone shown in the tab bar. It is what the
 // documentation and `vender version` are read against, so it moves with the
 // milestone rather than with the build.
-const milestoneTag = "M6"
+const milestoneTag = "M7"
 
 // --- messages ---------------------------------------------------------------
 
@@ -128,6 +128,9 @@ type configSnapshot struct {
 	BindInterface string
 	Selected      string
 	Servers       []config.Server
+	// Profiles is the profile registry (profiles.yaml), so the Settings screen
+	// can show and switch the active profile with no daemon running.
+	Profiles *config.ProfileSet
 	// UserRules is the parsed rules.yaml (nil when the file is absent), and
 	// UserRulesErr says why it could not be read. They let the Settings screen
 	// show the *merged* policy with no daemon running.
@@ -219,6 +222,7 @@ type serverRow struct {
 	Type     string
 	Protocol string
 	Endpoint string
+	Profile  string
 	Active   bool
 	Latency  string
 	// Health is the engine's verdict on this node (auto mode): "up"/"down"/
@@ -468,6 +472,14 @@ func loadSnapshot(opts Options) configSnapshot {
 	} else {
 		snap.Servers = ss.Servers
 	}
+	if ps, err := store.LoadProfiles(); err != nil {
+		if snap.Err == "" {
+			snap.Err = err.Error()
+		}
+		snap.Profiles = config.NewProfileSet()
+	} else {
+		snap.Profiles = ps
+	}
 	return snap
 }
 
@@ -503,6 +515,19 @@ func setModeCmd(ctx context.Context, opts Options, mode string) tea.Cmd {
 			return actionDoneMsg{label: "mode " + mode, err: err}
 		}
 		return actionDoneMsg{label: "mode set to " + mode}
+	})
+}
+
+// profileCmd switches the active profile through the daemon. It is daemon state
+// because with `selected_server: auto` the active profile decides which nodes
+// the failover group is built from, so a running engine has to be re-rendered.
+func profileCmd(ctx context.Context, opts Options, name string) tea.Cmd {
+	return actionCall(ctx, opts, func(cli *control.Client, cctx context.Context) tea.Msg {
+		applied, err := cli.SetProfile(cctx, name)
+		if err != nil {
+			return actionDoneMsg{label: "profile " + name, err: err}
+		}
+		return actionDoneMsg{label: "profile " + applied.Status.Profile}
 	})
 }
 
@@ -962,6 +987,10 @@ func (m Model) handleSettingsKey(key string) (tea.Model, tea.Cmd) {
 		// Toggle the TUN inbound. Unlike start-at-login this is daemon state —
 		// the engine's whole inbound set changes — so it needs the daemon.
 		return m.toggleTun()
+	case "p":
+		// Cycle the active profile: with `selected_server: auto`, that changes
+		// which nodes the failover group may use.
+		return m.cycleProfile()
 	case "a":
 		// Toggle start-at-login. It is a local change (a systemd unit, an XDG
 		// entry, a registry value), so it does not need the daemon — which is
@@ -1076,6 +1105,66 @@ func (m Model) cycleMode() (tea.Model, tea.Cmd) {
 	next := modes[(indexOfMode(config.ProxyMode(m.currentMode()))+1)%len(modes)]
 	m.settingsCursor = indexOfMode(next)
 	return m.applyMode(next)
+}
+
+// --- profiles ---------------------------------------------------------------
+
+// activeProfile is the profile whose servers `selected_server: auto` scopes to.
+// It prefers the daemon's answer (that is what the running engine was rendered
+// with) and falls back to profiles.yaml, which is all there is with no daemon.
+func (m Model) activeProfile() string {
+	if m.attached && m.status.Profile != "" {
+		return m.status.Profile
+	}
+	if m.snap.Profiles != nil {
+		return m.snap.Profiles.ActiveName()
+	}
+	return config.ProfileManual
+}
+
+// profileNames lists every known profile, for display and for cycling. The
+// daemon knows about profiles the TUI's snapshot might not (it re-reads
+// servers.yaml on every render), so its list wins when attached.
+func (m Model) profileNames() []string {
+	if m.attached && len(m.status.Profiles) > 0 {
+		return m.status.Profiles
+	}
+	ss := &config.ServerSet{Servers: m.snap.Servers}
+	return config.KnownProfiles(ss, m.snap.Profiles)
+}
+
+// profileCount is how many servers belong to a profile, counted from the
+// snapshot (which is always complete, with or without a daemon).
+func (m Model) profileCount(name string) int {
+	ss := &config.ServerSet{Servers: m.snap.Servers}
+	return ss.CountInProfile(name)
+}
+
+// cycleProfile advances to the next known profile and switches to it through
+// the daemon. "all" (every server) is included, so a user can always get back
+// to unfiltered failover.
+func (m Model) cycleProfile() (tea.Model, tea.Cmd) {
+	if !m.attached {
+		m.setToast("profiles are daemon state: start it with `vender daemon`", true)
+		return m, nil
+	}
+	names := append(m.profileNames(), config.ProfileAll)
+	current := m.activeProfile()
+	idx := 0
+	for i, n := range names {
+		if strings.EqualFold(n, current) {
+			idx = i
+			break
+		}
+	}
+	// "all" is rendered as the active profile's canonical name being "all" or
+	// the raw setting; normalise so the index lands on it reliably.
+	next := names[(idx+1)%len(names)]
+	if strings.EqualFold(next, current) {
+		next = names[(idx+2)%len(names)]
+	}
+	m.busy = "switching to profile " + next + "…"
+	return m, profileCmd(m.ctx, m.opts, next)
 }
 
 func (m Model) applyMode(mode config.ProxyMode) (tea.Model, tea.Cmd) {
@@ -1210,6 +1299,7 @@ func (m *Model) rebuildRows() {
 			Type:     string(srv.Type),
 			Protocol: srv.Detail(),
 			Endpoint: srv.Endpoint(),
+			Profile:  srv.ProfileName(),
 			Active:   strings.EqualFold(srv.Name, m.selectedName()),
 			Latency:  m.latencyText(srv.Name),
 		}

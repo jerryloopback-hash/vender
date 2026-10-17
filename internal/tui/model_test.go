@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -82,6 +83,30 @@ func fixtureSnapshot(servers []config.Server) configSnapshot {
 			Detail: "uid 1000 does not hold CAP_NET_ADMIN (CapEff 0000000000000000)",
 		},
 	}
+}
+
+// profileFixture is a subscription profile on top of the two hand-imported
+// nodes, so the Settings screen has something real to show: a registry entry
+// with a URL, a node count, and an active profile that is not "manual".
+func profileFixture() ([]config.Server, *config.ProfileSet) {
+	servers := fixtureServers()
+	servers = append(servers, config.Server{
+		Name: "Provider-LA-SS", Type: config.TypeShadowsocks, Address: "198.51.100.20", Port: 8388,
+		Method: "aes-256-gcm", Password: testPW, Profile: "provider",
+	})
+	servers = append(servers, config.Server{
+		Name: "Provider-Tokyo-Trojan", Type: config.TypeTrojan, Address: "198.51.100.21", Port: 443,
+		Password: testPW, Security: config.SecurityTLS, SNI: "cdn.example.com",
+		Fingerprint: "chrome", Network: "tcp", Profile: "provider",
+	})
+	ps := config.NewProfileSet()
+	ps.Upsert(config.Profile{
+		Name:      "provider",
+		URL:       "https://sub.example.com/api/v1/client/subscribe?token=0000000000000000000000000000000000000000",
+		FetchedAt: time.Date(2026, 10, 17, 9, 30, 0, 0, time.UTC),
+	})
+	ps.Active = "provider"
+	return servers, ps
 }
 
 // runningModel is the Dashboard with a healthy daemon and some traffic.
@@ -200,6 +225,53 @@ func TestViewSettings(t *testing.T) {
 		"final", "dns", "user rules", "sets",
 		"start at login", "checking",
 	})
+}
+
+// The profiles panel lists every known profile with its node count, marks the
+// active one, and redacts a subscription URL's token.
+func TestViewSettingsShowsProfiles(t *testing.T) {
+	servers, profiles := profileFixture()
+	m := newTestModel(t)
+	m.snap = fixtureSnapshot(servers)
+	m.snap.Profiles = profiles
+	m = m.switchScreen(screenSettings)
+	m.tabAnim = tabAnimSteps
+	m.rebuildRows()
+
+	view := m.View()
+	for _, want := range []string{
+		"profiles", "provider", "manual", "all",
+		"2 nodes", "sub.example.com", "?…", "p switch profile",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("settings profiles panel does not contain %q:\n%s", want, view)
+		}
+	}
+	// The token must never be printed.
+	if strings.Contains(view, "0000000000000000000000000000000000000000") {
+		t.Errorf("the subscription token leaked into the view:\n%s", view)
+	}
+	assertGolden(t, "settings_profiles.golden", view, nil)
+}
+
+// `p` on the Settings screen cycles the active profile through a daemon
+// command and marks the screen busy while it runs. The command itself is not
+// executed here: it would need a daemon.
+func TestSettingsProfileCycleIsACommand(t *testing.T) {
+	servers, profiles := profileFixture()
+	m := runningModel(t)
+	m.snap = fixtureSnapshot(servers)
+	m.snap.Profiles = profiles
+	m = m.switchScreen(screenSettings)
+
+	next, cmd := m.handleSettingsKey("p")
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("p did not issue a profile command")
+	}
+	if !strings.Contains(m.busy, "profile") {
+		t.Errorf("busy = %q", m.busy)
+	}
 }
 
 // The autostart panel is built from state the TUI reads itself, so it is

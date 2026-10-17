@@ -9,8 +9,9 @@ and the interfaces that later milestones compile against today.
 
 - A single small binary that gives a Linux / Windows 11 user a working local
   proxy with minimal ceremony.
-- Two well-chosen outbound protocols: VLESS + Vision + REALITY (TCP) and
-  Hysteria2 (UDP).
+- Five outbound protocols: VLESS + Vision + REALITY (TCP), Hysteria2 (UDP), and
+  — since M7 — Shadowsocks, VMess and Trojan, which is what a commercial
+  provider ("机场") serves.
 - A local **mixed SOCKS5 + HTTP** inbound so applications opt in per app, which
   stays the default and the primary way to use vender.
 - An **optional TUN mode** (M6) for the traffic that cannot be configured per
@@ -22,8 +23,11 @@ and the interfaces that later milestones compile against today.
 
 - TUN mode **off by default**, and never switched on by vender itself: it changes
   the host's routing table, so it is an explicit `vender tun on`.
-- No subscription marketplace, no telemetry, no accounts.
+- No subscription marketplace, no telemetry, no accounts. A subscription is a
+  URL *the user already has*; vender fetches it and forgets the rest.
 - No attempt to reimplement the proxy protocols; sing-box does that.
+- No SIP003 Shadowsocks plugins (M7): a link that needs one is rejected by name
+  rather than connecting without the obfuscation the server expects.
 - No attempt to reimplement the kernel's job: the routing rules, the fwmarks and
   the device are sing-box's, driven by vender's own `engine.tun` block.
 
@@ -55,7 +59,7 @@ and the interfaces that later milestones compile against today.
         +----------------------------+   +--------+---------+
         |  browser / curl / ...      |   |  vender CLI      |
         +----------------------------+   | import, servers, |
-                                         | status, proxy    |
+                                         | profiles, status |
                                          +------------------+
 ```
 
@@ -83,7 +87,7 @@ Two directories, deliberately:
 
 | Directory | Contents | Lifetime |
 |---|---|---|
-| `os.UserConfigDir()/vender` | `config.yaml`, `servers.yaml` | the user's; editable, backable-up, never overwritten by vender except through `import`/`servers`/`select` |
+| `os.UserConfigDir()/vender` | `config.yaml`, `servers.yaml`, `profiles.yaml` | the user's; editable, backable-up, never overwritten by vender except through `import`/`servers`/`profiles`/`select` |
 | `os.UserCacheDir()/vender` | `singbox.json`, `rules/*.srs`, `vender.lock`, `vender.pid`, `control.json` | the daemon's; disposable, regenerated on every start |
 
 `--config-dir` and `--run-dir` override both, which is what keeps the test
@@ -92,16 +96,18 @@ suite from touching a real installation.
 ## 3. Packages
 
 ```
-cmd/vender/            CLI (cobra): version, import, servers, rules, daemon, status,
-                       proxy, autostart, tui
-internal/config/       config.yaml + servers.yaml + share-link parsing  [M0]
+cmd/vender/            CLI (cobra): version, import, servers, profiles, rules,
+                       daemon, status, proxy, autostart, tui
+internal/config/       config.yaml + servers.yaml + profiles.yaml + share-link
+                       parsing                                             [M0, M7]
+internal/subscription/ subscription fetching + parsing (links, base64, Clash) [M7]
 internal/core/         engine contract + sing-box rendering + supervision [M1]
                        + the Clash API client used for traffic and latency  [M3]
-internal/rules/        built-in routing policy + embedded rule sets       [M2]
+internal/rules/        built-in routing policy + embedded rule sets        [M2]
 internal/control/      daemon control channel: protocol, server, client,
-                       and the controller that owns the engine            [M3]
-internal/tui/          Bubble Tea TUI (a control-channel client)         [M3]
-internal/autostart/    start-at-login registration                       [M4]
+                       and the controller that owns the engine             [M3]
+internal/tui/          Bubble Tea TUI (a control-channel client)           [M3]
+internal/autostart/    start-at-login registration                         [M4]
 docs/                  this document
 scripts/               build + release helpers (build.sh, package.sh,
                        install.sh, fetch-rules.sh, fetch-sing-box.sh)
@@ -114,9 +120,12 @@ cmd/vender     ->  internal/core
                ->  internal/control
                ->  internal/tui (M3)
                ->  internal/config
+               ->  internal/subscription (M7)
                ->  internal/rules
 internal/core  ->  internal/config
                ->  internal/rules
+internal/subscription -> internal/config (only for the share-link parser; the
+                     parsing is pure, Fetch is net/http)
 internal/rules ->  (pure data + embedded assets; imports nothing of vender's)
 internal/control -> internal/core
                  -> internal/config
@@ -145,6 +154,7 @@ loopback TCP (§8).
 |---|---|---|
 | `config.yaml` | `0644` | global settings; contains no secrets |
 | `servers.yaml` | `0600` | the server list; contains credentials |
+| `profiles.yaml` | `0600` | the profile registry (M7): which profiles exist, each one's subscription URL and last fetch time, and which one is active. `0600` because a subscription URL often carries a token |
 | `rules.yaml` | `0644` | optional per-user routing rules (M5); absent means "built-in policy, unmodified" |
 
 The config directory itself is created `0700`. Writes are atomic: content is
@@ -180,15 +190,17 @@ engine:
         address: []                     # the device's own address(es)
         route_exclude_address: []        # CIDRs kept out of the tunnel
         route_exclude_address_set: []    # rule-set tags kept out of the tunnel
-selected_server: ""             # name in servers.yaml, or "auto" (M5 failover)
+selected_server: ""             # a name in servers.yaml, or "auto" (failover
+                                # within the active profile; see §4.5)
 ```
 
-`selected_server: auto` renders a URLTest group over **every** server in
-`servers.yaml` instead of a single `proxy` outbound, so a degraded node is
-bypassed without anyone switching anything. It is the only value that is not a
-server name; `Config.IsAutoServer` recognises it (case-insensitively), and
-`Config.Selection` is the single place the daemon and the controller agree on
-what it means.
+`selected_server: auto` renders a URLTest group over the servers of the **active
+profile** instead of a single `proxy` outbound, so a degraded node is bypassed
+without anyone switching anything. `Config.IsAutoServer` recognises the sentinel
+(case-insensitively), and `Config.SelectionInProfile` is the single place the
+daemon and the controller agree on what it means. With no `profiles.yaml` the
+active profile is the built-in `manual` one, every server is manual, and the
+pool is therefore every server — byte-identical to M5's behaviour. See §4.5.
 
 `engine.tun.auto_route` is a `*bool` so that "absent" means the documented
 default (`true`) while an explicit `auto_route: false` is honoured: a plain
@@ -216,9 +228,10 @@ fail to bind on exactly the hosts that already run a proxy.
 ```yaml
 servers:
     - name: My-Node
-      type: vless               # vless | hysteria2
+      type: vless               # vless | hysteria2 | shadowsocks | vmess | trojan
       server: 203.0.113.10      # host or IP
       port: 443
+      profile: provider         # M7; absent => the built-in "manual" profile
       # --- vless ---
       uuid: ...
       flow: xtls-rprx-vision
@@ -237,17 +250,35 @@ servers:
       insecure: true
       pin_sha256: ...
       alpn: [h3]
+      # --- shadowsocks ---
+      method: aes-256-gcm       # or 2022-blake3-aes-256-gcm, ... (M7)
+      # --- vmess (M7) ---
+      cipher: auto              # the vmess "scy"
+      alter_id: 0               # the vmess "aid"
+      # --- vmess + trojan transport (M7) ---
+      path: /ray                # ws path / grpc service name / http path
+      host: cdn.example.com     # ws / http Host
 ```
 
 Validation is per type. A `vless` entry requires a well-formed UUID, and with
 `security: reality` it additionally requires `public_key` and `sni`; with
 `security: tls` it requires `sni`. A `hysteria2` entry requires `password`, and
-`obfs_password` must be present if and only if `obfs` is set. Only `network: tcp`
-is accepted today; a `ws`/`grpc` link fails loudly instead of silently
-misbehaving. `Server.Normalize` applies safe defaults (`network: tcp`,
-`fingerprint: chrome`, `header_type: none`) but deliberately does **not** invent
-a `flow`: a REALITY link that omits `flow` means the server expects a plain
-stream, and defaulting it would break that server.
+`obfs_password` must be present if and only if `obfs` is set. Only vless
+`network: tcp` is accepted; a vless `ws`/`grpc` link fails loudly instead of
+silently misbehaving (VMess and Trojan do support `tcp`/`ws`/`grpc`). A
+`shadowsocks` entry requires a `method` vender knows (checked against the list
+sing-box accepts, so a typo is reported by vender, not the engine) and a
+`password`. A `vmess` entry requires a UUID and accepts `none`/`tls`; a
+`trojan` entry requires a password and is always TLS. REALITY is a VLESS-only
+transport: a `vmess` entry with `security: reality` is rejected rather than
+silently rendered as plain TLS.
+
+`Server.Normalize` applies safe defaults (`network: tcp`,
+`fingerprint: chrome`, `header_type: none`, `cipher: auto` for vmess) but
+deliberately does **not** invent a `flow`: a REALITY link that omits `flow` means
+the server expects a plain stream, and defaulting it would break that server. It
+also folds `profile: manual` back to absent, so the implicit profile never
+appears in the file and a pre-M7 `servers.yaml` round-trips byte for byte.
 
 `Server.String` is redaction-safe — it prints only type, name and endpoint — so
 it can be embedded in errors and logs. The only code that emits credentials is
@@ -255,9 +286,23 @@ it can be embedded in errors and logs. The only code that emits credentials is
 
 ### 4.4 Share-link parsing (`internal/config/sharelink.go`)
 
-`ParseShareLink` accepts VLESS and Hysteria2 links and yields a normalized
+`ParseShareLink` accepts every supported scheme and yields a normalized
 `Server`; `Server.ShareLink()` renders the canonical inverse. Both directions
 are covered by tests, including round-trips.
+
+| Scheme | Form |
+|---|---|
+| `vless` | `vless://<uuid>@<host>:<port>?<params>#Name` |
+| `hysteria2` / `hy2` | `hysteria2://<password>@<host>:<port>/?<params>#Name` |
+| `ss` | SIP002 `ss://<base64(method:password)>@<host>:<port>/?<params>#Name` **and** legacy `ss://<base64(method:password@host:port)>#Name` |
+| `vmess` | `vmess://<base64(json)>` (the v2rayN object) |
+| `trojan` | `trojan://<password>@<host>:<port>?<params>#Name` |
+
+`ss://` and `vmess://` are **not** parsed with `net/url`: their payload is a
+base64 blob that legitimately contains `/` and `+`, which `net/url` would read as
+a path or a space. Both are scanned by hand, and any of the four base64
+spellings (standard/URL-safe, padded/unpadded) is accepted, because panels
+disagree and the difference is never meaningful.
 
 **VLESS**
 
@@ -299,18 +344,136 @@ fallback for panels that place it there. `insecure` accepts `1/0`, `true/false`,
 `yes/no`, `on/off`; `alpn` accepts a comma-separated list or repeated
 parameters.
 
+**Shadowsocks**
+
+SIP002 puts the credentials in the userinfo as base64 (`method:password`); the
+legacy form puts *everything* in one base64 blob and carries no userinfo at all.
+The parser distinguishes the two by the presence of a literal `@` (which cannot
+occur in the base64 alphabet). A percent-encoded `method:password` userinfo is
+accepted too, as some panels emit it. `?plugin=…` is **rejected by name**:
+vender does not implement SIP003 plugins, and connecting without the
+obfuscation the server expects would fail in a way that looks like a dead node.
+
+**VMess**
+
+The payload is a JSON object (`v, ps, add, port, id, aid, scy, net, type, host,
+path, tls, sni, alpn`). It is decoded leniently because panels disagree on
+types: `port` and `aid` may be numbers or quoted numbers, `tls` may be `true` or
+`"tls"`, `alpn` may be a comma-separated string or an array. `net` is mapped to
+vender's transport (`tcp`, `ws`, `grpc`; `http`/`h2` fold into `tcp` with an
+`http` header, since that is what they mean on the wire); `kcp`/`quic` and other
+transports vender does not support are rejected with the offending field named.
+For gRPC the service name travels in `path`, which is where v2rayN puts it.
+
+**Trojan**
+
+`type` is the transport (`tcp`, `ws`, `grpc`), `path`/`host` are the transport's
+destination, `allowInsecure`/`insecure`/`skip-cert-verify` are accepted as the
+insecure flag. Security is always TLS; there is no plaintext Trojan.
+
 **Names.** The server name is the URL fragment (percent-decoded by
-`url.Parse`). With no fragment the name falls back to `host:port`, bracketed for
-IPv6.
+`url.Parse`), or the `ps` field for VMess. With no name the name falls back to
+`host:port`, bracketed for IPv6.
 
 **IPv6.** A link such as `vless://<uuid>@[2001:db8::1]:443?...` stores the bare
 literal in `server` and re-brackets on output via `net.JoinHostPort`, so
 `Endpoint()` and `ShareLink()` are always correctly bracketed.
 
 `ParseShareLink` reports typed errors: `ErrInvalidLink` for a recognized-but-
-broken link, `ErrUnsupportedScheme` for e.g. `ss://`. Messages name the exact
-component that failed (missing uuid, missing port, out-of-range port, bad
-boolean, unsupported encryption).
+broken link, `ErrUnsupportedScheme` for e.g. `wireguard://`. Messages name the
+exact component that failed (missing uuid, missing port, out-of-range port, bad
+boolean, unsupported encryption, a plugin that is not implemented).
+
+### 4.5 Profiles and subscriptions (`internal/config/profiles.go`, `internal/subscription`)
+
+A **profile** is a named group of servers. It exists for exactly one purpose:
+`selected_server: auto` otherwise has no way to know which nodes belong together,
+and a user with both hand-typed nodes and a provider's subscription wants
+"fail over between my provider's nodes", not "between all sixteen of them".
+
+**Membership lives on the server; metadata lives in a separate file.** Each
+`Server` carries `profile` (absent ⇒ the built-in `manual` profile), and
+`profiles.yaml` records only where a group came from: the subscription URL, the
+last fetch time, and the active profile's name. Three consequences are the whole
+argument for this split:
+
+- `servers.yaml` alone is sufficient to know which servers belong together, so a
+  hand-edited file (or one copied between machines) cannot end up with a profile
+  that references servers it does not have;
+- `profiles.yaml` is safe to lose — the worst case is forgetting the URL and
+  falling back to `manual` — which is why it can be a small, disposable file;
+- a pre-M7 `servers.yaml` has no `profile` key, every entry loads as `manual`,
+  and the active profile therefore defaults to `manual`, so `auto` keeps
+  covering every server. **That is the compatibility guarantee, and it is
+  asserted by a test.**
+
+```go
+const ProfileManual = "manual"  // built in; never stored; cannot be removed
+const ProfileAll    = "all"     // "every server"; a reserved *name*, not a profile
+
+type Profile struct { Name, URL string; FetchedAt time.Time }
+type ProfileSet struct { Active string; Profiles []Profile }
+
+func (ps *ProfileSet) ActiveName() string            // never empty
+func (ps *ProfileSet) Get(name string) (*Profile, bool)
+func (ps *ProfileSet) Upsert(p Profile) *Profile
+func (ps *ProfileSet) Remove(name string) bool
+
+func KnownProfiles(ss *ServerSet, ps *ProfileSet) []string   // manual + registry + server-carried
+func KnownProfileName(ss *ServerSet, ps *ProfileSet, name string) (string, bool)
+
+func (ss *ServerSet) InProfile(name string) []Server          // "" / "all" => every server
+func (ss *ServerSet) CountInProfile(name string) int
+func (ss *ServerSet) ProfileNames() []string
+func (ss *ServerSet) RemoveProfile(name string) (int, error)
+func (ss *ServerSet) UpsertProfileServers(profile string, servers []Server, force bool) (ImportStats, error)
+func (ss *ServerSet) RemoveServersExcept(profile string, keep []string) []string
+
+func (s *Store) LoadProfiles() (*ProfileSet, error)
+func (s *Store) SaveProfiles(*ProfileSet) error
+func (s *Store) SelectProfile(name string) (string, error)
+func (s *Store) RemoveProfile(name string) (int, error)
+func (s *Store) ProfileImport(profile, url string, at time.Time, servers []Server, replace, force bool) (ImportStats, string, error)
+```
+
+`KnownProfiles` is a **union**, because either half can exist alone: a
+hand-edited `servers.yaml` can name a profile the registry has never heard of,
+and an imported profile can have all its servers deleted by hand. `profiles list`
+prints that union, so what you see is what `auto` can actually use.
+
+**Import semantics.** `UpsertProfileServers` updates a name that already exists
+*inside the profile* (that is what re-importing means), leaves an entry that is
+already present verbatim alone (so a repeated import does not churn
+`servers.yaml`), and reports a name held by a *different* profile as a conflict
+instead of silently stealing it — `--force` overrides, `--name-prefix` avoids it
+altogether. `ProfileImport(replace: true)` is the refresh path: it drops the
+profile's stale nodes first. When a removed node was `selected_server`, the
+selection falls back to `auto`, because a `selected_server` naming a server that
+no longer exists would make the daemon refuse to start.
+
+**The subscription package** (`internal/subscription`) is deliberately split so
+that only one function touches the network:
+
+| Function | Network? | Role |
+|---|---|---|
+| `Parse(data) (Result, Format, error)` | no | auto-detect and parse; `Result` carries the usable servers and one `Skipped{Node, Reason}` per unusable node |
+| `ParseLinks(text)` | no | newline-separated share links (blank/`#`/`//` lines ignored; duplicates dropped by name) |
+| `ParseClash(data)` | no | Clash / Mihomo YAML with a `proxies:` list |
+| `Fetch(ctx, client, url)` | yes | `http.Client` + `User-Agent: v2rayN/6.0`, ctx- and size-bounded |
+| `DeriveProfileName(url)` | no | the default profile name (the URL's host) |
+
+Auto-detection order: a `proxies:` key ⇒ Clash YAML; else plain links; else
+base64-of-links; else YAML. The v2ray user agent matters — an unknown agent is
+often served an HTML page or a Clash config instead of links — and a Clash
+response is handled anyway, which is why the YAML shape is a first-class parser
+rather than a fallback.
+
+Parsing is pure and tested against fixtures with **no network at all**: the
+fetch tests inject an `http.Client` with a fake `RoundTripper` and assert the user
+agent, so `go test` never opens a socket (not even loopback). Nodes that cannot
+be used are skipped *with a reason* rather than failing the subscription — a
+provider's list routinely contains a protocol vender does not implement, and a
+user should get the other 40 nodes.
 
 ## 5. CLI (`cmd/vender`)
 
@@ -323,9 +486,14 @@ without touching the user's real configuration.
 |---|---|
 | `vender version` | implemented (M0) |
 | `vender import <share-link>` | implemented (M0) (`--name`, `--force`) |
+| `vender import --url <subscription> [--profile N] [--name-prefix P]` | implemented (M7) — fetch, parse (links / base64 / Clash), file under a profile, per-node summary |
 | `vender servers list` | implemented (M0) (`--links`) |
 | `vender servers use <name\|auto>` | implemented (M5) — selects a server, or `auto` for failover; restarts a running daemon |
 | `vender servers rm <name>` | implemented (M0) |
+| `vender profiles list` | implemented (M7) — name, node count, source URL, last-updated, active |
+| `vender profiles use <name\|all>` | implemented (M7) — makes a profile active; restarts a running daemon |
+| `vender profiles update [name]` | implemented (M7) — re-fetch and reconcile |
+| `vender profiles rm <name>` | implemented (M7) — removes a profile's servers; refuses the built-in `manual` |
 | `vender rules list` | implemented (M2; merged policy in M5) — the ordered policy, DNS split and embedded sets |
 | `vender rules path` / `vender rules init` | implemented (M5) — the user rules file (`rules.yaml`) |
 | `vender daemon` | implemented (M1) — foreground, one per run dir |
@@ -400,10 +568,16 @@ possible. It emits up to five top-level sections — `log`, `dns`, `inbounds`,
   from `proxy.listen`, and — when TUN mode is on — a `tun` inbound tagged
   `tun-in` (§6.5), which shares the struct and the `omitempty` tags so the
   TUN-off output is byte-identical to M1/M2's;
-- the **proxy** outbound (`vless` with `flow` + `tls.utls` + `tls.reality`, or
-  `hysteria2` with `password` + `obfs` + `tls`), always tagged `proxy` — or, in
-  `selected_server: auto` mode, one outbound per configured server plus a
-  `urltest` group **also tagged `proxy`** (§7.5), so nothing downstream changes;
+- the **proxy** outbound (`vless` with `flow` + `tls.utls` + `tls.reality`,
+  `hysteria2` with `password` + `obfs` + `tls`, `shadowsocks` with
+  `method` + `password`, `vmess` with `uuid` + `security` + `alter_id`, or
+  `trojan` with `password` + `tls`; vmess and trojan also carry a
+  `transport` — `ws` with a `Host` header, `grpc` with a `service_name`, or
+  `http` for an HTTP-framed TCP stream), always tagged `proxy` — or, in
+  `selected_server: auto` mode, one outbound per server in the **active
+  profile's pool** plus a `urltest` group **also tagged `proxy`** (§7.5), so
+  nothing downstream changes. The renderer only ever sees the pool
+  (`RuntimeConfig.Servers`), so `core` needs no knowledge of profiles at all;
 - a `direct` outbound and a `block` outbound, always present so that rules
   written against `rules.OutDirect` / `rules.OutBlock` always have a target;
 - `route.final` = `proxy` for `rule`/`global` and `direct` for `direct`;
@@ -820,11 +994,14 @@ embedded sets with their provenance and sizes.
 
 ### 7.5 Node failover (`selected_server: auto`)
 
-`selected_server: auto` makes `core.buildAutoOutbounds` render **every** server
-in `servers.yaml` as its own outbound (tagged by server name), plus a `urltest`
-group **tagged `proxy`**. Because the group reuses the `proxy` tag, nothing else
-changes: every rule that says "proxy", the `route.final`, and (in global mode)
-the DNS `detour` all keep referring to `proxy`, which is now the group.
+`selected_server: auto` makes `core.buildAutoOutbounds` render **the active
+profile's servers** as their own outbounds (tagged by server name), plus a
+`urltest` group **tagged `proxy`**. The pool is decided upstream, by
+`Config.SelectionInProfile(servers, activeProfile)` (§4.5), so the renderer's
+contract is unchanged: it renders whatever `RuntimeConfig.Servers` holds.
+Because the group reuses the `proxy` tag, nothing else changes: every rule that
+says "proxy", the `route.final`, and (in global mode) the DNS `detour` all keep
+referring to `proxy`, which is now the group.
 
 ```
 outbounds: [ UpCloud-SJ, UpCloud-SJ-Hy2, {urltest proxy -> [UpCloud-SJ, UpCloud-SJ-Hy2]}, direct, block ]
@@ -951,6 +1128,7 @@ which the connection belongs to it:
 | `servers` | — | the server list, with the active one flagged |
 | `select` | `{name}` | persists the choice, restarts the engine |
 | `mode` | `{mode}` | persists `rule`/`global`/`direct`, restarts the engine |
+| `profile` | `{name}` | M7: persists the active profile in `profiles.yaml`, restarts the engine (with `auto`, that changes the group's members) |
 | `tun` | `{enabled}` | persists `engine.tun.enabled`, restarts the engine; **refuses before touching the engine** when this daemon cannot create a TUN device |
 | `latency` | `{name?}` | round trip in ms (through the tunnel for the active server) |
 | `start` / `stop` / `restart` | — | engine lifecycle inside the running daemon |
@@ -1032,10 +1210,10 @@ type Options struct {
 
 | Key | Screen | Contents |
 |---|---|---|
-| `1` | **Dashboard** | daemon and engine state, selected server, mode, uptime, latency badge, and an animated up/down traffic graph with a load gauge, human-readable rates and session totals |
-| `2` | **Nodes** | table of configured servers (name, type, protocol, endpoint, latency); `enter` selects and lets the daemon restart the engine, `A` switches to auto failover, `t` measures latency, `r` reloads from disk. In **auto** mode the header shows which member is carrying traffic and the latency column is fed by the engine's own URL-test results, so node health is visible without probing each one by hand. |
+| `1` | **Dashboard** | daemon and engine state, selected server, active profile, mode, uptime, latency badge, and an animated up/down traffic graph with a load gauge, human-readable rates and session totals |
+| `2` | **Nodes** | table of configured servers (profile, name, type, protocol, endpoint, latency); `enter` selects and lets the daemon restart the engine, `A` switches to auto failover, `t` measures latency, `r` reloads from disk. In **auto** mode the header shows the active profile and how many servers the group scopes to, plus which member is carrying traffic, and the latency column is fed by the engine's own URL-test results, so node health is visible without probing each one by hand. |
 | `3` | **Logs** | the engine's own output as streamed by the daemon, in a scrolling viewport with follow mode (`f`) and a substring filter (`/`) |
-| `4` | **Settings** | the routing mode (rule/global/direct), the inbounds — the mixed listener and the **TUN inbound** with its device, its knobs, the privilege verdict and an explicit warning when it is on but cannot work (`u` toggles it) — the engine paths, the **merged routing policy** rendered from `internal/rules` (critical + `rules.yaml` + built-in, with the selected server and whether failover is active), and the **start-at-login registration** with `a` to toggle it |
+| `4` | **Settings** | the routing mode (rule/global/direct), the **profiles** — every known profile with its node count and (redacted) subscription URL, and `p` to switch the active one — the inbounds — the mixed listener and the **TUN inbound** with its device, its knobs, the privilege verdict and an explicit warning when it is on but cannot work (`u` toggles it) — the engine paths, the **merged routing policy** rendered from `internal/rules` (critical + `rules.yaml` + built-in, with the selected server and whether failover is active), and the **start-at-login registration** with `a` to toggle it |
 
 Global keys: `tab`/`shift+tab` (next/previous screen), `?` (help overlay), `q`
 (or Ctrl-C) to quit. On the Dashboard: `t` latency, `s`/`x`/`R` start/stop/
@@ -1212,6 +1390,35 @@ Both implementations are driven in tests through injected seams (an isolated
 runner on Windows), so `go test` cannot register a real unit or rewrite a real
 registry.
 
+## 10.5 Subscriptions and profiles (M7)
+
+`internal/config/profiles.go` owns the profile model and the merge rules, and
+`internal/subscription` owns the wire formats. Three decisions are worth
+recording:
+
+- **The subscription body is data, not a file.** `Parse` returns a `Result` of
+  usable servers plus one `Skipped{Node, Reason}` per node it could not use, so
+  the CLI can print "added 4, skipped 1: ss needs a SIP003 plugin" instead of
+  failing the whole import. Selecting a nice-looking subset (the first 40 nodes)
+  is explicitly *not* done: the engine's URL test is a better judge of which node
+  is good, and a subscription that changes does so under the user's feet.
+- **`Fetch` is the only networked function, and the only place the user agent
+  matters.** Panels branch on it and serve an HTML or Clash page to an unknown
+  agent; `v2rayN/6.0` gets links. The response is bounded (`MaxBody`) and honours
+  the caller's context, and the URL is redacted before it reaches a terminal or a
+  log (`redactURL`), because a subscription URL is a bearer token in practice.
+- **The TUI switches profiles through the daemon, not by writing the file.** With
+  `auto` the active profile changes the engine's outbound set, so a client that
+  edited `profiles.yaml` behind a running daemon would show a state the engine
+  does not have. `CmdProfile` is therefore a control command (§8.2), exactly like
+  `CmdTun`; the *list* of profiles is read from the local snapshot, which is what
+  keeps the panel useful with no daemon.
+
+The compatibility guarantee is stated once and tested: **`profile` is optional,
+absent means `manual`, and `manual` is the default active profile, so an existing
+`servers.yaml` + `config.yaml` pair keeps rendering exactly what it rendered
+before M7** — a URLTest group over every server.
+
 ## 11. Release packaging (M4)
 
 `scripts/package.sh` produces two archives in `dist/release/`:
@@ -1253,16 +1460,18 @@ needs no root and writes nothing outside the prefix.
 | **M4** | `internal/autostart` (systemd user unit / XDG entry, Task Scheduler task / Run key), Windows system proxy, release packaging and the installer | `autostart on` starts the daemon after login on both platforms; `off` removes it; `status` reports it; all idempotent. `vender proxy on\|off` works on Windows. Both release archives build and contain the engine plus the licence documents |
 | **M5** | **Robustness**: a critical "must survive a dead proxy" list, an optional per-user `rules.yaml` merged ahead of the built-in policy, a proxy-independent split DNS (FakeIP for proxied names, direct resolution for direct ones), and `selected_server: auto` node failover with the active member shown in the TUI | With a deliberately unreachable proxy, DNS still resolves in well under a second and direct traffic (CN + the critical list) keeps working while foreign requests fail fast; `sing-box check` accepts rule/auto/direct configs; `rules list` shows the merged policy; auto mode serves traffic through a reachable node while another is dead |
 | **M6** | **Optional TUN mode**: a `tun` inbound in the engine, `vender tun on\|off\|status`, a TUI toggle that reports the privilege verdict, and a TUN-aware autostart mechanism on both platforms | Config-level: golden files for TUN on/off in rule/global/direct plus `sing-box check` for each. Live: a TUN test in a network namespace where one is available, otherwise a documented statement of what could not be run. `vender tun on` against a running daemon either applies (persist + restart with the TUN inbound) or is refused before the engine is touched, with an actionable message. Autostart reflects the TUN-correct mechanism and `status` says whether it can work |
-| M7 | Hardening and release | Subscription URLs and bulk import, per-server latency ranking, log rotation, reproducible cross-builds, signed Windows binaries, a windowless Windows start |
+| M7 | **Subscription import, named profiles and three more protocols** (Plan B: hardening and release) | Share links for Shadowsocks (both spellings and the 2022 ciphers), VMess (TCP/WS/gRPC ± TLS) and Trojan, rendered, validated and round-tripped; `import --url` accepts base64, plain and Clash subscriptions with a per-node summary; `vender profiles list\|use\|update\|rm` with `profiles.yaml` persisted; `auto` scopes to the active profile, a pre-M7 `servers.yaml` still loads and still fails over over every server; `sing-box check` accepts every new outbound type and a profile-scoped group |
 
 ## 13. Engineering conventions
 
 - **Minimal dependencies.** vender uses only `cobra`, `yaml.v3` and — from M3,
   for the TUI alone — `bubbletea`, `lipgloss` and `bubbles`. There is no
-  networking library (that is sing-box's job); the control channel is `net` +
-  `encoding/json` + `crypto/rand`/`crypto/subtle`. Windows-specific calls that
-  the standard library does not expose (`LockFileEx`) go through
-  `syscall.NewLazyDLL`, which loads from `System32` only.
+  networking library (that is sing-box's job) and subscription fetching added none
+  either: it is `net/http`, `encoding/base64` and `encoding/json`. The control
+  channel is `net` + `encoding/json` + `crypto/rand`/`crypto/subtle`.
+  Windows-specific calls that the standard library does not expose
+  (`LockFileEx`) go through `syscall.NewLazyDLL`, which loads from `System32`
+  only.
 - **No OS-specific code.** Everything builds for `linux/amd64` and
   `windows/amd64`; platform differences are handled through standard-library
   abstractions (`os.UserConfigDir`, `os.UserCacheDir`). Where `syscall`-level
@@ -1320,9 +1529,16 @@ needs no root and writes nothing outside the prefix.
 - **The TUI is testable without a terminal.** `View` is pure and colour is a
   property of one renderer, so the screens are covered by golden files
   (`internal/tui/testdata/`, refreshable with `go test ./internal/tui -update`)
-  for the Dashboard running and not running, Nodes populated and empty, and
-  Settings — plus the behaviour tests that go through the same `Update` the
-  program uses.
+  for the Dashboard running and not running, Nodes populated and empty, Settings,
+  and Settings with a subscription profile to switch between — plus the behaviour
+  tests that go through the same `Update` the program uses.
+- **A subscription test opens no socket.** The parsers are pure and covered by
+  fixtures under `internal/subscription/testdata/` (plain links, base64 links,
+  Clash YAML), and `Fetch` is tested by injecting an `http.Client` whose
+  `RoundTripper` returns a canned response, so the test can assert the user agent
+  without a listener — not even a loopback one. `cmd/vender` uses the same trick
+  through a `subscriptionClient` seam, so `vender import --url` and the whole
+  `profiles` lifecycle are exercised without touching the network.
 - **The daemon's own channel is tested against a real daemon.** `cmd/vender`'s
   tests run `vender daemon` in-process with the test binary standing in for
   sing-box (including its Clash API), then drive status/servers/select/mode/

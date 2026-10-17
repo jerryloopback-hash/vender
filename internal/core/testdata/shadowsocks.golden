@@ -1,0 +1,201 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-cn",
+        "type": "udp",
+        "server": "223.5.5.5"
+      },
+      {
+        "tag": "dns-fakeip",
+        "type": "fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "action": "route",
+        "domain_suffix": [
+          "opencode.ai"
+        ],
+        "server": "dns-cn"
+      },
+      {
+        "action": "route",
+        "rule_set": [
+          "geosite-cn"
+        ],
+        "server": "dns-cn"
+      },
+      {
+        "action": "route",
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "server": "dns-fakeip"
+      }
+    ],
+    "final": "dns-cn",
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7897
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "proxy",
+      "server": "203.0.113.10",
+      "server_port": 8388,
+      "method": "aes-256-gcm",
+      "password": "ss-password"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "rule_set": [
+      {
+        "type": "local",
+        "tag": "geosite-cn",
+        "format": "binary",
+        "path": "/run/vender/rules/geosite-cn.srs"
+      },
+      {
+        "type": "local",
+        "tag": "geosite-category-ads-all",
+        "format": "binary",
+        "path": "/run/vender/rules/geosite-category-ads-all.srs"
+      },
+      {
+        "type": "local",
+        "tag": "geoip-cn",
+        "format": "binary",
+        "path": "/run/vender/rules/geoip-cn.srs"
+      },
+      {
+        "type": "local",
+        "tag": "geosite-steam",
+        "format": "binary",
+        "path": "/run/vender/rules/geosite-steam.srs"
+      },
+      {
+        "type": "local",
+        "tag": "geosite-onedrive",
+        "format": "binary",
+        "path": "/run/vender/rules/geosite-onedrive.srs"
+      },
+      {
+        "type": "local",
+        "tag": "geosite-microsoft",
+        "format": "binary",
+        "path": "/run/vender/rules/geosite-microsoft.srs"
+      },
+      {
+        "type": "local",
+        "tag": "geosite-google",
+        "format": "binary",
+        "path": "/run/vender/rules/geosite-google.srs"
+      },
+      {
+        "type": "local",
+        "tag": "geosite-youtube",
+        "format": "binary",
+        "path": "/run/vender/rules/geosite-youtube.srs"
+      },
+      {
+        "type": "local",
+        "tag": "geosite-telegram",
+        "format": "binary",
+        "path": "/run/vender/rules/geosite-telegram.srs"
+      },
+      {
+        "type": "local",
+        "tag": "geosite-netflix",
+        "format": "binary",
+        "path": "/run/vender/rules/geosite-netflix.srs"
+      },
+      {
+        "type": "local",
+        "tag": "geosite-openai",
+        "format": "binary",
+        "path": "/run/vender/rules/geosite-openai.srs"
+      },
+      {
+        "type": "local",
+        "tag": "geosite-bahamut",
+        "format": "binary",
+        "path": "/run/vender/rules/geosite-bahamut.srs"
+      }
+    ],
+    "default_domain_resolver": {
+      "server": "dns-cn"
+    },
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "action": "hijack-dns",
+        "protocol": [
+          "dns"
+        ]
+      },
+      {
+        "domain_suffix": [
+          "opencode.ai"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "geosite-category-ads-all"
+        ],
+        "outbound": "block"
+      },
+      {
+        "rule_set": [
+          "geosite-steam",
+          "geosite-onedrive",
+          "geosite-microsoft",
+          "geosite-google",
+          "geosite-youtube",
+          "geosite-telegram",
+          "geosite-netflix",
+          "geosite-openai",
+          "geosite-bahamut"
+        ],
+        "outbound": "proxy"
+      },
+      {
+        "rule_set": [
+          "geosite-cn",
+          "geoip-cn"
+        ],
+        "outbound": "direct"
+      }
+    ],
+    "final": "proxy"
+  }
+}

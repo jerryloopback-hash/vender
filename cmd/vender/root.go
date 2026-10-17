@@ -136,6 +136,7 @@ in the platform cache directory instead:
 		a.newVersionCmd(),
 		a.newImportCmd(),
 		a.newServersCmd(),
+		a.newProfilesCmd(),
 		a.newRulesCmd(),
 		a.newDaemonCmd(),
 		a.newStatusCmd(),

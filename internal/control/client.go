@@ -259,6 +259,13 @@ func (c *Client) SetTun(ctx context.Context, enabled bool) (ApplyData, error) {
 	return out, err
 }
 
+// SetProfile switches the active profile and restarts the engine.
+func (c *Client) SetProfile(ctx context.Context, name string) (ApplyData, error) {
+	var out ApplyData
+	err := c.Call(ctx, CmdProfile, ProfileArgs{Name: name}, &out)
+	return out, err
+}
+
 // Latency measures a round trip through the named server (empty: the active
 // one). A failed probe is reported in LatencyData.Err, not as an error.
 func (c *Client) Latency(ctx context.Context, name string) (LatencyData, error) {

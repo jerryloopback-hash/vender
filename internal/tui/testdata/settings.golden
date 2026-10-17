@@ -1,4 +1,4 @@
- Dashboard   Nodes       Logs        Settings                                             vender M6
+ Dashboard   Nodes       Logs        Settings                                             vender M7
 ╭─ routing mode ───────────────────────────────────────────────────────────────────────────────────╮
 │ ▸ (●) rule   active  built-in policy: CN and private destinations direct, ads blocked, the rest… │
 │   ( ) global         every connection through the selected server                                │
@@ -11,7 +11,7 @@
 │ tun settings       stack mixed   device vender0   mtu auto   auto_route on   strict_route off    │
 │ privileges         missing  uid 1000 does not hold CAP_NET_ADMIN (CapEff 0000000000000000)       │
 │ engine binary      /usr/local/bin/sing-box   log info                                            │
-│ config dir         /home/test/.config/vender   bind -                                            │
+│ config dir         /home/test/.config/vender   bind -   profile manual                           │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ built-in routing policy ────────────────────────────────────────────────────────────────────────╮
 │ actions  sniff, protocol=dns -> hijack-dns   final  proxy   selected  Interserver-LA             │
@@ -27,4 +27,4 @@
 │ system proxy    `vender proxy on|off` points the desktop at the local inbound                    │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
  ● daemon pid 4821  attached to the daemon at 127.0.0.1:41234
- ←/→ mode • enter apply • u tun • a start at login • tab screens • ? help
+ ←/→ mode • enter apply • p profile • u tun • a start at login • tab screens • ? help

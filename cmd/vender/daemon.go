@@ -72,7 +72,11 @@ func (a *app) runDaemon(cmd *cobra.Command) error {
 	if err := cfg.ValidateAgainst(servers); err != nil {
 		return err
 	}
-	srv, allServers, err := cfg.Selection(servers)
+	profiles, err := store.LoadProfiles()
+	if err != nil {
+		return err
+	}
+	srv, allServers, err := cfg.SelectionInProfile(servers, profiles.ActiveName())
 	if err != nil {
 		return err
 	}
@@ -171,7 +175,7 @@ func (a *app) runDaemon(cmd *cobra.Command) error {
 	case srv != nil:
 		fmt.Fprintf(out, "  server       %s\n", srv.String())
 	case cfg.IsAutoServer() && cfg.Proxy.Mode != config.ModeDirect:
-		fmt.Fprintf(out, "  server       auto (failover over %d servers)\n", len(allServers))
+		fmt.Fprintf(out, "  server       auto (failover over %d servers in profile %q)\n", len(allServers), profiles.ActiveName())
 	default:
 		fmt.Fprintf(out, "  server       (none; direct mode)\n")
 	}

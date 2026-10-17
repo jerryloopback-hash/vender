@@ -76,6 +76,10 @@ const (
 	// CmdProxies reports the engine's outbound table: which failover member is
 	// active and how each one is measuring.
 	CmdProxies = "proxies"
+	// CmdProfile switches the active profile: with selected_server "auto", the
+	// failover pool is the active profile's servers, so switching profiles
+	// changes which nodes the engine may use.
+	CmdProfile = "profile"
 )
 
 // Streams. A subscription request takes over its connection.
@@ -162,6 +166,13 @@ type StatusData struct {
 	ClashListen string `json:"clashListen,omitempty"`
 	ServerCount int    `json:"serverCount"`
 
+	// Profile is the active profile, and ProfileServers is how many servers
+	// `selected_server: auto` scopes to. Profiles lists every known profile
+	// name, so a client can cycle them without reading profiles.yaml itself.
+	Profile        string   `json:"profile,omitempty"`
+	ProfileServers int      `json:"profileServers"`
+	Profiles       []string `json:"profiles,omitempty"`
+
 	// Tun is the TUN inbound's state (M6). It travels in every status reply so
 	// a client never has to guess whether system-wide capture is on, and so
 	// the TUI can show the *daemon's* privilege verdict rather than its own.
@@ -227,6 +238,8 @@ type ServerInfo struct {
 	Endpoint string `json:"endpoint"`
 	Detail   string `json:"detail,omitempty"`
 	Active   bool   `json:"active"`
+	// Profile is the server's profile (config.ProfileManual when implicit).
+	Profile string `json:"profile,omitempty"`
 }
 
 // ServersData is the reply to CmdServers.
@@ -248,6 +261,12 @@ type ModeArgs struct {
 // TunArgs is the argument of CmdTun.
 type TunArgs struct {
 	Enabled bool `json:"enabled"`
+}
+
+// ProfileArgs is the argument of CmdProfile. Name is a profile name, or
+// config.ProfileAll ("all") to scope auto failover to every server.
+type ProfileArgs struct {
+	Name string `json:"name"`
 }
 
 // LatencyArgs is the argument of CmdLatency. An empty Name means the active

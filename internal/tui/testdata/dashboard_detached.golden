@@ -1,4 +1,4 @@
- Dashboard   Nodes       Logs        Settings                                             vender M6
+ Dashboard   Nodes       Logs        Settings                                             vender M7
 ╭─ daemon ─────────────────────────────────────────────────────────────────────────────────────────╮
 │ ○ daemon not running  (nothing holds /home/test/.cache/vender)                                   │
 │                                                                                                  │

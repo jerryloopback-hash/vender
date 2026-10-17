@@ -1,0 +1,8 @@
+ss://YWVzLTI1Ni1nY206ZHVtbXktcGFzcw@203.0.113.10:8388#Provider-SS-A
+ss://YWVzLTI1Ni1nY206ZHVtbXktcGFzc0AyMDMuMC4xMTMuMTA6ODM4OQ==#Provider-SS-Legacy
+vmess://eyJ2IjoiMiIsInBzIjoiUHJvdmlkZXItVk1lc3MiLCJhZGQiOiIyMDMuMC4xMTMuMTEiLCJwb3J0IjoiNDQzIiwiaWQiOiIxMTExMTExMS0xMTExLTExMTEtMTExMS0xMTExMTExMTExMTEiLCJhaWQiOiIwIiwic2N5IjoiYXV0byIsIm5ldCI6IndzIiwidHlwZSI6Im5vbmUiLCJob3N0IjoiY2RuLmV4YW1wbGUuY29tIiwicGF0aCI6Ii9yYXkiLCJ0bHMiOiJ0bHMiLCJzbmkiOiJjZG4uZXhhbXBsZS5jb20ifQ==
+trojan://dummy-trojan-pass@203.0.113.12:443?sni=www.example.com&type=tcp#Provider-Trojan
+vless://11111111-1111-1111-1111-111111111111@203.0.113.13:443?encryption=none&security=reality&sni=www.example.com&fp=chrome&pbk=DUMMY-FAKE-PUBLIC-KEY-FOR-TESTS-ONLY-0000000000&sid=0123456789abcdef&type=tcp#Provider-VLESS
+hysteria2://dummy-hy2-pass@203.0.113.14:8443/?sni=www.example.com&insecure=1#Provider-Hy2
+ss://YWVzLTI1Ni1nY206ZHVtbXk@203.0.113.15:8388/?plugin=obfs-local%3Bobfs%3Dhttp#Provider-SS-Plugin
+wireguard://unsupported@203.0.113.16:51820#Provider-Not-Supported
