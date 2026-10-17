@@ -31,3 +31,6 @@ servers.yaml
 # script cleans up after itself, this is a belt-and-braces guard so a partial
 # .srs can never be committed or embedded.
 internal/rules/assets/*.tmp.*
+
+# Local debug handoff doc (contains real credentials) — never commit
+/DEBUG-HANDOFF.md
