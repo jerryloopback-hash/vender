@@ -187,7 +187,7 @@ engine:
         auto_route: true        # install the routes that pull traffic in
         strict_route: false     # refuse traffic that would bypass the tunnel
         interface_name: vender0
-        address: []                     # the device's own address(es)
+        address: []                     # enabled + unspecified => IPv4/IPv6 defaults
         route_exclude_address: []        # CIDRs kept out of the tunnel
         route_exclude_address_set: []    # rule-set tags kept out of the tunnel
 selected_server: ""             # a name in servers.yaml, or "auto" (failover

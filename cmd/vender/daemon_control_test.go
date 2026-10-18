@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -29,6 +30,37 @@ type daemonHarness struct {
 	done     chan error
 	output   *syncBuffer
 	endpoint control.Endpoint
+}
+
+func TestCLIStatusUsesAppliedStateAndRejectsUnrelatedListener(t *testing.T) {
+	listen := "127.0.0.1:" + fmt.Sprint(freePort(t))
+	h := startDaemon(t, listen, vlessLink)
+	defer h.stop(t)
+
+	// Invalid disk settings must not prevent querying the still-working
+	// daemon, nor be mistaken for its applied configuration.
+	store := config.NewStoreAt(h.cfgDir)
+	if err := os.WriteFile(store.ConfigPath(), []byte("proxy:\n  mode: invalid-mode\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runCLIIn(t, h.runDir, "status", "--config-dir", h.cfgDir)
+	if err != nil || !strings.Contains(out, "mode         rule") {
+		t.Fatalf("applied state was not authoritative: %v\n%s", err, out)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := h.dial(t).StopEngine(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	out, err = runCLIIn(t, h.runDir, "status", "--config-dir", h.cfgDir)
+	if err == nil {
+		t.Fatalf("unrelated listener falsely proved engine health:\n%s", out)
+	}
 }
 
 // syncBuffer is what the daemon writes its stdout into. It is read by the test

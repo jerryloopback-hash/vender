@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/ll-lite/vender/internal/config"
 	"github.com/ll-lite/vender/internal/core"
+	"github.com/ll-lite/vender/internal/privatefs"
 )
 
 // Dummy credentials only: never commit real ones.
@@ -56,7 +58,7 @@ func (f *fakeEngine) WriteConfig(rc core.RuntimeConfig) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(rc.RunDir, 0o700); err != nil {
+	if err := privatefs.EnsureDir(rc.RunDir); err != nil {
 		return err
 	}
 	if err := os.WriteFile(core.ConfigPath(rc.RunDir), data, 0o600); err != nil {
@@ -226,7 +228,7 @@ func TestControllerStartStopAndStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
+	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm != 0o600 {
 		t.Errorf("generated config mode = %o, want 600", perm)
 	}
 
@@ -761,7 +763,7 @@ func TestEndpointFileIsPrivate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
+	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm != 0o600 {
 		t.Errorf("control.json mode = %o, want 600 (it carries the token)", perm)
 	}
 	got, err := ReadEndpoint(runDir)

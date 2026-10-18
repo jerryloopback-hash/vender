@@ -74,6 +74,9 @@ const (
 // default per-user mechanisms cannot provide it. The caller reads config.yaml
 // and says so; autostart does not depend on internal/config.
 type Options struct {
+	// Explicit directories are preserved in Windows task/Run-key arguments.
+	ConfigDir string
+	RunDir    string
 	// TUN reports whether the TUN inbound is enabled in config.yaml.
 	TUN bool
 	// CapabilityHint is the caller's one-line verdict on whether this

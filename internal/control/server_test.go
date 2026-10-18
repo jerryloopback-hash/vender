@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -43,7 +44,7 @@ func TestServerPublishesAPrivateEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the daemon did not publish %s: %v", EndpointFileName, err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
+	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm != 0o600 {
 		t.Errorf("%s mode = %o, want 600", EndpointFileName, perm)
 	}
 	ep, err := ReadEndpoint(f.runDir)

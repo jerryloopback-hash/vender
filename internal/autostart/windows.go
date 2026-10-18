@@ -1,6 +1,7 @@
 package autostart
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -42,7 +43,13 @@ type windowsBackend struct {
 	run      winRunner
 	lookPath func(string) (string, error)
 	// writeTemp writes the task XML to a temporary file and returns its path.
-	writeTemp func(content string) (string, error)
+	writeTemp    func(content string) (string, error)
+	userSID      string
+	identityErr  error
+	deleteTask   func() error
+	deleteRunKey func() error
+	taskExists   func() (bool, error)
+	isElevated   func() bool
 }
 
 func defaultWindowsBackend() windowsBackend {
@@ -52,12 +59,14 @@ func defaultWindowsBackend() windowsBackend {
 	} else if abs, aerr := filepath.Abs(exe); aerr == nil {
 		exe = abs
 	}
-	return windowsBackend{
+	b := windowsBackend{
 		exe:       exe,
 		run:       runWindowsCommand,
 		lookPath:  exec.LookPath,
 		writeTemp: writeTaskXMLTemp,
 	}
+	configureNativeWindowsBackend(&b)
+	return b
 }
 
 func runWindowsCommand(name string, args ...string) (string, error) {
@@ -89,14 +98,25 @@ func (b windowsBackend) enable() (State, error) { return b.enableWith(Options{})
 // acceptable mechanism: falling back to the Run key would install something
 // that starts a daemon that cannot create the TUN.
 func (b windowsBackend) enableWith(o Options) (State, error) {
+	if b.identityErr != nil {
+		return State{}, b.identityErr
+	}
+	if o.TUN && b.isElevated != nil && !b.isElevated() {
+		return State{}, errors.New("registering TUN autostart requires an elevated Administrator prompt; HighestAvailable cannot grant Administrator rights to a standard user")
+	}
 	if b.exe == "" {
 		return State{}, errors.New("autostart: cannot determine the vender executable path (os.Executable failed)")
 	}
 
 	var taskErr error
 	if _, err := b.lookPath("schtasks"); err == nil {
-		st, err := b.enableTask(o.TUN)
+		st, err := b.enableTaskWith(o)
 		if err == nil {
+			if b.deleteRunKey != nil {
+				if err := b.deleteRunKey(); err != nil {
+					return st, fmt.Errorf("task registered, but removing old Run entry failed: %w", err)
+				}
+			}
 			return st, nil
 		}
 		taskErr = err
@@ -109,8 +129,19 @@ func (b windowsBackend) enableWith(o Options) (State, error) {
 			"and the task could not be created (%v); the per-user Run key cannot elevate, so it is not installed. "+
 			"Run `vender autostart on` once from an elevated (Administrator) prompt%s", taskErr, b.capabilityNoteSuffix(o))
 	}
+	// A refused update of an existing task must not install a second startup
+	// mechanism pointing at another configuration or privilege level.
+	if b.taskExists != nil {
+		exists, err := b.taskExists()
+		if err != nil {
+			return State{}, fmt.Errorf("task registration failed (%v); cannot safely check existing task: %w", taskErr, err)
+		}
+		if exists {
+			return State{}, fmt.Errorf("task registration failed (%v); existing task retained, Run-key fallback not installed", taskErr)
+		}
+	}
 
-	st, err := b.enableRunKey()
+	st, err := b.enableRunKeyWith(o)
 	if err != nil {
 		return State{}, fmt.Errorf("autostart: the Task Scheduler task could not be created (%v) and the Run key fallback failed: %w", taskErr, err)
 	}
@@ -128,10 +159,14 @@ func (b windowsBackend) capabilityNoteSuffix(o Options) string {
 }
 
 func (b windowsBackend) enableTask(elevated bool) (State, error) {
+	return b.enableTaskWith(Options{TUN: elevated})
+}
+
+func (b windowsBackend) enableTaskWith(o Options) (State, error) {
 	if b.writeTemp == nil {
 		return State{}, errors.New("autostart: no way to stage the task XML")
 	}
-	xmlPath, err := b.writeTemp(taskXML(b.exe, elevated))
+	xmlPath, err := b.writeTemp(taskXMLWith(b.exe, o, b.userSID))
 	if err != nil {
 		return State{}, err
 	}
@@ -143,7 +178,7 @@ func (b windowsBackend) enableTask(elevated bool) (State, error) {
 	}
 	detail := "Task Scheduler logon task created (least privilege, hidden); " +
 		"runs `vender daemon` at logon. A short console window can still appear because vender is a console-subsystem binary"
-	if elevated {
+	if o.TUN {
 		detail = "Task Scheduler logon task created with the highest available privileges (hidden) because TUN mode is on; " +
 			"the daemon can create the WinTun adapter at logon without another prompt. " +
 			"A short console window can still appear because vender is a console-subsystem binary"
@@ -157,10 +192,14 @@ func (b windowsBackend) enableTask(elevated bool) (State, error) {
 }
 
 func (b windowsBackend) enableRunKey() (State, error) {
+	return b.enableRunKeyWith(Options{})
+}
+
+func (b windowsBackend) enableRunKeyWith(o Options) (State, error) {
 	if _, err := b.lookPath("reg"); err != nil {
 		return State{}, errors.New("reg.exe is not available")
 	}
-	value := runKeyValue(b.exe)
+	value := `"` + b.exe + `" ` + windowsDaemonArgs(o)
 	out, err := b.run("reg", "add", winRunKeyPath, "/v", winRunValueName, "/t", "REG_SZ", "/d", value, "/f")
 	if err != nil {
 		return State{}, fmt.Errorf("reg add %s\\%s: %w%s", winRunKeyPath, winRunValueName, err, winOutputSuffix(out))
@@ -182,14 +221,20 @@ func (b windowsBackend) enableRunKey() (State, error) {
 func (b windowsBackend) disable() error {
 	var firstErr error
 
-	if _, err := b.lookPath("schtasks"); err == nil {
+	if b.deleteTask != nil {
+		firstErr = b.deleteTask()
+	} else if _, err := b.lookPath("schtasks"); err == nil {
 		if out, err := b.run("schtasks", "/Delete", "/TN", winTaskName, "/F"); err != nil && !winNotFound(out) {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("schtasks /Delete /TN %s: %w%s", winTaskName, err, winOutputSuffix(out))
 			}
 		}
 	}
-	if _, err := b.lookPath("reg"); err == nil {
+	if b.deleteRunKey != nil {
+		if err := b.deleteRunKey(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	} else if _, err := b.lookPath("reg"); err == nil {
 		if out, err := b.run("reg", "delete", winRunKeyPath, "/v", winRunValueName, "/f"); err != nil && !winNotFound(out) {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("reg delete %s\\%s: %w%s", winRunKeyPath, winRunValueName, err, winOutputSuffix(out))
@@ -223,6 +268,15 @@ func (b windowsBackend) statusWith(o Options) (State, error) {
 					Detail:    detail,
 				}, nil
 			}
+		}
+	}
+	if b.taskExists != nil {
+		exists, err := b.taskExists()
+		if err != nil {
+			return State{}, err
+		}
+		if exists {
+			return State{}, errors.New("a Windows logon task exists, but its XML could not be inspected")
 		}
 	}
 
@@ -300,9 +354,17 @@ func runKeyValue(exe string) string {
 // --headless` launcher, both deferred to M7; the daemon itself needs no
 // console to work.
 func taskXML(exe string, elevated bool) string {
+	return taskXMLWith(exe, Options{TUN: elevated}, "")
+}
+
+func taskXMLWith(exe string, o Options, sid string) string {
 	runLevel := "LeastPrivilege"
-	if elevated {
+	if o.TUN {
 		runLevel = "HighestAvailable"
+	}
+	user := ""
+	if sid != "" {
+		user = "      <UserId>" + xmlEscape(sid) + "</UserId>\n"
 	}
 	return `<?xml version="1.0" encoding="UTF-16"?>` + "\n" +
 		`<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">` + "\n" +
@@ -313,10 +375,12 @@ func taskXML(exe string, elevated bool) string {
 		`  <Triggers>` + "\n" +
 		`    <LogonTrigger>` + "\n" +
 		`      <Enabled>true</Enabled>` + "\n" +
+		user +
 		`    </LogonTrigger>` + "\n" +
 		`  </Triggers>` + "\n" +
 		`  <Principals>` + "\n" +
 		`    <Principal id="Author">` + "\n" +
+		user +
 		`      <LogonType>InteractiveToken</LogonType>` + "\n" +
 		`      <RunLevel>` + runLevel + `</RunLevel>` + "\n" +
 		`    </Principal>` + "\n" +
@@ -338,15 +402,62 @@ func taskXML(exe string, elevated bool) string {
 		`    <RunOnlyIfIdle>false</RunOnlyIfIdle>` + "\n" +
 		`    <WakeToRun>false</WakeToRun>` + "\n" +
 		`    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>` + "\n" +
+		`    <RestartOnFailure><Interval>PT1M</Interval><Count>5</Count></RestartOnFailure>` + "\n" +
 		`    <Priority>7</Priority>` + "\n" +
 		`  </Settings>` + "\n" +
 		`  <Actions Context="Author">` + "\n" +
 		`    <Exec>` + "\n" +
 		`      <Command>` + xmlEscape(exe) + `</Command>` + "\n" +
-		`      <Arguments>daemon</Arguments>` + "\n" +
+		`      <Arguments>` + xmlEscape(windowsDaemonArgs(o)) + `</Arguments>` + "\n" +
+		`      <WorkingDirectory>` + xmlEscape(windowsDir(exe)) + `</WorkingDirectory>` + "\n" +
 		`    </Exec>` + "\n" +
 		`  </Actions>` + "\n" +
 		`</Task>` + "\n"
+}
+
+func windowsDaemonArgs(o Options) string {
+	args := []string{"daemon"}
+	if o.ConfigDir != "" {
+		args = append(args, "--config-dir", quoteWindowsArg(o.ConfigDir))
+	}
+	if o.RunDir != "" {
+		args = append(args, "--run-dir", quoteWindowsArg(o.RunDir))
+	}
+	return strings.Join(args, " ")
+}
+
+// Match CommandLineToArgvW/Go's command-line quoting, including a trailing
+// backslash in a quoted directory. No shell is involved.
+func quoteWindowsArg(s string) string {
+	if s != "" && !strings.ContainsAny(s, " \t\n\v\"") {
+		return s
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	slashes := 0
+	for _, r := range s {
+		if r == '\\' {
+			slashes++
+			continue
+		}
+		if r == '"' {
+			b.WriteString(strings.Repeat("\\", 2*slashes+1))
+		} else {
+			b.WriteString(strings.Repeat("\\", slashes))
+		}
+		b.WriteRune(r)
+		slashes = 0
+	}
+	b.WriteString(strings.Repeat("\\", 2*slashes))
+	b.WriteByte('"')
+	return b.String()
+}
+
+func windowsDir(exe string) string {
+	if i := strings.LastIndexAny(exe, `\/`); i >= 0 {
+		return exe[:i+1]
+	}
+	return "."
 }
 
 func xmlEscape(s string) string {
@@ -400,10 +511,24 @@ func describeTaskCommand(out string) string {
 // so every second byte is NUL; dropping the NULs recovers the ASCII subset both
 // tools actually use.
 func normalizeWinOutput(s string) string {
-	if !strings.ContainsRune(s, 0) {
-		return s
+	if !strings.ContainsRune(s, 0) && !strings.HasPrefix(s, "\xff\xfe") && !strings.HasPrefix(s, "\xfe\xff") {
+		return strings.TrimPrefix(s, "\xef\xbb\xbf")
 	}
-	return strings.ReplaceAll(s, "\x00", "")
+	b := []byte(s)
+	var order binary.ByteOrder = binary.LittleEndian
+	if strings.HasPrefix(s, "\xfe\xff") {
+		order = binary.BigEndian
+		b = b[2:]
+	} else if strings.HasPrefix(s, "\xff\xfe") {
+		b = b[2:]
+	} else if len(b) > 1 && b[0] == 0 {
+		order = binary.BigEndian
+	}
+	units := make([]uint16, 0, len(b)/2)
+	for i := 0; i+1 < len(b); i += 2 {
+		units = append(units, order.Uint16(b[i:i+2]))
+	}
+	return string(utf16.Decode(units))
 }
 
 // winNotFound reports whether a reg/schtasks failure is the benign "there is

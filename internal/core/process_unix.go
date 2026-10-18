@@ -11,8 +11,9 @@ import (
 // signal the whole tree (sing-box spawns helper goroutines but no children
 // today; a group kill still guarantees nothing is orphaned) without touching
 // its own process group.
-func prepareProcess(cmd *exec.Cmd) {
+func prepareProcess(cmd *exec.Cmd) error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return nil
 }
 
 // terminateProcess asks the child to exit gracefully, and its whole process

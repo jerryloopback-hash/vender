@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"fmt"
+	"github.com/ll-lite/vender/internal/privatefs"
 	"os"
 	"path/filepath"
 )
@@ -23,7 +24,7 @@ type Lock struct {
 // AcquireLock takes the lock at path, creating the file (and its directory) if
 // needed. It fails immediately with ErrLocked rather than waiting.
 func AcquireLock(path string) (*Lock, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := privatefs.EnsureDir(filepath.Dir(path)); err != nil {
 		return nil, fmt.Errorf("core: create lock dir: %w", err)
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)

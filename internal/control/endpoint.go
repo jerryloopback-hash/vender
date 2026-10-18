@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/ll-lite/vender/internal/privatefs"
 	"io/fs"
 	"net"
 	"os"
@@ -55,7 +56,7 @@ func EndpointPath(runDir string) string {
 
 // WriteEndpoint publishes ep atomically with mode 0600.
 func WriteEndpoint(runDir string, ep Endpoint) error {
-	if err := os.MkdirAll(runDir, 0o700); err != nil {
+	if err := privatefs.EnsureDir(runDir); err != nil {
 		return fmt.Errorf("control: create run dir %s: %w", runDir, err)
 	}
 	data, err := json.MarshalIndent(ep, "", "  ")
@@ -73,6 +74,9 @@ func WriteEndpoint(runDir string, ep Endpoint) error {
 // tell those apart to print either "start it with vender daemon" or the
 // actual parse error.
 func ReadEndpoint(runDir string) (Endpoint, error) {
+	if err := privatefs.Protect(EndpointPath(runDir)); err != nil {
+		return Endpoint{}, err
+	}
 	data, err := os.ReadFile(EndpointPath(runDir))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {

@@ -2,102 +2,131 @@ package main
 
 import (
 	"errors"
-	"strconv"
 	"strings"
 	"testing"
 )
 
-// fakeReg records the registry writes in order and can be told to fail one of
-// them, which is what makes the "endpoints before the switch" ordering
-// testable without a Windows registry.
-type fakeReg struct {
-	ops    []string
-	failOn string
+type fakeProxyAPI struct {
+	settings    winProxySettings
+	writes      int
+	failWrite   bool
+	failRefresh bool
 }
 
-func (f *fakeReg) record(op string) error {
-	f.ops = append(f.ops, op)
-	if f.failOn != "" && strings.HasPrefix(op, f.failOn) {
-		return errors.New("simulated registry failure")
+func (a *fakeProxyAPI) Read() (winProxySettings, error) { return a.settings, nil }
+func (a *fakeProxyAPI) Write(s winProxySettings) error {
+	a.writes++
+	a.settings = s
+	if a.failWrite {
+		a.failWrite = false
+		return errors.New("partial write failure")
+	}
+	return nil
+}
+func (a *fakeProxyAPI) Refresh() error {
+	if a.failRefresh {
+		a.failRefresh = false
+		return errors.New("refresh failed")
 	}
 	return nil
 }
 
-func (f *fakeReg) SetString(subkey, name, value string) error {
-	return f.record("SetString " + name + "=" + value)
+type fakeProxyStore struct {
+	backup   *winProxyBackup
+	failSave bool
 }
 
-func (f *fakeReg) SetDWORD(subkey, name string, value uint32) error {
-	return f.record("SetDWORD " + name + "=" + strconv.FormatUint(uint64(value), 10))
+func (s *fakeProxyStore) Load() (*winProxyBackup, error) { return s.backup, nil }
+func (s *fakeProxyStore) Save(b winProxyBackup) error {
+	if s.failSave {
+		return errors.New("backup failed")
+	}
+	s.backup = &b
+	return nil
 }
+func (s *fakeProxyStore) Clear() error { s.backup = nil; return nil }
 
-func TestApplyWindowsProxyWritesEndpointsBeforeTheSwitch(t *testing.T) {
-	reg := &fakeReg{}
-	refreshes := 0
-	if err := applyWindowsProxy(reg, func() error { refreshes++; return nil }, true, "127.0.0.1:7897"); err != nil {
-		t.Fatalf("applyWindowsProxy: %v", err)
-	}
-
-	want := []string{
-		"SetString ProxyServer=http=127.0.0.1:7897;https=127.0.0.1:7897;socks=127.0.0.1:7897",
-		"SetString ProxyOverride=" + winProxyBypass,
-		"SetDWORD ProxyEnable=1",
-	}
-	if len(reg.ops) != len(want) {
-		t.Fatalf("ops = %v, want %v", reg.ops, want)
-	}
-	for i := range want {
-		if reg.ops[i] != want[i] {
-			t.Errorf("op %d = %q, want %q", i, reg.ops[i], want[i])
+func TestWindowsProxyRestoresPACAndOriginalAcrossRepeatedOn(t *testing.T) {
+	original := winProxySettings{Flags: 1 | 4 | 8, Server: "old:80", Bypass: "*.intranet", AutoConfigURL: "https://example.invalid/proxy.pac"}
+	a, s := &fakeProxyAPI{settings: original}, &fakeProxyStore{}
+	for _, listen := range []string{"127.0.0.1:7897", "[::1]:7898"} {
+		if err := applyWindowsProxy(a, s, true, listen, false); err != nil {
+			t.Fatal(err)
+		}
+		if a.settings.Flags != 3 || a.settings.AutoConfigURL != "" {
+			t.Fatal("PAC/autodetect still active")
 		}
 	}
-	if refreshes != 1 {
-		t.Errorf("WinINET refreshes = %d, want 1", refreshes)
+	if err := applyWindowsProxy(a, s, false, "", false); err != nil {
+		t.Fatal(err)
+	}
+	if a.settings != original || s.backup != nil {
+		t.Fatal("original settings not restored")
+	}
+	writes := a.writes
+	if err := applyWindowsProxy(a, s, false, "", false); err != nil || a.writes != writes {
+		t.Fatal("repeated off modified another proxy")
 	}
 }
 
-func TestApplyWindowsProxyOffClearsOnlyTheSwitch(t *testing.T) {
-	reg := &fakeReg{}
-	refreshes := 0
-	if err := applyWindowsProxy(reg, func() error { refreshes++; return nil }, false, "127.0.0.1:7897"); err != nil {
-		t.Fatalf("applyWindowsProxy: %v", err)
-	}
-	if len(reg.ops) != 1 || reg.ops[0] != "SetDWORD ProxyEnable=0" {
-		t.Errorf("ops = %v, want exactly the ProxyEnable switch", reg.ops)
-	}
-	if refreshes != 1 {
-		t.Errorf("turning the proxy off did not refresh WinINET")
+func TestWindowsProxyBackupMustSucceedBeforeAnyWrite(t *testing.T) {
+	a, s := &fakeProxyAPI{}, &fakeProxyStore{failSave: true}
+	if err := applyWindowsProxy(a, s, true, "127.0.0.1:7897", false); err == nil || a.writes != 0 {
+		t.Fatal("changed proxy without durable backup")
 	}
 }
 
-func TestApplyWindowsProxyPartialFailureLeavesItOff(t *testing.T) {
-	// The server value is written first; if that fails the switch must never
-	// flip, so the machine is left with the proxy disabled rather than pointed
-	// at a listener that may not exist.
-	reg := &fakeReg{failOn: "SetString ProxyServer"}
-	if err := applyWindowsProxy(reg, func() error { return nil }, true, "127.0.0.1:7897"); err == nil {
-		t.Fatal("a failing write did not surface an error")
-	}
-	for _, op := range reg.ops {
-		if strings.HasPrefix(op, "SetDWORD ProxyEnable=1") {
-			t.Errorf("the proxy switch flipped despite a failed write: %v", reg.ops)
+func TestWindowsProxyFailureRollsBack(t *testing.T) {
+	for _, refresh := range []bool{false, true} {
+		original := winProxySettings{Flags: 8, AutoConfigURL: "https://example.invalid/a"}
+		a, s := &fakeProxyAPI{settings: original, failWrite: !refresh, failRefresh: refresh}, &fakeProxyStore{}
+		if err := applyWindowsProxy(a, s, true, "127.0.0.1:7897", false); err == nil {
+			t.Fatal("failure swallowed")
+		}
+		if a.settings != original || s.backup != nil {
+			t.Fatal("rollback failed")
 		}
 	}
 }
 
-func TestApplyWindowsProxyRejectsABadListenAddress(t *testing.T) {
-	reg := &fakeReg{}
-	if err := applyWindowsProxy(reg, nil, true, "not-an-address"); err == nil {
-		t.Error("a bad listen address was accepted")
+func TestWindowsProxyConflictsRequireExplicitForce(t *testing.T) {
+	a, s := &fakeProxyAPI{settings: winProxySettings{Flags: 8}}, &fakeProxyStore{}
+	original := a.settings
+	if err := applyWindowsProxy(a, s, true, "127.0.0.1:7897", false); err != nil {
+		t.Fatal(err)
 	}
-	if len(reg.ops) != 0 {
-		t.Errorf("nothing should be written for a bad address, got %v", reg.ops)
+	a.settings = winProxySettings{Flags: 3, Server: "another:123"}
+	if err := applyWindowsProxy(a, s, false, "", false); err == nil {
+		t.Fatal("external settings silently overwritten")
+	}
+	if a.settings.Server != "another:123" || s.backup == nil {
+		t.Fatal("conflict lost data")
+	}
+	if err := applyWindowsProxy(a, s, false, "", true); err != nil || a.settings != original {
+		t.Fatalf("explicit recovery failed: %v", err)
+	}
+}
+
+func TestWindowsProxyCanRecoverInterruptedApply(t *testing.T) {
+	original := winProxySettings{Flags: 8}
+	s := &fakeProxyStore{backup: &winProxyBackup{Version: 1, Original: original, Applied: winProxySettings{Flags: 3, Server: "planned"}}}
+	a := &fakeProxyAPI{settings: original}
+	if err := applyWindowsProxy(a, s, false, "", false); err != nil || s.backup != nil {
+		t.Fatal("interrupted write not recoverable")
+	}
+}
+
+func TestWindowsProxyRejectsBadAddressBeforeMutation(t *testing.T) {
+	for _, listen := range []string{"bad", "127.0.0.1:0", "127.0.0.1:65536"} {
+		a, s := &fakeProxyAPI{}, &fakeProxyStore{}
+		if err := applyWindowsProxy(a, s, true, listen, false); err == nil || a.writes != 0 || s.backup != nil {
+			t.Fatalf("accepted %s", listen)
+		}
 	}
 }
 
 func TestWinProxyServerValueBracketsIPv6(t *testing.T) {
-	got := winProxyServerValue("::1", "7897")
-	if !strings.Contains(got, "http=[::1]:7897") {
-		t.Errorf("winProxyServerValue(::1) = %q", got)
+	if !strings.Contains(winProxyServerValue("::1", "7897"), "http=[::1]:7897") {
+		t.Fatal("missing IPv6 brackets")
 	}
 }

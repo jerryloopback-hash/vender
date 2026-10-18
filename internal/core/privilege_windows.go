@@ -3,6 +3,7 @@
 package core
 
 import (
+	"golang.org/x/sys/windows"
 	"syscall"
 	"unsafe"
 )
@@ -73,7 +74,7 @@ func isElevated() bool {
 }
 
 var (
-	advapi32 = syscall.NewLazyDLL("advapi32.dll")
+	advapi32 = windows.NewLazySystemDLL("advapi32.dll")
 
 	procOpenProcessToken    = advapi32.NewProc("OpenProcessToken")
 	procGetTokenInformation = advapi32.NewProc("GetTokenInformation")

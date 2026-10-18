@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -391,11 +392,49 @@ func TestBuildConfigGolden(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read golden file (run `go test ./internal/core -update`): %v", err)
 			}
+			if runtime.GOOS == "windows" {
+				got = normalizeGoldenPaths(t, got)
+				want = normalizeGoldenPaths(t, want)
+			}
 			if string(got) != string(want) {
 				t.Errorf("rendered config differs from %s\n--- got ---\n%s\n--- want ---\n%s", path, got, want)
 			}
 		})
 	}
+}
+
+// The fixture uses /run/vender on every OS. Normalize only filesystem/URI path
+// fields for comparison, not production output or credentials/protocol fields.
+func normalizeGoldenPaths(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		t.Fatal(err)
+	}
+	var visit func(any)
+	visit = func(v any) {
+		switch item := v.(type) {
+		case map[string]any:
+			for k, v := range item {
+				if k == "path" {
+					if s, ok := v.(string); ok {
+						item[k] = strings.ReplaceAll(s, `\`, "/")
+					}
+				}
+				visit(v)
+			}
+		case []any:
+			for _, v := range item {
+				visit(v)
+			}
+		}
+	}
+	visit(value)
+	out, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
 }
 
 // The generated config must never carry a deprecated field: sing-box 1.13

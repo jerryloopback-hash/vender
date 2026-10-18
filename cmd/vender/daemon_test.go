@@ -13,8 +13,7 @@ import (
 )
 
 // These tests exercise the daemon/status/proxy wiring without a real sing-box:
-// the lock, the pid file and a plain TCP listener are enough to describe the
-// states `vender status` must distinguish.
+// an advisory lock or an unrelated TCP listener must not prove engine health.
 
 // holdLock takes the run dir's lock for the duration of the test, standing in
 // for a running daemon.
@@ -66,15 +65,15 @@ func TestCLIStatusFailsWhenTheDaemonIsUpButThePortIsClosed(t *testing.T) {
 	if errors.Is(err, errNotRunning) {
 		t.Errorf("error = %v, want it to distinguish \"running but not listening\"", err)
 	}
-	if !strings.Contains(err.Error(), "not accepting connections") {
-		t.Errorf("error = %q, want it to explain the closed port", err)
+	if !strings.Contains(err.Error(), "control channel") {
+		t.Errorf("error = %q, want it to explain the unverified engine state", err)
 	}
 	if !strings.Contains(out, "state        running") {
 		t.Errorf("status output = %q, want it to report running", out)
 	}
 }
 
-func TestCLIStatusSucceedsWhenTheDaemonIsUpAndThePortIsOpen(t *testing.T) {
+func TestCLIStatusRejectsALockAndUnrelatedListener(t *testing.T) {
 	cfgDir := t.TempDir()
 	runDir := t.TempDir()
 
@@ -91,16 +90,16 @@ func TestCLIStatusSucceedsWhenTheDaemonIsUpAndThePortIsOpen(t *testing.T) {
 	}
 
 	out, err := runCLIIn(t, runDir, "status", "--config-dir", cfgDir)
-	if err != nil {
-		t.Fatalf("status = %v, want nil (output: %q)", err, out)
+	if err == nil {
+		t.Fatalf("status = nil error despite having no authenticated daemon (output: %q)", out)
 	}
-	for _, want := range []string{"state        running", "accepting connections", "pid          "} {
+	for _, want := range []string{"state        running", "pid          "} {
 		if !strings.Contains(out, want) {
 			t.Errorf("status output = %q, want it to contain %q", out, want)
 		}
 	}
-	if !strings.Contains(out, "127.0.0.1") {
-		t.Errorf("status output = %q, want it to name the listener", out)
+	if !strings.Contains(err.Error(), "control channel") {
+		t.Errorf("error = %v, want an unverified engine error", err)
 	}
 }
 
@@ -210,7 +209,7 @@ func TestCLIProxyOnOff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy off: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "restored") {
+	if !strings.Contains(out, "restored") && !strings.Contains(out, "disabled") {
 		t.Errorf("proxy off output = %q", out)
 	}
 

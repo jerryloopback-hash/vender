@@ -57,11 +57,13 @@ func systemdBackend(t *testing.T, r *fakeRun) (linuxBackend, string) {
 		return "", errors.New("not found")
 	}
 	return linuxBackend{
-		home:     home,
-		exe:      "/usr/local/bin/vender",
-		user:     "tester",
-		lookPath: look,
-		run:      r.run,
+		home:          home,
+		exe:           "/usr/local/bin/vender",
+		user:          "tester",
+		systemUnitDir: filepath.Join(home, "etc-systemd-system"),
+		euid:          1000,
+		lookPath:      look,
+		run:           r.run,
 	}, home
 }
 
@@ -206,7 +208,7 @@ func TestXDGFallbackWhenSystemdIsUnavailable(t *testing.T) {
 	r.answers["systemctl --user is-system-running"] = "Failed to connect to bus: No such file or directory"
 	r.fail["systemctl --user is-system-running"] = true
 	look := func(name string) (string, error) { return "/usr/bin/" + name, nil }
-	b := linuxBackend{home: home, exe: "/opt/vender", user: "tester", lookPath: look, run: r.run}
+	b := linuxBackend{home: home, exe: "/opt/vender", user: "tester", systemUnitDir: filepath.Join(home, "etc-systemd-system"), euid: 1000, lookPath: look, run: r.run}
 
 	st, err := b.enable()
 	if err != nil {
@@ -258,7 +260,7 @@ func TestDegradedUserManagerStillAcceptsUnits(t *testing.T) {
 }
 
 func TestDisabledStatusWithNoHomeIsHonest(t *testing.T) {
-	b := linuxBackend{exe: "/bin/vender", lookPath: func(string) (string, error) { return "", errors.New("nope") }, run: newFakeRun().run}
+	b := linuxBackend{exe: "/bin/vender", systemUnitDir: t.TempDir(), euid: 1000, lookPath: func(string) (string, error) { return "", errors.New("nope") }, run: newFakeRun().run}
 	st, err := b.status()
 	if err != nil {
 		t.Fatalf("status: %v", err)

@@ -3,132 +3,195 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
-	"syscall"
+	"os"
+	"path/filepath"
+	"runtime"
 	"unsafe"
+
+	"github.com/ll-lite/vender/internal/core"
+	"github.com/ll-lite/vender/internal/privatefs"
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
-// systemProxySupported reports whether `vender proxy on|off` can change the
-// desktop's proxy settings on this platform.
 func systemProxySupported() bool { return true }
 
-// setSystemProxy writes the per-user WinINET proxy and refreshes it, or turns
-// it off. See winproxy.go for the key layout and the ordering; everything here
-// is the Windows API surface.
-func setSystemProxy(on bool, listen string) error {
-	return applyWindowsProxy(winReg{}, winInetRefresh, on, listen)
+func setSystemProxy(on bool, listen string) error { return setWindowsProxy(on, listen, false) }
+
+func forceRestoreSystemProxy() error { return setWindowsProxy(false, "", true) }
+
+func setWindowsProxy(on bool, listen string, force bool) error {
+	// The OS setting is per user, not per vender profile or run directory.
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return err
+	}
+	dir = filepath.Join(dir, "vender")
+	if err := privatefs.EnsureDir(dir); err != nil {
+		return err
+	}
+	lock, err := core.AcquireLock(filepath.Join(dir, "system-proxy.lock"))
+	if err != nil {
+		return fmt.Errorf("another system proxy operation may be running: %w", err)
+	}
+	defer lock.Release()
+	return applyWindowsProxy(winInetAPI{}, winProxyStore{}, on, listen, force)
 }
 
-// The DLLs are resolved with syscall.NewLazyDLL, which searches System32 only,
-// so a rogue DLL in the working directory cannot be loaded. This is the same
-// approach internal/core uses for LockFileEx.
 var (
-	advapi32DLL = syscall.NewLazyDLL("advapi32.dll")
-	wininetDLL  = syscall.NewLazyDLL("wininet.dll")
-
-	procRegCreateKeyExW    = advapi32DLL.NewProc("RegCreateKeyExW")
-	procRegSetValueExW     = advapi32DLL.NewProc("RegSetValueExW")
-	procRegCloseKey        = advapi32DLL.NewProc("RegCloseKey")
-	procInternetSetOptionW = wininetDLL.NewProc("InternetSetOptionW")
+	wininetDLL               = windows.NewLazySystemDLL("wininet.dll")
+	procInternetSetOptionW   = wininetDLL.NewProc("InternetSetOptionW")
+	procInternetQueryOptionW = wininetDLL.NewProc("InternetQueryOptionW")
+	procGlobalFree           = windows.NewLazySystemDLL("kernel32.dll").NewProc("GlobalFree")
+	procRegFlushKey          = windows.NewLazySystemDLL("advapi32.dll").NewProc("RegFlushKey")
 )
 
 const (
-	hkeyCurrentUser = syscall.HKEY_CURRENT_USER
-	keySetValue     = syscall.KEY_SET_VALUE
-	regSZ           = syscall.REG_SZ
-	regDWORD        = syscall.REG_DWORD
+	optionPerConnection   = 75
+	optionRefresh         = 37
+	optionSettingsChanged = 39
+	backupKey             = `Software\vender`
+	backupValue           = "SystemProxyBackupV1"
 )
 
-// winReg is the winRegistry implementation: HKEY_CURRENT_USER only, so no
-// elevation is needed and no machine-wide setting is touched.
-type winReg struct{}
-
-func (winReg) SetString(subkey, name, value string) error {
-	data := syscall.StringToUTF16(value) // NUL-terminated
-	return setWinValue(subkey, name, regSZ, unsafe.Pointer(&data[0]), uint32(len(data)*2))
+// The union includes a FILETIME (8 bytes), even on 32-bit Windows. Using a
+// uint64 gives the correct native union size/alignment on our Windows targets.
+type perConnOption struct {
+	Option uint32
+	Value  uint64
+}
+type perConnList struct {
+	Size       uint32
+	Connection *uint16 // nil selects the LAN settings, not dial-up profiles
+	Count      uint32
+	Error      uint32
+	Options    *perConnOption
 }
 
-func (winReg) SetDWORD(subkey, name string, value uint32) error {
-	v := value
-	return setWinValue(subkey, name, regDWORD, unsafe.Pointer(&v), 4)
+type winInetAPI struct{}
+
+func (winInetAPI) Read() (winProxySettings, error) {
+	options := []perConnOption{{Option: 1}, {Option: 2}, {Option: 3}, {Option: 4}}
+	list := perConnList{Count: uint32(len(options)), Options: &options[0]}
+	list.Size = uint32(unsafe.Sizeof(list))
+	size := list.Size
+	ok, _, err := procInternetQueryOptionW.Call(0, optionPerConnection, uintptr(unsafe.Pointer(&list)), uintptr(unsafe.Pointer(&size)))
+	// WinINET allocates returned string buffers with GlobalAlloc.
+	defer func() {
+		for _, o := range options[1:] {
+			if o.Value != 0 {
+				_, _, _ = procGlobalFree.Call(uintptr(o.Value))
+			}
+		}
+	}()
+	if ok == 0 {
+		return winProxySettings{}, fmt.Errorf("InternetQueryOption: %w", err)
+	}
+	text := func(option *perConnOption) string {
+		if option.Value == 0 {
+			return ""
+		}
+		// Read the pointer member of the native union directly rather than
+		// round-tripping an address through a Go integer.
+		return windows.UTF16PtrToString(*(**uint16)(unsafe.Pointer(&option.Value)))
+	}
+	return winProxySettings{Flags: uint32(options[0].Value), Server: text(&options[1]), Bypass: text(&options[2]), AutoConfigURL: text(&options[3])}, nil
 }
 
-func setWinValue(subkey, name string, typ uint32, data unsafe.Pointer, size uint32) error {
-	sub, err := syscall.UTF16PtrFromString(subkey)
-	if err != nil {
-		return fmt.Errorf("subkey %q: %w", subkey, err)
+func (winInetAPI) Write(settings winProxySettings) error {
+	values := make([]*uint16, 3)
+	for i, s := range []string{settings.Server, settings.Bypass, settings.AutoConfigURL} {
+		p, err := windows.UTF16PtrFromString(s)
+		if err != nil {
+			return err
+		}
+		values[i] = p
 	}
-	val, err := syscall.UTF16PtrFromString(name)
-	if err != nil {
-		return fmt.Errorf("value name %q: %w", name, err)
-	}
-
-	var h syscall.Handle
-	// Create (not just open) so a freshly provisioned profile that has never
-	// run an Internet program still gets the key instead of a not-found error.
-	r1, _, callErr := procRegCreateKeyExW.Call(
-		uintptr(hkeyCurrentUser),
-		uintptr(unsafe.Pointer(sub)),
-		0, // Reserved
-		0, // lpClass
-		0, // REG_OPTION_NON_VOLATILE
-		uintptr(keySetValue),
-		0, // lpSecurityAttributes
-		uintptr(unsafe.Pointer(&h)),
-		0, // lpdwDisposition
-	)
-	if r1 != 0 {
-		return fmt.Errorf("open HKCU\\%s: %w", subkey, winCallErr(callErr))
-	}
-	defer procRegCloseKey.Call(uintptr(h))
-
-	r1, _, callErr = procRegSetValueExW.Call(
-		uintptr(h),
-		uintptr(unsafe.Pointer(val)),
-		0, // Reserved
-		uintptr(typ),
-		uintptr(data),
-		uintptr(size),
-	)
-	if r1 != 0 {
-		return fmt.Errorf("set %s: %w", name, winCallErr(callErr))
+	options := []perConnOption{{Option: 1, Value: uint64(settings.Flags)},
+		{Option: 2, Value: uint64(uintptr(unsafe.Pointer(values[0])))},
+		{Option: 3, Value: uint64(uintptr(unsafe.Pointer(values[1])))},
+		{Option: 4, Value: uint64(uintptr(unsafe.Pointer(values[2])))}}
+	list := perConnList{Count: uint32(len(options)), Options: &options[0]}
+	list.Size = uint32(unsafe.Sizeof(list))
+	ok, _, err := procInternetSetOptionW.Call(0, optionPerConnection, uintptr(unsafe.Pointer(&list)), uintptr(list.Size))
+	runtime.KeepAlive(values)
+	if ok == 0 {
+		return fmt.Errorf("InternetSetOption(per-connection): %w", err)
 	}
 	return nil
 }
 
-const (
-	internetOptionRefresh         = 37 // INTERNET_OPTION_REFRESH
-	internetOptionSettingsChanged = 39 // INTERNET_OPTION_SETTINGS_CHANGED
-)
-
-// winInetRefresh tells WinINET the registry changed and makes it re-read the
-// configuration. Both calls are required: SETTINGS_CHANGED invalidates the
-// cached settings, REFRESH propagates them to the processes that use them.
-// Writing ProxyEnable without this leaves already-running applications on the
-// old configuration.
-func winInetRefresh() error {
-	for _, option := range []uintptr{internetOptionSettingsChanged, internetOptionRefresh} {
-		r1, _, callErr := procInternetSetOptionW.Call(0, option, 0, 0)
-		if r1 == 0 {
-			return fmt.Errorf("InternetSetOption(%d): %w", option, winCallErr(callErr))
+func (winInetAPI) Refresh() error {
+	for _, option := range []uintptr{optionSettingsChanged, optionRefresh} {
+		ok, _, err := procInternetSetOptionW.Call(0, option, 0, 0)
+		if ok == 0 {
+			return fmt.Errorf("InternetSetOption(%d): %w", option, err)
 		}
 	}
 	return nil
 }
 
-// winCallErr turns a LazyProc.Call error into something worth printing: the
-// syscall package reports a zero Errno when the API failed without setting
-// GetLastError.
-func winCallErr(err error) error {
-	if errno, ok := err.(syscall.Errno); ok {
-		if errno == 0 {
-			return errors.New("the call failed")
-		}
-		return errno
+type winProxyStore struct{}
+
+func (winProxyStore) Load() (*winProxyBackup, error) {
+	key, err := registry.OpenKey(registry.CURRENT_USER, backupKey, registry.QUERY_VALUE)
+	if errors.Is(err, registry.ErrNotExist) {
+		return nil, nil
 	}
-	if err == nil {
-		return errors.New("the call failed")
+	if err != nil {
+		return nil, err
 	}
-	return err
+	defer key.Close()
+	data, _, err := key.GetStringValue(backupValue)
+	if errors.Is(err, registry.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var backup winProxyBackup
+	if err := json.Unmarshal([]byte(data), &backup); err != nil {
+		return nil, fmt.Errorf("invalid saved proxy state: %w", err)
+	}
+	return &backup, nil
+}
+func (winProxyStore) Save(backup winProxyBackup) error {
+	data, err := json.Marshal(backup)
+	if err != nil {
+		return err
+	}
+	key, _, err := registry.CreateKey(registry.CURRENT_USER, backupKey, registry.SET_VALUE|registry.QUERY_VALUE)
+	if err != nil {
+		return err
+	}
+	defer key.Close()
+	if err := key.SetStringValue(backupValue, string(data)); err != nil {
+		return err
+	}
+	return flushProxyKey(key)
+}
+func (winProxyStore) Clear() error {
+	key, err := registry.OpenKey(registry.CURRENT_USER, backupKey, registry.SET_VALUE|registry.QUERY_VALUE)
+	if errors.Is(err, registry.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer key.Close()
+	if err := key.DeleteValue(backupValue); err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return err
+	}
+	return flushProxyKey(key)
+}
+
+func flushProxyKey(key registry.Key) error {
+	status, _, _ := procRegFlushKey.Call(uintptr(key))
+	if status != 0 {
+		return windows.Errno(status)
+	}
+	return nil
 }

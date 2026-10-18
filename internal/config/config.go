@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"strings"
 	"time"
 
@@ -265,8 +266,8 @@ func (c *Config) Validate() error {
 		problems = append(problems, "proxy.listen: "+err.Error())
 	}
 
-	if strings.ContainsAny(c.Engine.BindInterface, " \t/") {
-		problems = append(problems, fmt.Sprintf("engine.bind_interface %q must be an interface name without spaces or slashes", c.Engine.BindInterface))
+	if invalidInterfaceName(c.Engine.BindInterface, runtime.GOOS) {
+		problems = append(problems, fmt.Sprintf("engine.bind_interface %q is not a valid interface name (spaces are supported only on Windows)", c.Engine.BindInterface))
 	}
 
 	problems = append(problems, c.Engine.Validate()...)
@@ -383,6 +384,9 @@ func validateListen(addr string) error {
 	}
 	if host == "" {
 		return fmt.Errorf("host must not be empty in %q (a wildcard listener would expose the proxy)", addr)
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		return fmt.Errorf("wildcard host in %q would expose the unauthenticated proxy; use a loopback address", addr)
 	}
 	if err := validatePortString(port); err != nil {
 		return err

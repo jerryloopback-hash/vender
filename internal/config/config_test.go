@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -346,7 +347,7 @@ func TestStoreConfigRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != plainFileMode {
+	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm != plainFileMode {
 		t.Errorf("config.yaml mode = %o, want %o", perm, plainFileMode)
 	}
 }
@@ -388,6 +389,7 @@ func TestDefaultDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "cfg"))
 	t.Setenv("HOME", home)
+	t.Setenv("APPDATA", filepath.Join(home, "AppData"))
 
 	dir, err := DefaultDir()
 	if err != nil {

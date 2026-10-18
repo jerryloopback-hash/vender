@@ -19,12 +19,31 @@ configuration — it never enables a VPN or TUN mode, and it never changes the
 listen address or the daemon's state.
 
   Linux    GNOME: gsettings org.gnome.system.proxy
-  Windows  not implemented until M4 (the Registry Internet Settings path)
+  Windows  WinINET LAN settings, with a durable per-user backup
 
-Run ` + "`vender proxy off`" + ` to restore the previous setting. vender's own
+On Windows, ` + "`vender proxy off`" + ` restores the saved manual/PAC/auto-detect
+settings; it refuses to overwrite external changes unless you explicitly use
+` + "`proxy off --force`" + `. On GNOME, off sets mode to none. vender's own
 documentation always prefers per-application proxy configuration (or the
 http_proxy / https_proxy environment variables printed by ` + "`proxy on`" + `).`,
 	}
+	off := &cobra.Command{
+		Use:   "off",
+		Short: "Restore the saved Windows proxy, or disable the GNOME proxy",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			force, _ := cmd.Flags().GetBool("force")
+			if force {
+				if err := forceRestoreSystemProxy(); err != nil {
+					return err
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), "Saved system proxy settings restored (forced)")
+				return nil
+			}
+			return a.setProxy(cmd, false)
+		},
+	}
+	off.Flags().Bool("force", false, "Windows: restore saved settings even if another application changed the proxy")
 	cmd.AddCommand(
 		&cobra.Command{
 			Use:   "on",
@@ -34,14 +53,7 @@ http_proxy / https_proxy environment variables printed by ` + "`proxy on`" + `).
 				return a.setProxy(cmd, true)
 			},
 		},
-		&cobra.Command{
-			Use:   "off",
-			Short: "Restore the system proxy (mode: none)",
-			Args:  cobra.NoArgs,
-			RunE: func(cmd *cobra.Command, _ []string) error {
-				return a.setProxy(cmd, false)
-			},
-		},
+		off,
 	)
 	return cmd
 }
@@ -63,15 +75,18 @@ func (a *app) setProxy(cmd *cobra.Command, on bool) error {
 			action, runtime.GOOS)
 	}
 
-	store, err := a.configStore()
-	if err != nil {
-		return err
+	listen := "127.0.0.1:7897"
+	if on || runtime.GOOS != "windows" {
+		store, err := a.configStore()
+		if err != nil {
+			return err
+		}
+		cfg, err := store.LoadConfig()
+		if err != nil {
+			return err
+		}
+		listen = cfg.Proxy.Listen
 	}
-	cfg, err := store.LoadConfig()
-	if err != nil {
-		return err
-	}
-	listen := cfg.Proxy.Listen
 
 	if err := applySystemProxy(on, listen); err != nil {
 		return fmt.Errorf("proxy: %w", err)
@@ -91,7 +106,11 @@ func (a *app) setProxy(cmd *cobra.Command, on bool) error {
 		return nil
 	}
 
-	fmt.Fprintf(out, "System proxy restored (mode: none)\n")
+	if runtime.GOOS == "windows" {
+		fmt.Fprintln(out, "Saved system proxy settings restored (or no vender backup was present)")
+	} else {
+		fmt.Fprintln(out, "System proxy disabled (mode: none)")
+	}
 	fmt.Fprintln(out, "Shells that exported the variables above need to unset them:")
 	for _, v := range []string{"http_proxy", "https_proxy", "all_proxy", "no_proxy"} {
 		fmt.Fprintf(out, "  unset %s\n", v)

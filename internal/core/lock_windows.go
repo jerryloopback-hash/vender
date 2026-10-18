@@ -4,6 +4,7 @@ package core
 
 import (
 	"errors"
+	"golang.org/x/sys/windows"
 	"os"
 	"syscall"
 	"unsafe"
@@ -17,7 +18,7 @@ var (
 	// syscall.NewLazyDLL resolves "kernel32.dll" with
 	// LOAD_LIBRARY_SEARCH_SYSTEM32, so a rogue copy in the working directory
 	// cannot be loaded.
-	kernel32         = syscall.NewLazyDLL("kernel32.dll")
+	kernel32         = windows.NewLazySystemDLL("kernel32.dll")
 	procLockFileEx   = kernel32.NewProc("LockFileEx")
 	procUnlockFileEx = kernel32.NewProc("UnlockFileEx")
 )

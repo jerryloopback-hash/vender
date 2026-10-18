@@ -35,6 +35,10 @@ const (
 	// engine's Clash API is not (yet) answering.
 	trafficMinBackoff = 500 * time.Millisecond
 	trafficMaxBackoff = 10 * time.Second
+	// Bound crash loops across successful-but-short-lived restarts as well as
+	// failed starts. A manual lifecycle command starts a new recovery budget.
+	recoveryLimit  = 5
+	recoveryWindow = 5 * time.Minute
 )
 
 // ControllerOptions configures a Controller.
@@ -88,18 +92,23 @@ type Controller struct {
 
 	ops sync.Mutex // serialises engine lifecycle changes
 
-	mu         sync.RWMutex
-	cfg        config.Config
-	servers    *config.ServerSet
-	profiles   *config.ProfileSet
-	running    bool
-	restarting bool
-	stopping   bool
-	lastErr    string
-	startedAt  time.Time
-	enginePid  int
-	engVersion string
-	gen        int
+	mu               sync.RWMutex
+	cfg              config.Config
+	servers          *config.ServerSet
+	profiles         *config.ProfileSet
+	running          bool
+	restarting       bool
+	stopping         bool
+	lastErr          string
+	startedAt        time.Time
+	enginePid        int
+	engVersion       string
+	gen              int
+	lastRuntime      core.RuntimeConfig
+	wanted           bool
+	recoveryEpoch    uint64
+	recoveryAttempts []time.Time
+	recoveryDelay    time.Duration
 
 	logMu   sync.Mutex
 	logSubs map[int]chan any
@@ -147,18 +156,19 @@ func NewController(opts ControllerOptions) (*Controller, error) {
 	}
 
 	c := &Controller{
-		store:      opts.Store,
-		runDir:     opts.RunDir,
-		engine:     opts.Engine,
-		binary:     opts.BinaryPath,
-		version:    opts.Version,
-		logf:       opts.Logf,
-		clash:      core.NewClashClient(addr, token),
-		clashAddr:  addr,
-		clashToken: token,
-		logSubs:    make(map[int]chan any),
-		trafSubs:   make(map[int]chan any),
-		closed:     make(chan struct{}),
+		store:         opts.Store,
+		runDir:        opts.RunDir,
+		engine:        opts.Engine,
+		binary:        opts.BinaryPath,
+		version:       opts.Version,
+		logf:          opts.Logf,
+		clash:         core.NewClashClient(addr, token),
+		clashAddr:     addr,
+		clashToken:    token,
+		logSubs:       make(map[int]chan any),
+		trafSubs:      make(map[int]chan any),
+		closed:        make(chan struct{}),
+		recoveryDelay: time.Second,
 	}
 
 	// Render (but do not start) so a broken configuration or a missing server
@@ -179,6 +189,7 @@ func (c *Controller) ClashListen() string { return c.clashAddr }
 func (c *Controller) StartEngine() error {
 	c.ops.Lock()
 	defer c.ops.Unlock()
+	c.setWanted(true)
 	return c.startLocked()
 }
 
@@ -187,6 +198,7 @@ func (c *Controller) StartEngine() error {
 func (c *Controller) StopEngine() error {
 	c.ops.Lock()
 	defer c.ops.Unlock()
+	c.setWanted(false)
 	return c.stopLocked()
 }
 
@@ -196,10 +208,17 @@ func (c *Controller) StopEngine() error {
 func (c *Controller) RestartEngine() error {
 	c.ops.Lock()
 	defer c.ops.Unlock()
-	if err := c.stopLocked(); err != nil {
-		return err
-	}
-	return c.startLocked()
+	return c.restartLocked()
+}
+
+// setWanted is called with ops held. Incrementing the epoch cancels pending
+// recovery without waiting for its backoff timer.
+func (c *Controller) setWanted(wanted bool) {
+	c.mu.Lock()
+	c.wanted = wanted
+	c.recoveryEpoch++
+	c.recoveryAttempts = nil
+	c.mu.Unlock()
 }
 
 // SelectServer makes name the active server, persists the choice to
@@ -326,14 +345,12 @@ func (c *Controller) SetMode(mode string) error {
 // when it is running. When it is not, the config is only re-rendered, so a
 // later StartEngine uses the new choice without a pointless restart.
 func (c *Controller) applyLocked() error {
-	if _, err := c.render(); err != nil {
-		return err
-	}
 	c.mu.RLock()
 	running := c.running
 	c.mu.RUnlock()
 	if !running {
-		return nil
+		_, err := c.render()
+		return err
 	}
 	return c.restartLocked()
 }
@@ -343,6 +360,7 @@ func (c *Controller) Close() {
 	c.closeOnce.Do(func() {
 		close(c.closed)
 		c.ops.Lock()
+		c.setWanted(false)
 		_ = c.stopLocked()
 		c.ops.Unlock()
 	})
@@ -357,11 +375,15 @@ func (c *Controller) startLocked() error {
 	if already {
 		return nil
 	}
-	rc, err := c.render()
+	rc, servers, profiles, err := c.loadRuntime()
 	if err != nil {
 		c.fail(err)
 		return err
 	}
+	return c.startRuntimeLocked(rc, servers, profiles)
+}
+
+func (c *Controller) startRuntimeLocked(rc core.RuntimeConfig, servers *config.ServerSet, profiles *config.ProfileSet) error {
 	if err := c.engine.WriteConfig(rc); err != nil {
 		c.fail(err)
 		return err
@@ -381,6 +403,10 @@ func (c *Controller) startLocked() error {
 
 	c.mu.Lock()
 	c.running = true
+	c.cfg = rc.Config
+	c.servers = servers
+	c.profiles = profiles
+	c.lastRuntime = rc
 	c.startedAt = time.Now()
 	c.lastErr = ""
 	c.enginePid = enginePID(c.engine)
@@ -416,6 +442,26 @@ func (c *Controller) stopLocked() error {
 }
 
 func (c *Controller) restartLocked() error {
+	// Refuse an invalid candidate before dropping a working proxy. render also
+	// runs the pure renderer, catching errors that RuntimeConfig.Validate alone
+	// cannot catch (for example outbound tag collisions).
+	rc, servers, profiles, err := c.loadRuntime()
+	if err != nil {
+		c.fail(err)
+		return err
+	}
+	if checker, ok := c.engine.(interface {
+		CheckConfig(core.RuntimeConfig) error
+	}); ok {
+		if err := checker.CheckConfig(rc); err != nil {
+			c.fail(err)
+			return err
+		}
+	}
+	c.mu.RLock()
+	previous, previousServers, previousProfiles, wasRunning := c.lastRuntime, c.servers, c.profiles, c.running
+	c.mu.RUnlock()
+	c.setWanted(true)
 	c.mu.Lock()
 	c.restarting = true
 	c.mu.Unlock()
@@ -427,7 +473,18 @@ func (c *Controller) restartLocked() error {
 	if err := c.stopLocked(); err != nil {
 		return err
 	}
-	return c.startLocked()
+	if err := c.startRuntimeLocked(rc, servers, profiles); err != nil {
+		if wasRunning {
+			if restoreErr := c.startRuntimeLocked(previous, previousServers, previousProfiles); restoreErr != nil {
+				err = fmt.Errorf("apply failed: %w; restoring previous engine also failed: %v", err, restoreErr)
+			} else {
+				err = fmt.Errorf("apply failed: %w; previous engine restored (disk configuration remains pending)", err)
+			}
+		}
+		c.fail(err)
+		return err
+	}
+	return nil
 }
 
 // render builds the RuntimeConfig from the files on disk and refreshes the
@@ -435,17 +492,32 @@ func (c *Controller) restartLocked() error {
 // render is what makes `vender import` in another terminal take effect on the
 // next restart.
 func (c *Controller) render() (core.RuntimeConfig, error) {
+	rc, servers, profiles, err := c.loadRuntime()
+	if err != nil {
+		return core.RuntimeConfig{}, err
+	}
+	c.mu.Lock()
+	c.cfg = rc.Config
+	c.servers = servers
+	c.profiles = profiles
+	c.mu.Unlock()
+	return rc, nil
+}
+
+// Loading/validating a candidate must not publish it as applied state. A failed
+// switch can leave newer settings on disk while the old engine keeps working.
+func (c *Controller) loadRuntime() (core.RuntimeConfig, *config.ServerSet, *config.ProfileSet, error) {
 	cfg, err := c.store.LoadConfig()
 	if err != nil {
-		return core.RuntimeConfig{}, Errorf(KindInternal, "control: %v", err)
+		return core.RuntimeConfig{}, nil, nil, Errorf(KindInternal, "control: %v", err)
 	}
 	servers, err := c.store.LoadServers()
 	if err != nil {
-		return core.RuntimeConfig{}, Errorf(KindInternal, "control: %v", err)
+		return core.RuntimeConfig{}, nil, nil, Errorf(KindInternal, "control: %v", err)
 	}
 	profiles, err := c.store.LoadProfiles()
 	if err != nil {
-		return core.RuntimeConfig{}, Errorf(KindInternal, "control: %v", err)
+		return core.RuntimeConfig{}, nil, nil, Errorf(KindInternal, "control: %v", err)
 	}
 
 	var srv *config.Server
@@ -457,14 +529,14 @@ func (c *Controller) render() (core.RuntimeConfig, error) {
 			if errors.Is(serr, config.ErrNotFound) {
 				kind = KindNotFound
 			}
-			return core.RuntimeConfig{}, Errorf(kind, "control: %v", serr)
+			return core.RuntimeConfig{}, nil, nil, Errorf(kind, "control: %v", serr)
 		}
 		srv, all = s, as
 	}
 
 	userRules, err := rules.LoadUserRules(c.store.RulesPath())
 	if err != nil {
-		return core.RuntimeConfig{}, Errorf(KindBadRequest, "control: %v", err)
+		return core.RuntimeConfig{}, nil, nil, Errorf(KindBadRequest, "control: %v", err)
 	}
 
 	rc := core.RuntimeConfig{
@@ -479,15 +551,12 @@ func (c *Controller) render() (core.RuntimeConfig, error) {
 		ClashSecret: c.clashToken,
 	}
 	if err := rc.Validate(); err != nil {
-		return core.RuntimeConfig{}, Errorf(KindInternal, "control: %v", err)
+		return core.RuntimeConfig{}, nil, nil, Errorf(KindInternal, "control: %v", err)
 	}
-
-	c.mu.Lock()
-	c.cfg = *cfg
-	c.servers = servers
-	c.profiles = profiles
-	c.mu.Unlock()
-	return rc, nil
+	if _, err := core.BuildConfig(rc); err != nil {
+		return core.RuntimeConfig{}, nil, nil, Errorf(KindBadRequest, "control: %v", err)
+	}
+	return rc, servers, profiles, nil
 }
 
 func (c *Controller) fail(err error) {
@@ -518,16 +587,78 @@ func (c *Controller) watchLogs(gen int) {
 			c.publishLog(LogLine{Line: line, Time: time.Now().Format("15:04:05"), Source: SourceEngine})
 		}
 		c.mu.Lock()
+		unexpected := false
+		epoch := c.recoveryEpoch
 		if c.gen == gen {
 			c.running = false
 			c.enginePid = 0
 			if !c.stopping && !c.restarting {
 				c.lastErr = "engine exited"
+				unexpected = c.wanted
 			}
 		}
 		c.mu.Unlock()
 		c.stopTrafficGen(gen)
+		if unexpected {
+			go c.recoverEngine(epoch)
+		}
 	}()
+}
+
+// recoverEngine restores only unexpected exits, with a rolling crash budget.
+// ops and the epoch check prevent a pending recovery from undoing a user's
+// stop/restart or resurrecting the engine after Close.
+func (c *Controller) recoverEngine(epoch uint64) {
+	for attempt := 0; ; attempt++ {
+		delay := c.recoveryDelay * time.Duration(1<<min(attempt, 4))
+		timer := time.NewTimer(delay)
+		select {
+		case <-c.closed:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		c.ops.Lock()
+		c.mu.Lock()
+		if !c.wanted || c.recoveryEpoch != epoch || c.running {
+			c.mu.Unlock()
+			c.ops.Unlock()
+			return
+		}
+		select {
+		case <-c.closed:
+			c.mu.Unlock()
+			c.ops.Unlock()
+			return
+		default:
+		}
+		now := time.Now()
+		kept := c.recoveryAttempts[:0]
+		for _, when := range c.recoveryAttempts {
+			if now.Sub(when) < recoveryWindow {
+				kept = append(kept, when)
+			}
+		}
+		c.recoveryAttempts = kept
+		if len(kept) >= recoveryLimit {
+			c.lastErr = "engine recovery limit reached (5 attempts in 5 minutes); start manually after correcting the failure"
+			c.mu.Unlock()
+			c.ops.Unlock()
+			c.note("engine recovery limit reached")
+			return
+		}
+		c.recoveryAttempts = append(c.recoveryAttempts, now)
+		rc, servers, profiles := c.lastRuntime, c.servers, c.profiles
+		c.mu.Unlock()
+		c.note("recovering unexpectedly exited engine")
+		// Recover the last applied configuration, not unvalidated edits that
+		// another process may have left on disk since the engine started.
+		err := c.startRuntimeLocked(rc, servers, profiles)
+		c.ops.Unlock()
+		if err == nil {
+			return
+		}
+	}
 }
 
 // --- traffic ----------------------------------------------------------------
@@ -736,6 +867,7 @@ func (c *Controller) Status() StatusData {
 	startedAt := c.startedAt
 	pid := c.enginePid
 	engVersion := c.engVersion
+	profiles := c.profiles
 	c.mu.RUnlock()
 
 	priv := core.CheckTUNPrivilege(c.binary)
@@ -771,8 +903,7 @@ func (c *Controller) Status() StatusData {
 	}
 	// Profile state: which profile is active, how many servers auto failover
 	// would use, and every known profile name (so a client can cycle them).
-	var ps *config.ProfileSet
-	ps, _ = c.store.LoadProfiles()
+	ps := profiles
 	if ps == nil {
 		ps = config.NewProfileSet()
 	}
@@ -793,8 +924,8 @@ func (c *Controller) Status() StatusData {
 	if servers != nil && cfg.SelectedServer != "" {
 		if cfg.IsAutoServer() {
 			st.SrvType = "auto"
-			st.SrvEndpoint = fmt.Sprintf("%d servers", servers.Len())
-			st.SrvDetail = "failover (urltest over every configured server)"
+			st.SrvEndpoint = fmt.Sprintf("%d servers", st.ProfileServers)
+			st.SrvDetail = "failover (urltest over the active profile)"
 		} else if srv, ok := servers.Get(cfg.SelectedServer); ok {
 			st.SrvType = string(srv.Type)
 			st.SrvEndpoint = srv.Endpoint()

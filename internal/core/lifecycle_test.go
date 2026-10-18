@@ -3,6 +3,7 @@ package core
 import (
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -80,7 +81,7 @@ func TestEngineLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generated config missing: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
+	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm != 0o600 {
 		t.Errorf("generated config mode = %o, want 600 (it holds credentials)", perm)
 	}
 

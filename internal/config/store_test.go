@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -179,7 +180,7 @@ func TestServersRoundTripAndPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != secretFileMode {
+	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm != secretFileMode {
 		t.Errorf("servers.yaml mode = %o, want %o", perm, secretFileMode)
 	}
 
@@ -241,7 +242,7 @@ func TestSaveServersFixesLoosePermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != secretFileMode {
+	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm != secretFileMode {
 		t.Errorf("mode = %o, want it tightened to %o", perm, secretFileMode)
 	}
 }

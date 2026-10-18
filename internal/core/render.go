@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strconv"
 
 	"github.com/ll-lite/vender/internal/config"
@@ -70,7 +71,14 @@ type singboxConfig struct {
 // emits it only when the daemon asked for them (M3: the Clash API, which is
 // how the TUI gets live traffic counters and latency).
 type singboxExperimental struct {
-	ClashAPI *singboxClashAPI `json:"clash_api,omitempty"`
+	ClashAPI  *singboxClashAPI  `json:"clash_api,omitempty"`
+	CacheFile *singboxCacheFile `json:"cache_file,omitempty"`
+}
+
+type singboxCacheFile struct {
+	Enabled     bool   `json:"enabled"`
+	Path        string `json:"path"`
+	StoreFakeIP bool   `json:"store_fakeip"`
 }
 
 // singboxClashAPI is sing-box's Clash-compatible REST/streaming API. It is
@@ -377,6 +385,14 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 				Secret:             rc.ClashSecret,
 			},
 		}
+		// Applications keep DNS answers across node switches and engine
+		// restarts. Reassigning a cached FakeIP to a different domain breaks
+		// those connections (and can send non-TLS traffic to the wrong host).
+		if rc.Config.Proxy.Mode == config.ModeRule {
+			cfg.Experimental.CacheFile = &singboxCacheFile{
+				Enabled: true, Path: filepath.Join(rc.RunDir, "fakeip.db"), StoreFakeIP: true,
+			}
+		}
 	}
 
 	// sing-box 1.13 removed the legacy inbound `sniff` option outright, so
@@ -506,6 +522,18 @@ func BuildConfig(rc RuntimeConfig) ([]byte, error) {
 			AutoDetectInterface: autoDetect,
 			Rules:               []singboxRule{},
 			Final:               final,
+		}
+	}
+
+	// An explicit physical interface must also apply to direct upstream DNS.
+	// Otherwise another TUN on the host can intercept node lookups and return
+	// FakeIP addresses even though the node connection itself is interface-bound.
+	if cfg.DNS != nil && rc.Config.Engine.BindInterface != "" {
+		for i := range cfg.DNS.Servers {
+			s := &cfg.DNS.Servers[i]
+			if s.Type != "fakeip" && s.Type != "local" && s.Detour == "" {
+				s.BindInterface = rc.Config.Engine.BindInterface
+			}
 		}
 	}
 

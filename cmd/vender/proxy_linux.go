@@ -14,6 +14,10 @@ import (
 // desktop's proxy settings on this platform.
 func systemProxySupported() bool { return true }
 
+func forceRestoreSystemProxy() error {
+	return errors.New("forced saved-proxy restoration is only supported on Windows")
+}
+
 // GNOME's proxy settings are the de-facto standard on Linux desktops: KDE and
 // the *BSD/GNOME-alike desktops either share the schema or leave it unused, and
 // gsettings writes the same values as the Settings UI, so the change is visible

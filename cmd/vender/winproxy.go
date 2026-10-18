@@ -1,108 +1,120 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
 )
 
-// Windows system-proxy control, the part that is independent of the Windows
-// API. It is deliberately not behind the windows build tag so the registry
-// operations can be driven by a fake and the whole flow unit-tested anywhere;
-// proxy_windows.go only supplies the real registry and the WinINET refresh.
-//
-// The proxy WinINET, and so Edge/Chrome, WinHTTP-based tools and anything else
-// that reads the user's Internet settings, live in one key:
-//
-//	HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings
-//	    ProxyEnable   REG_DWORD  0 | 1
-//	    ProxyServer   REG_SZ     http=127.0.0.1:7897;https=...;socks=...
-//	    ProxyOverride REG_SZ     the bypass list
-//
-// WinHTTP has its own configuration (`netsh winhttp import proxy source=ie`),
-// which a browser does not use, so vender does not touch it.
-const (
-	winInternetSettings = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	winProxyEnable      = "ProxyEnable"
-	winProxyServer      = "ProxyServer"
-	winProxyOverride    = "ProxyOverride"
-)
+// Effective LAN WinINET settings, including PAC and automatic discovery flags.
+// WinHTTP and dial-up connection profiles are deliberately not changed.
+type winProxySettings struct {
+	Flags         uint32 `json:"flags"`
+	Server        string `json:"server"`
+	Bypass        string `json:"bypass"`
+	AutoConfigURL string `json:"autoConfigURL"`
+}
 
-// winProxyBypass keeps loopback traffic away from the proxy: pointing a process
-// at vender in order to reach vender would be a loop. "[::1]" and "<local>"
-// cover IPv6 and bare NetBIOS-style names.
 const winProxyBypass = "localhost;127.*;[::1];<local>"
+const winProxyDirect = 1
+const winProxyManual = 2
 
-// winRegistry is the slice of the registry the proxy needs. The real
-// implementation (proxy_windows.go) is a thin wrapper over advapi32.
-type winRegistry interface {
-	// SetString writes name = value under HKEY_CURRENT_USER\subkey as REG_SZ.
-	SetString(subkey, name, value string) error
-	// SetDWORD writes name = value under HKEY_CURRENT_USER\subkey as REG_DWORD.
-	SetDWORD(subkey, name string, value uint32) error
+type winProxyBackup struct {
+	Version  int              `json:"version"`
+	Original winProxySettings `json:"original"`
+	Applied  winProxySettings `json:"applied"`
 }
 
-// winProxyRefresh notifies WinINET that the settings changed. Writing the
-// registry alone is not enough: the proxy is cached, partly per process.
-type winProxyRefresh func() error
+type winProxyAPI interface {
+	Read() (winProxySettings, error)
+	Write(winProxySettings) error
+	Refresh() error
+}
 
-// applyWindowsProxy points the per-user proxy at listen, or turns it off.
-//
-// The endpoints are written before ProxyEnable flips, so a failure part way
-// through leaves the proxy disabled rather than half-configured — the same
-// ordering the GNOME implementation uses. Turning it off only clears
-// ProxyEnable; the endpoints stay behind the switch, so nothing the user had
-// configured in ProxyServer is destroyed.
-func applyWindowsProxy(reg winRegistry, refresh winProxyRefresh, on bool, listen string) error {
-	if !on {
-		if err := reg.SetDWORD(winInternetSettings, winProxyEnable, 0); err != nil {
-			return fmt.Errorf("clear %s: %w", winProxyEnable, err)
+// Save must be durable before Write changes any OS settings. The Windows
+// implementation uses a single HKCU value, scoped to the user, not run-dir.
+type winProxyBackupStore interface {
+	Load() (*winProxyBackup, error)
+	Save(winProxyBackup) error
+	Clear() error
+}
+
+// applyWindowsProxy is serialized by a per-user lock in the native wrapper.
+// A durable original survives CLI/daemon crashes and repeated `on` invocations.
+// Conflicting external edits are never silently overwritten by `off`.
+func applyWindowsProxy(api winProxyAPI, store winProxyBackupStore, on bool, listen string, force bool) error {
+	var target winProxySettings
+	if on {
+		host, port, err := net.SplitHostPort(listen)
+		if err != nil || host == "" {
+			return fmt.Errorf("invalid proxy listen address %q", listen)
 		}
-		return refreshProxy(refresh)
+		p, err := strconv.Atoi(port)
+		if err != nil || p < 1 || p > 65535 {
+			return fmt.Errorf("invalid proxy port in %q", listen)
+		}
+		target = winProxySettings{Flags: winProxyDirect | winProxyManual, Server: winProxyServerValue(host, port), Bypass: winProxyBypass}
 	}
-
-	host, port, err := net.SplitHostPort(listen)
+	backup, err := store.Load()
 	if err != nil {
-		return fmt.Errorf("listen address %q: %w", listen, err)
+		return fmt.Errorf("load system proxy backup: %w", err)
 	}
-	if host == "" {
-		return fmt.Errorf("listen address %q has no host", listen)
+	if backup != nil && backup.Version != 1 {
+		return errors.New("unsupported system proxy backup version; original settings were not changed")
 	}
-	if _, err := strconv.Atoi(port); err != nil {
-		return fmt.Errorf("listen address %q has a non-numeric port", listen)
-	}
-
-	if err := reg.SetString(winInternetSettings, winProxyServer, winProxyServerValue(host, port)); err != nil {
-		return fmt.Errorf("set %s: %w", winProxyServer, err)
-	}
-	if err := reg.SetString(winInternetSettings, winProxyOverride, winProxyBypass); err != nil {
-		return fmt.Errorf("set %s: %w", winProxyOverride, err)
-	}
-	// The switch flips last: until it does, the (now correct) endpoints are
-	// inert.
-	if err := reg.SetDWORD(winInternetSettings, winProxyEnable, 1); err != nil {
-		return fmt.Errorf("enable %s: %w", winProxyEnable, err)
-	}
-	return refreshProxy(refresh)
-}
-
-func refreshProxy(refresh winProxyRefresh) error {
-	if refresh == nil {
+	if !on && backup == nil {
+		// Never disable a proxy configured by somebody else, including when
+		// this is a repeated `off` or a fresh vender installation.
 		return nil
 	}
-	if err := refresh(); err != nil {
-		return fmt.Errorf("notify WinINET of the change: %w", err)
+	current, err := api.Read()
+	if err != nil {
+		return err
+	}
+	if backup != nil && current != backup.Applied && current != backup.Original && !force {
+		return errors.New("system proxy changed outside vender; backup retained; use `vender proxy off --force` only to deliberately restore the saved original")
+	}
+	if !on {
+		if err := writeAndRefresh(api, backup.Original); err != nil {
+			return fmt.Errorf("restore system proxy (backup retained): %w", err)
+		}
+		return store.Clear()
+	}
+	original := current
+	if backup != nil {
+		original = backup.Original
+	}
+	next := winProxyBackup{Version: 1, Original: original, Applied: target}
+	if err := store.Save(next); err != nil {
+		return fmt.Errorf("save system proxy backup before applying settings: %w", err)
+	}
+	if err := writeAndRefresh(api, target); err != nil {
+		// Write or refresh can fail after modifying effective settings. Restore
+		// the state observed at entry, and retain the original on any failure.
+		if restoreErr := writeAndRefresh(api, current); restoreErr != nil {
+			return fmt.Errorf("apply failed: %w; rollback failed: %v; backup retained for `proxy off --force`", err, restoreErr)
+		}
+		var storeErr error
+		if backup == nil {
+			storeErr = store.Clear()
+		} else {
+			storeErr = store.Save(*backup)
+		}
+		return errors.Join(fmt.Errorf("apply system proxy failed; previous settings restored: %w", err), storeErr)
 	}
 	return nil
 }
 
-// winProxyServerValue renders WinINET's ProxyServer string: a semicolon
-// separated list of [protocol=]host:port entries, one per protocol. Spelling
-// all three out (rather than a bare host:port for HTTP only) makes the SOCKS5
-// and HTTPS paths behave the way the local listener does.
+func writeAndRefresh(api winProxyAPI, settings winProxySettings) error {
+	if err := api.Write(settings); err != nil {
+		return err
+	}
+	return api.Refresh()
+}
+
 func winProxyServerValue(host, port string) string {
 	hp := net.JoinHostPort(host, port)
-	parts := []string{"http=" + hp, "https=" + hp, "socks=" + hp}
-	return strings.Join(parts, ";")
+	return strings.Join([]string{"http=" + hp, "https=" + hp, "socks=" + hp}, ";")
 }

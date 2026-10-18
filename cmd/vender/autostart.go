@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -38,6 +39,8 @@ func defaultAutostartOptions(a *app) autostart.Options {
 	if err != nil {
 		return opts
 	}
+	opts.ConfigDir = store.Dir()
+	opts.RunDir, _ = a.runDirPath()
 	cfg, err := store.LoadConfig()
 	if err != nil {
 		return opts
@@ -52,8 +55,10 @@ func defaultAutostartOptions(a *app) autostart.Options {
 		opts.CapabilityHint = "this environment already can create a TUN device (" + verdict.Detail + ")"
 		return opts
 	}
-	opts.CapabilityHint = verdict.Detail + "; grant it with `sudo setcap cap_net_admin,cap_net_raw+ep " +
-		nonEmptyPath(engine) + "`, or run `sudo vender autostart on` to install a system unit that has it"
+	opts.CapabilityHint = verdict.Detail
+	if verdict.Hint != "" {
+		opts.CapabilityHint += "; " + strings.Join(strings.Fields(verdict.Hint), " ")
+	}
 	return opts
 }
 

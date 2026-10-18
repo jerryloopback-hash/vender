@@ -11,7 +11,7 @@ import (
 //
 //	system  the kernel's TCP/IP stack, reached through the TUN device
 //	gvisor  a user-space stack, no kernel routing of the payload
-//	mixed   TCP on gvisor, UDP on the system stack (sing-box's default)
+//	mixed   TCP on the system stack, UDP on gvisor (sing-box 1.14)
 //
 // They are validated here because the engine accepts an unknown stack string
 // without complaining (`sing-box check` passes for stack: "bogus"), so a typo
@@ -35,6 +35,9 @@ const (
 	// always supply it. This is a private /30 outside 198.18.0.0/15 (the range
 	// mihomo/clash uses for its own TUN), so the two can coexist.
 	DefaultTunAddress = "172.19.0.1/30"
+	// Use a dedicated ULA outside the FakeIP pool (fc00::/18). Both address
+	// families need a TUN address for auto_route to capture both families.
+	DefaultTunAddress6 = "fdfe:dcba:9876::1/126"
 )
 
 // ifNameMaxLen is Linux's IFNAMSIZ-1. Windows accepts longer adapter names, so
@@ -64,10 +67,9 @@ type TunConfig struct {
 	// is captured until a route is added by hand, which is the safe way to try
 	// a TUN on a machine whose connectivity matters.
 	AutoRoute *bool `yaml:"auto_route"`
-	// StrictRoute refuses traffic that would bypass the tunnel instead of
-	// letting it out through the physical interface. It is a kill switch: with
-	// it on, a broken engine means no connectivity at all, so it stays off by
-	// default.
+	// StrictRoute applies sing-box's platform-specific anti-bypass routing/DNS
+	// restrictions. It is not a persistent firewall kill switch after the engine
+	// exits and its routes/filters are removed. It stays off by default.
 	StrictRoute bool `yaml:"strict_route"`
 	// InterfaceName is the device name (vender0 by default).
 	InterfaceName string `yaml:"interface_name"`
@@ -128,7 +130,7 @@ func (t *TunConfig) Normalize() {
 	t.InterfaceName = strings.TrimSpace(t.InterfaceName)
 	t.Address = normalizeList(t.Address)
 	if t.Enabled && len(t.Address) == 0 {
-		t.Address = []string{DefaultTunAddress}
+		t.Address = []string{DefaultTunAddress, DefaultTunAddress6}
 	}
 	t.RouteExcludeAddress = normalizeList(t.RouteExcludeAddress)
 	t.RouteExcludeAddressSet = normalizeList(t.RouteExcludeAddressSet)
@@ -173,7 +175,7 @@ func (t TunConfig) Validate() []string {
 	if t.InterfaceName == "" {
 		problems = append(problems, "engine.tun.interface_name must not be empty")
 	} else {
-		if strings.ContainsAny(t.InterfaceName, " \t/") {
+		if invalidInterfaceName(t.InterfaceName, runtime.GOOS) {
 			problems = append(problems, fmt.Sprintf(
 				"engine.tun.interface_name %q must be a device name without spaces or slashes", t.InterfaceName))
 		}
@@ -201,6 +203,10 @@ func (t TunConfig) Validate() []string {
 	return problems
 }
 
+func invalidInterfaceName(name, goos string) bool {
+	return strings.ContainsAny(name, "\t\r\n\x00/\\") || (goos != "windows" && strings.Contains(name, " "))
+}
+
 // Describe renders the block for `vender tun status`, one "key: value" per
 // line.
 func (t TunConfig) Describe() []string {
@@ -219,6 +225,9 @@ func (t TunConfig) Describe() []string {
 	if len(t.Address) > 0 {
 		out = append(out, "address            "+strings.Join(t.Address, ", "))
 	}
+	if t.Enabled && t.AutoRouteEnabled() && !t.HasIPv6Address() {
+		out = append(out, "warning            IPv6 is not captured by this TUN address configuration")
+	}
 	if len(t.RouteExcludeAddress) > 0 {
 		out = append(out, "route_exclude      "+strings.Join(t.RouteExcludeAddress, ", "))
 	}
@@ -226,6 +235,16 @@ func (t TunConfig) Describe() []string {
 		out = append(out, "exclude sets       "+strings.Join(t.RouteExcludeAddressSet, ", "))
 	}
 	return out
+}
+
+// HasIPv6Address reports whether auto_route can install IPv6 capture routes.
+func (t TunConfig) HasIPv6Address() bool {
+	for _, cidr := range t.Address {
+		if ip, _, err := net.ParseCIDR(cidr); err == nil && ip.To4() == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeList trims each entry and drops empties, so a hand-edited YAML list

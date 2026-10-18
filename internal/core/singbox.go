@@ -2,6 +2,7 @@ package core
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ll-lite/vender/internal/config"
+	"github.com/ll-lite/vender/internal/privatefs"
 	"github.com/ll-lite/vender/internal/rules"
 )
 
@@ -56,6 +59,32 @@ type engine struct {
 	dialTimeout  time.Duration
 }
 
+// CheckConfig validates a candidate using the actual engine before a working
+// process is stopped. The candidate and its extracted rules live in a private,
+// disposable directory, never replacing the active run's configuration.
+func (e *engine) CheckConfig(rc RuntimeConfig) error {
+	if err := privatefs.EnsureDir(rc.RunDir); err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp(rc.RunDir, ".check-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	rc.RunDir = dir
+	candidate := newEngine(rc)
+	if err := candidate.WriteConfig(rc); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, rc.BinaryPath, "check", "-c", ConfigPath(dir)).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("core: sing-box rejected candidate configuration: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // newEngine builds a stopped engine for rc. It does not touch the filesystem.
 func newEngine(rc RuntimeConfig) *engine {
 	return &engine{
@@ -84,8 +113,26 @@ func (e *engine) WriteConfig(rc RuntimeConfig) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(rc.RunDir, 0o700); err != nil {
+	if err := privatefs.EnsureDir(rc.RunDir); err != nil {
 		return fmt.Errorf("core: create run dir %s: %w", rc.RunDir, err)
+	}
+	if rc.ClashListen != "" && rc.Config.Proxy.Mode == config.ModeRule {
+		// sing-box otherwise creates its database with mode 0644. It carries
+		// visited domain names, so create it privately and repair drift too.
+		cache, err := os.OpenFile(filepath.Join(rc.RunDir, "fakeip.db"), os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return fmt.Errorf("core: prepare FakeIP cache: %w", err)
+		}
+		if err := cache.Chmod(0o600); err != nil {
+			cache.Close()
+			return fmt.Errorf("core: protect FakeIP cache: %w", err)
+		}
+		if err := cache.Close(); err != nil {
+			return err
+		}
+		if err := privatefs.Protect(filepath.Join(rc.RunDir, "fakeip.db")); err != nil {
+			return err
+		}
 	}
 	if len(declaredRuleSets(rc.Config)) > 0 {
 		dir := filepath.Join(rc.RunDir, rules.RulesSubdir)
@@ -165,7 +212,13 @@ func (e *engine) Start() error {
 	cmd.Dir = rc.RunDir
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
-	prepareProcess(cmd)
+	if err := prepareProcess(cmd); err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
+		stderrR.Close()
+		stderrW.Close()
+		return err
+	}
 
 	if err := cmd.Start(); err != nil {
 		stdoutR.Close()

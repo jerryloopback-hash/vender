@@ -391,7 +391,7 @@ func loadSnapshotCmd(opts Options) tea.Cmd {
 // the mechanism that actually works.
 func (m Model) autostartOptions() autostart.Options {
 	t := m.tun()
-	o := autostart.Options{TUN: t.Enabled}
+	o := autostart.Options{TUN: t.Enabled, ConfigDir: m.opts.ConfigDir, RunDir: m.opts.RunDir}
 	if t.Enabled {
 		o.CapabilityHint = t.Priv.Detail
 	}

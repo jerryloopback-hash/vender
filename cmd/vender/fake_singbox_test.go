@@ -73,6 +73,9 @@ func fakeEngineMain(mode string) int {
 		fmt.Fprintf(os.Stderr, "fake-sing-box: decode %s: %v\n", configPath, err)
 		return 2
 	}
+	if len(args) > 0 && args[0] == "check" {
+		return 0
+	}
 	if len(cfg.Inbounds) == 0 {
 		fmt.Fprintln(os.Stderr, "fake-sing-box: no inbound in the generated config")
 		return 2

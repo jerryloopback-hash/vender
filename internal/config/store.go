@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ll-lite/vender/internal/privatefs"
 	"gopkg.in/yaml.v3"
 )
 
@@ -100,7 +101,7 @@ func (s *Store) ProfilesPath() string { return filepath.Join(s.dir, ProfilesFile
 
 // EnsureDir creates the config directory (mode 0700) if it does not exist.
 func (s *Store) EnsureDir() error {
-	if err := os.MkdirAll(s.dir, dirMode); err != nil {
+	if err := privatefs.EnsureDir(s.dir); err != nil {
 		return fmt.Errorf("create config dir %s: %w", s.dir, err)
 	}
 	return nil
@@ -155,6 +156,9 @@ func (s *Store) SaveConfig(cfg *Config) error {
 // empty set. Entries are normalized in memory; servers.yaml is only rewritten
 // when explicitly saved (import/rm/select).
 func (s *Store) LoadServers() (*ServerSet, error) {
+	if err := privatefs.Protect(s.ServersPath()); err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(s.ServersPath())
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -291,6 +295,9 @@ func (s *Store) SelectServer(name string) error {
 // an empty registry (whose active profile is the built-in "manual" one, which
 // is exactly what an existing installation behaves like).
 func (s *Store) LoadProfiles() (*ProfileSet, error) {
+	if err := privatefs.Protect(s.ProfilesPath()); err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(s.ProfilesPath())
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {

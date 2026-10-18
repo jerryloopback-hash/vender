@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ll-lite/vender/internal/config"
+	"github.com/ll-lite/vender/internal/control"
 	"github.com/ll-lite/vender/internal/core"
 )
 
@@ -38,16 +41,32 @@ func (a *app) runStatus(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := store.LoadConfig()
-	if err != nil {
-		return err
-	}
 	runDir, err := a.runDirPath()
 	if err != nil {
 		return err
 	}
 
 	running, pid, err := daemonRunning(runDir)
+	if err != nil {
+		return err
+	}
+	if running {
+		ctx, cancel := context.WithTimeout(cmd.Context(), 3*time.Second)
+		defer cancel()
+		cli, err := control.Dial(ctx, runDir)
+		if err == nil {
+			defer cli.Close()
+			st, serr := cli.Status(ctx)
+			if serr == nil {
+				return printDaemonStatus(cmd, st)
+			}
+			err = serr
+		}
+		fmt.Fprintln(out, "state        running")
+		fmt.Fprintf(out, "pid          %s\n", pidLabel(pid))
+		return fmt.Errorf("daemon holds the lock, but its engine state cannot be verified over the control channel: %w", err)
+	}
+	cfg, err := store.LoadConfig()
 	if err != nil {
 		return err
 	}
@@ -72,6 +91,38 @@ func (a *app) runStatus(cmd *cobra.Command) error {
 	default:
 		return nil
 	}
+}
+
+// Report the daemon's applied state, not a mixture of disk settings and an
+// arbitrary listener. Health here means the managed engine is alive/listening,
+// not a guarantee that a remote proxy or destination is reachable.
+func printDaemonStatus(cmd *cobra.Command, st control.StatusData) error {
+	out := cmd.OutOrStdout()
+	fmt.Fprintln(out, "state        running")
+	fmt.Fprintf(out, "pid          %d\n", st.PID)
+	fmt.Fprintf(out, "run dir      %s\n", st.RunDir)
+	fmt.Fprintf(out, "listen       %s (%s)\n", st.Listen, listenLabel(st.EngineHealthy))
+	fmt.Fprintf(out, "mode         %s\n", st.Mode)
+	tun := "off"
+	if st.Tun.Enabled {
+		tun = fmt.Sprintf("on (%s, stack %s, auto_route %s) — managed by the running daemon", st.Tun.Interface, st.Tun.Stack, onOffWord(st.Tun.AutoRoute))
+	}
+	fmt.Fprintf(out, "tun          %s\n", tun)
+	fmt.Fprintf(out, "profile      %s (%d servers; auto pool)\n", st.Profile, st.ProfileServers)
+	server := st.Selected
+	if st.Mode == "direct" {
+		server = "(none; direct mode)"
+	} else if strings.EqualFold(st.Selected, config.SelectedServerAuto) {
+		server = fmt.Sprintf("auto (failover over %d servers in profile %q)", st.ProfileServers, st.Profile)
+	}
+	fmt.Fprintf(out, "server       %s\n", server)
+	if st.LastError != "" {
+		fmt.Fprintf(out, "last error   %s\n", st.LastError)
+	}
+	if !st.EngineRunning || !st.EngineHealthy {
+		return fmt.Errorf("daemon is running but its managed engine is stopped or not accepting connections")
+	}
+	return nil
 }
 
 // activeProfileLabel renders the active profile and how many servers it holds,

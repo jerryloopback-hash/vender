@@ -107,8 +107,9 @@ start-at-login in the same step. See [Licence](#licence) for why the sing-box
 documentation travels with the binaries.
 
 Dependencies are deliberately few: `cobra` and `yaml.v3` for the CLI, plus
-`bubbletea`, `lipgloss` and `bubbles` for the TUI. The control channel,
-autostart and the Windows registry work use only the standard library —
+`bubbletea`, `lipgloss` and `bubbles` for the TUI. The control channel uses the
+standard library; Windows ACL, process lifetime and registry handling use the
+existing `golang.org/x/sys/windows` dependency —
 subscription fetching is `net/http` and adds no module at all.
 
 ## Installing sing-box
@@ -485,14 +486,14 @@ says nothing about how to fix it.
 
 | Setting | Default | Notes |
 |---|---|---|
-| `stack` | `mixed` | `system` — the kernel stack, reached through the device; `gvisor` — a user-space stack; `mixed` — TCP on gvisor, UDP on the kernel. Always written explicitly, so a change of engine default cannot silently change vender's behaviour |
+| `stack` | `mixed` | `system` — the kernel stack, reached through the device; `gvisor` — a user-space stack; `mixed` — TCP on the kernel, UDP on gvisor (sing-box 1.14). Always written explicitly |
 | `interface_name` | `vender0` | named explicitly so `ip link`, `ip route` and any cleanup have one predictable device to look for. Max 15 characters on Linux |
 | `auto_route` | `true` | installs the routes for `0.0.0.0/1` and `128.0.0.0/1` and adds `ip rule`s, so the engine's own marked connections bypass its own tunnel instead of looping. `auto_route: false` captures nothing until you add a route yourself — the safe way to try a TUN on a machine whose connectivity matters |
-| `strict_route` | `false` | a kill switch: refuses traffic that would leave outside the tunnel. Useful, and it means a broken engine means *no* connectivity |
+| `strict_route` | `false` | platform-specific anti-bypass routing/DNS restrictions. On Windows this also restricts multihomed DNS leaks. **Not a persistent firewall kill switch** after the engine exits |
 | `mtu` | `0` (`auto` → 9000) | lower it if a path MTU problem shows up |
 | `route_exclude_address` | empty | CIDRs kept out of the tunnel. The usual entries spare your LAN, a corporate VPN, or mihomo/clash's own `198.18.0.0/15` |
 | `route_exclude_address_set` | empty | the same, expressed as embedded rule-set tags (`geoip-cn`, `geosite-cn`, …). vender checks the tag exists and declares it in the engine config. sing-box 1.14 has no `route_exclude_rule` field; this is that knob |
-| `address` | empty → engine default | the device's own address. Left alone, sing-box picks a private `/30` that does not collide with the `198.18.0.0/15` a mihomo/clash TUN uses |
+| `address` | `172.19.0.1/30`, `fdfe:dcba:9876::1/126` when enabled and unspecified | vender supplies both families; sing-box needs an explicit address. Existing explicit IPv4-only lists are preserved, but do **not** capture IPv6 |
 
 Two things that follow from turning it on, stated plainly:
 
@@ -500,7 +501,7 @@ Two things that follow from turning it on, stated plainly:
   `global` mode too — the generated config starts with `{"action": "sniff"}`
   and `{"protocol": ["dns"], "action": "hijack-dns"}`, so DNS queries stop being
   plain packets to port 53 and are answered by the split-DNS policy instead
-  (domestic names via `223.5.5.5`, everything else over the proxied resolver).
+  (in rule mode: domestic/direct names via `223.5.5.5`, other A/AAAA queries via local FakeIP; non-address queries still use the domestic resolver).
   In `direct` mode there are no such actions: direct mode must not intercept
   anything.
 - **`global` is still `global`.** Under a TUN, global mode gains those two
@@ -569,7 +570,7 @@ Two files live in the config directory, plus two optional ones:
           auto_route: true      # install the routes that pull traffic in
           strict_route: false   # true = refuse traffic that would bypass the tunnel
           interface_name: vender0
-          # address: []                       # the device's own address
+          # address: [172.19.0.1/30, 'fdfe:dcba:9876::1/126'] # dual-stack capture
           # route_exclude_address: []         # CIDRs kept out of the tunnel
           # route_exclude_address_set: []     # rule-set tags kept out (e.g. geoip-cn)
   selected_server: ""     # a name in servers.yaml, or "auto" for failover
@@ -739,6 +740,11 @@ The split is emitted as sing-box 1.14 *actions* (`{"action":"sniff"}`,
 `{"action":"hijack-dns"}`) plus a `dns` block; the legacy inbound `sniff` field
 the pinned engine removed is never written.
 
+Daemon rule-mode runs persist FakeIP mappings in `<run-dir>/fakeip.db`
+(`0600` on Linux), so application-cached addresses survive node switches and
+engine restarts. This file contains domain history: keep it private and do not
+delete it while applications may still hold FakeIP answers.
+
 `vender rules list` prints exactly this merged policy, the DNS split and the rule
 sets below.
 
@@ -875,8 +881,20 @@ While it runs, a client can also switch the active server, change the routing
 mode, turn TUN mode on and off, and start/stop/restart the engine in place — the daemon re-renders the
 configuration and restarts sing-box without the daemon itself going away.
 
-`vender status` reads the same lock, so its exit code means exactly "the proxy
-is up" and is safe to use in scripts or a health check.
+`vender status` reads the lock and queries the authenticated daemon for its
+applied state. Success means the **managed engine** is alive and listening,
+not that a remote node or destination is reachable. An unrelated listener no
+longer counts as a healthy engine.
+
+Unexpected engine exits are retried with exponential backoff (1–16 seconds),
+with at most five recovery attempts in five minutes, including short-lived
+successful restarts. An explicit stop is never undone. Recovery uses the last
+applied configuration rather than unvalidated disk edits.
+
+Configuration switches validate the candidate with `sing-box check` before
+stopping a working engine. If starting the candidate fails, the daemon attempts
+to restore the previous engine. Failed settings may remain on disk pending
+correction; status continues to describe the actually applied configuration.
 
 ## Licence
 
