@@ -3,8 +3,8 @@
   profile  manual   (2 of 2 servers; `selected_server: auto` fails over over these)
 ╭─ servers.yaml ───────────────────────────────────────────────────────────────────────────────────╮
 │   NAME              PROFILE   TYPE      PROTOCOL       ENDPOINT           ACTIVE PING (ICMP)     │
-│ ▸ Interserver-LA    manual    vless     reality/xtls-… 162.35.170.235:443 ●      924 ms          │
-│   Interserver-LA-Hy2manual    hysteria2 obfs=salamand… 162.35.170.235:8443       38 ms           │
+│ ▸ Interserver-LA    manual    vless     reality/xtls-r…162.35.170.235:443 ●      924 ms          │
+│   Interserver-LA-Hy2manual    hysteria2 obfs=salamande…162.35.170.235:8443       38 ms           │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
   ICMP Interserver-LA: 924 ms
  ● daemon pid 4821  attached to the daemon at 127.0.0.1:41234

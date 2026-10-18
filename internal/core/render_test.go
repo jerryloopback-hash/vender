@@ -403,38 +403,140 @@ func TestBuildConfigGolden(t *testing.T) {
 	}
 }
 
-// The fixture uses /run/vender on every OS. Normalize only filesystem/URI path
-// fields for comparison, not production output or credentials/protocol fields.
+// Only local rule-set paths under /run/vender and the exact cache-file fixture
+// may differ by separators and an optional Windows drive.
 func normalizeGoldenPaths(t *testing.T, data []byte) []byte {
 	t.Helper()
 	var value any
 	if err := json.Unmarshal(data, &value); err != nil {
 		t.Fatal(err)
 	}
-	var visit func(any)
-	visit = func(v any) {
-		switch item := v.(type) {
-		case map[string]any:
-			for k, v := range item {
-				if k == "path" {
-					if s, ok := v.(string); ok {
-						item[k] = strings.ReplaceAll(s, `\`, "/")
-					}
-				}
-				visit(v)
-			}
-		case []any:
-			for _, v := range item {
-				visit(v)
-			}
+	root, _ := value.(map[string]any)
+	route, _ := root["route"].(map[string]any)
+	sets, _ := route["rule_set"].([]any)
+	for _, entry := range sets {
+		set, _ := entry.(map[string]any)
+		if set["type"] != "local" {
+			continue
+		}
+		s, ok := set["path"].(string)
+		if !ok {
+			continue
+		}
+		path := strings.ReplaceAll(s, `\`, "/")
+		if len(path) >= 3 && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1:3] == ":/" {
+			path = path[2:]
+		}
+		if path == "/run/vender" || strings.HasPrefix(path, "/run/vender/") {
+			set["path"] = path
 		}
 	}
-	visit(value)
+	experimental, _ := root["experimental"].(map[string]any)
+	cache, _ := experimental["cache_file"].(map[string]any)
+	if s, ok := cache["path"].(string); ok {
+		path := strings.ReplaceAll(s, `\`, "/")
+		if len(path) >= 3 && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1:3] == ":/" {
+			path = path[2:]
+		}
+		if path == "/run/vender/fakeip.db" {
+			cache["path"] = path
+		}
+	}
 	out, err := json.Marshal(value)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return out
+}
+
+func TestNormalizeGoldenPaths(t *testing.T) {
+	for _, tt := range []struct {
+		name, typ, path, want string
+	}{
+		{"fixture with drive", "local", `D:\run\vender\rules\cn.srs`, "/run/vender/rules/cn.srs"},
+		{"fixture forward slashes", "local", "c:/run/vender/rules/cn.srs", "/run/vender/rules/cn.srs"},
+		{"fixture rooted", "local", `\run\vender\rules\cn.srs`, "/run/vender/rules/cn.srs"},
+		{"fixture POSIX", "local", "/run/vender/rules/cn.srs", "/run/vender/rules/cn.srs"},
+		{"other root", "local", `D:\other\cn.srs`, `D:\other\cn.srs`},
+		{"similar root", "local", `D:\run\vender-other\cn.srs`, `D:\run\vender-other\cn.srs`},
+		{"UNC", "local", `\\host\run\vender\cn.srs`, `\\host\run\vender\cn.srs`},
+		{"URL", "local", "https://example.com/run/vender/cn.srs", "https://example.com/run/vender/cn.srs"},
+		{"remote rule set", "remote", `D:\run\vender\rules\cn.srs`, `D:\run\vender\rules\cn.srs`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// Protocol and URL fields deliberately resemble filesystem paths.
+			fixture := map[string]any{
+				"outbounds": []any{map[string]any{"path": `D:\run\vender\ws`, "type": "vless"}},
+				"url":       `https://example.com/run/vender/a\b`,
+				"route": map[string]any{"rule_set": []any{map[string]any{
+					"type": tt.typ, "path": tt.path,
+				}}},
+			}
+			input, err := json.Marshal(fixture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture["route"].(map[string]any)["rule_set"].([]any)[0].(map[string]any)["path"] = tt.want
+			want, err := json.Marshal(fixture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := normalizeGoldenPaths(t, input); string(got) != string(want) {
+				t.Errorf("normalized = %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+func TestNormalizeGoldenCachePaths(t *testing.T) {
+	for _, tt := range []struct {
+		name, path, want string
+	}{
+		{"fixture POSIX", "/run/vender/fakeip.db", "/run/vender/fakeip.db"},
+		{"fixture rooted", `\run\vender\fakeip.db`, "/run/vender/fakeip.db"},
+		{"fixture with drive", `D:\run\vender\fakeip.db`, "/run/vender/fakeip.db"},
+		{"fixture forward slashes", "c:/run/vender/fakeip.db", "/run/vender/fakeip.db"},
+		{"other root", `D:\other\fakeip.db`, `D:\other\fakeip.db`},
+		{"similar root", `D:\run\vender-other\fakeip.db`, `D:\run\vender-other\fakeip.db`},
+		{"other cache file", `D:\run\vender\other.db`, `D:\run\vender\other.db`},
+		{"similar filename", `D:\run\vender\fakeip.db.bak`, `D:\run\vender\fakeip.db.bak`},
+		{"child path", `D:\run\vender\fakeip.db\child`, `D:\run\vender\fakeip.db\child`},
+		{"relative path", `run\vender\fakeip.db`, `run\vender\fakeip.db`},
+		{"drive relative", `D:run\vender\fakeip.db`, `D:run\vender\fakeip.db`},
+		{"UNC", `\\run\vender\fakeip.db`, `\\run\vender\fakeip.db`},
+		{"UNC with host", `\\host\run\vender\fakeip.db`, `\\host\run\vender\fakeip.db`},
+		{"URL", `https://example.com/run/vender/fakeip.db`, `https://example.com/run/vender/fakeip.db`},
+		{"URL with backslashes", `https://example.com/run/vender\fakeip.db`, `https://example.com/run/vender\fakeip.db`},
+		{"file URL", `file:///run/vender/fakeip.db`, `file:///run/vender/fakeip.db`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cache := map[string]any{"enabled": true, "path": tt.path, "store_fakeip": true}
+			// Even an exact fixture match in a protocol or unrelated field must stay intact.
+			fixture := map[string]any{
+				"experimental": map[string]any{
+					"cache_file": cache,
+					"clash_api":  map[string]any{"path": `D:\run\vender\fakeip.db`},
+				},
+				"outbounds": []any{map[string]any{
+					"type": "vless", "path": `D:\run\vender\fakeip.db`,
+					"transport": map[string]any{"type": "ws", "path": `\run\vender\fakeip.db`},
+				}},
+				"url": `https://example.com/run/vender\fakeip.db`,
+			}
+			input, err := json.Marshal(fixture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cache["path"] = tt.want
+			want, err := json.Marshal(fixture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := normalizeGoldenPaths(t, input); string(got) != string(want) {
+				t.Errorf("normalized = %s, want %s", got, want)
+			}
+		})
+	}
 }
 
 // The generated config must never carry a deprecated field: sing-box 1.13
@@ -1045,6 +1147,10 @@ func TestTunUnknownExclusionSetIsRejected(t *testing.T) {
 // disabled TUN block is inert: a typo in a feature that is off must not block
 // start-up.
 func TestTunValidation(t *testing.T) {
+	longNameError := ""
+	if runtime.GOOS == "linux" {
+		longNameError = "interface_name"
+	}
 	for _, tt := range []struct {
 		name    string
 		tun     config.TunConfig
@@ -1060,7 +1166,7 @@ func TestTunValidation(t *testing.T) {
 			wantSub: "mtu"},
 		{name: "interface name too long for Linux", enabled: true,
 			tun:     config.TunConfig{Enabled: true, Stack: "mixed", AutoRoute: config.Bool(true), InterfaceName: "a-very-long-tun-name"},
-			wantSub: "interface_name"},
+			wantSub: longNameError},
 		{name: "bad CIDR", enabled: true,
 			tun: config.TunConfig{Enabled: true, Stack: "mixed", AutoRoute: config.Bool(true),
 				InterfaceName: "vender0", RouteExcludeAddress: []string{"192.168.0.0"}},

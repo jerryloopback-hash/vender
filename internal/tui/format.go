@@ -126,14 +126,19 @@ func truncate(s string, width int) string {
 	if lipgloss.Width(s) <= width {
 		return s
 	}
+	const ellipsis = "…"
+	budget := width - lipgloss.Width(ellipsis)
+	if budget < 0 {
+		return ""
+	}
 	var b strings.Builder
 	for _, r := range s {
-		if lipgloss.Width(b.String())+lipgloss.Width(string(r)) > width-1 {
+		if lipgloss.Width(b.String()+string(r)) > budget {
 			break
 		}
 		b.WriteRune(r)
 	}
-	return b.String() + "…"
+	return b.String() + ellipsis
 }
 
 // pad right-pads s to width (truncating if needed) so columns line up.

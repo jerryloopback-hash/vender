@@ -88,8 +88,36 @@ func TestGraphScalesAndAligns(t *testing.T) {
 }
 
 func TestTruncateAndPadUseDisplayWidth(t *testing.T) {
-	if got := truncate("abcdef", 3); got != "ab…" {
-		t.Errorf("truncate = %q", got)
+	for _, tt := range []struct {
+		s            string
+		width        int
+		narrow, wide string
+	}{
+		{"abcdef", -1, "", ""},
+		{"abcdef", 0, "", ""},
+		{"abcdef", 1, "…", ""},
+		{"abcdef", 2, "a…", "…"},
+		{"abcdef", 3, "ab…", "a…"},
+		{"中文ab", 3, "中…", "…"},
+		{"中文ab", 4, "中…", "中…"},
+	} {
+		want := tt.narrow
+		if lipgloss.Width("…") == 2 {
+			want = tt.wide
+		}
+		if got := truncate(tt.s, tt.width); got != want {
+			t.Errorf("truncate(%q, %d) = %q, want %q", tt.s, tt.width, got, want)
+		}
+	}
+	for _, s := range []string{"", "abcdef", "中文ab", "e\u0301cole", "🙂abc", "☀️abc", "…abc"} {
+		for width := 0; width <= 10; width++ {
+			if got := truncate(s, width); lipgloss.Width(got) > width {
+				t.Errorf("truncate(%q, %d) = %q exceeds display width", s, width, got)
+			}
+			if got := pad(s, width); lipgloss.Width(got) != width {
+				t.Errorf("pad(%q, %d) = %q has width %d", s, width, got, lipgloss.Width(got))
+			}
+		}
 	}
 	if got := truncate("abc", 3); got != "abc" {
 		t.Errorf("truncate(short) = %q", got)
@@ -108,19 +136,14 @@ func TestTruncateAndPadUseDisplayWidth(t *testing.T) {
 
 func TestThemePanelIsExactWidth(t *testing.T) {
 	th := newTheme(nil)
-	for _, width := range []int{40, 60, 100} {
-		got := th.panel("title", width, "a line", "another")
-		for i, line := range strings.Split(got, "\n") {
-			if w := lipgloss.Width(line); w != width {
-				t.Errorf("width %d: line %d is %d columns: %q", width, i, w, line)
+	for _, width := range []int{16, 17, 40, 41, 60, 100} {
+		for _, title := range []string{"", "title", "中文", "a very long title that cannot possibly fit"} {
+			got := th.panel(title, width, "a line", "another")
+			for i, line := range strings.Split(got, "\n") {
+				if w := lipgloss.Width(line); w != width {
+					t.Errorf("width %d, title %q: line %d is %d columns: %q", width, title, i, w, line)
+				}
 			}
-		}
-	}
-	// A title longer than the panel must not break the border.
-	got := th.panel("a very long title that cannot possibly fit", 30, "x")
-	for i, line := range strings.Split(got, "\n") {
-		if w := lipgloss.Width(line); w != 30 {
-			t.Errorf("long title: line %d is %d columns: %q", i, w, line)
 		}
 	}
 }

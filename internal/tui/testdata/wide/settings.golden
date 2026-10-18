@@ -1,0 +1,30 @@
+ Dashboard   Nodes       Logs        Settings                                             vender M7
+╭─ routing mode ────────────────────────────────────────╮
+│ ▸ (●) rule   active  built-in policy: CN and private destinations direct, ads blocked, the … │
+│   ( ) global         every connection through the selected server                              │
+│   ( ) direct         no proxy at all (the local inbound still works)                           │
+│ ←/→ choose · enter apply · applying restarts the engine in place                           │
+╰────────────────────────────────────────────────╯
+╭─ inbounds ──────────────────────────────────────────╮
+│ mixed SOCKS5+HTTP  127.0.0.1:7897                                                              │
+│ tun                off  press u to enable system-wide capture                                  │
+│ tun settings       stack mixed   device vender0   mtu auto   auto_route on   strict_route off  │
+│ privileges         missing  uid 1000 does not hold CAP_NET_ADMIN (CapEff 0000000000000000)     │
+│ engine binary      /usr/local/bin/sing-box   log info                                          │
+│ config dir         /home/test/.config/vender   bind -   profile manual                         │
+╰────────────────────────────────────────────────╯
+╭─ built-in routing policy ────────────────────────────────── ╮
+│ actions  sniff, protocol=dns -> hijack-dns   final  proxy   selected  Interserver-LA           │
+│  1  critical-direct         domain_suffix=[opencode.ai]                   direct               │
+│  2  private-dest-direct     ip_is_private                                 direct               │
+│  3  ads-block               rule_set=[geosite-category-ads-all]           block                │
+│  4  service-overrides-pr…  rule_set=[geosite-steam geosite-onedrive g…  proxy                │
+│  5  cn-direct               rule_set=[geosite-cn geoip-cn]                direct               │
+│ dns      2 servers, 3 rules, final dns-cn   user rules  none   sets  12, 494 KiB               │
+╰────────────────────────────────────────────────╯
+╭─ autostart ───────────────────────────────────────── ╮
+│ start at login  checking…                                                                     │
+│ system proxy    `vender proxy on|off` points the desktop at the local inbound                  │
+╰────────────────────────────────────────────────╯
+ ● daemon pid 4821  attached to the daemon at 127.0.0.1:41234
+ ←/→ mode • enter apply • p profile • u tun • a start at login • tab screens • ? help

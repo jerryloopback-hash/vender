@@ -1643,10 +1643,22 @@ needs no root and writes nothing outside the prefix.
   serving everyone else.
 - **The TUI is testable without a terminal.** `View` is pure and colour is a
   property of one renderer, so the screens are covered by golden files
-  (`internal/tui/testdata/`, refreshable with `go test ./internal/tui -update`)
+  (`internal/tui/testdata/narrow/` and `internal/tui/testdata/wide/`, both
+  refreshable with `go test ./internal/tui -run '^TestDisplayWidthModes$' -update`)
   for the Dashboard running and not running, Nodes populated and empty, Settings,
   and Settings with a subscription profile to switch between — plus the behaviour
-  tests that go through the same `Update` the program uses.
+  tests that go through the same `Update` the program uses. Ordinary test runs
+  also launch fresh subprocesses with `RUNEWIDTH_EASTASIAN=0`, `=1`, and unset
+  under Chinese and English locales to check both sets of snapshots,
+  truncation/padding, and exact panel widths. The width libraries read their
+  environment at init, so changing it inside a running test would not exercise
+  these cases. TUI package initialization aligns legacy runewidth defaults with
+  the already initialized ANSI width policy before any models or concurrent
+  rendering: unset means narrow, even with a Chinese locale; explicit `1` means
+  wide. This uses public runewidth defaults once, without changing the environment
+  or writing globals during rendering. Non-TUI CLI commands also import this
+  package and receive the same process-wide legacy width default; the current CLI
+  does not directly use runewidth for its output.
 - **A subscription test opens no socket.** The parsers are pure and covered by
   fixtures under `internal/subscription/testdata/` (plain links, base64 links,
   Clash YAML), and `Fetch` is tested by injecting an `http.Client` whose

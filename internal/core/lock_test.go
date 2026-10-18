@@ -2,6 +2,7 @@ package core
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -82,12 +83,17 @@ func TestAcquireLockRecordsTheHolder(t *testing.T) {
 		t.Fatalf("AcquireLock: %v", err)
 	}
 	defer l.Release()
-	body, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
+	// Read through the owning handle: Windows correctly denies a second
+	// handle access to the byte held by our exclusive LockFileEx lock.
+	if _, err := l.file.Seek(0, io.SeekStart); err != nil {
+		t.Fatalf("Seek: %v", err)
 	}
-	if !strings.HasPrefix(string(body), strconv.Itoa(os.Getpid())) {
-		t.Errorf("lock file = %q, want it to start with this pid (%d)", body, os.Getpid())
+	body, err := io.ReadAll(l.file)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if want := strconv.Itoa(os.Getpid()) + "\n"; string(body) != want {
+		t.Errorf("lock file = %q, want %q", body, want)
 	}
 }
 

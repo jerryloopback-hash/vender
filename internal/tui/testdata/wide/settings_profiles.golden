@@ -1,0 +1,30 @@
+ Dashboard   Nodes       Logs        Settings                                             vender M7
+╭─ routing mode ────────────────────────────────────────╮
+│ ▸ (●) rule   active  built-in policy: CN and private destinations direct, ads blocked, the … │
+│   ( ) global         every connection through the selected server                              │
+│   ( ) direct         no proxy at all (the local inbound still works)                           │
+│ ←/→ choose · enter apply · applying restarts the engine in place                           │
+╰────────────────────────────────────────────────╯
+╭─ profiles ──────────────────────────────────────────╮
+│ ( ) manual             2 nodes  built-in (imported by hand)                                    │
+│ (●) provider           2 nodes  https://sub.example.com/api/v1/client/subscribe?…            │
+│ ( ) all                4 nodes  every server                                                   │
+│ p switch profile · the active profile scopes the auto failover group                          │
+╰────────────────────────────────────────────────╯
+╭─ inbounds ──────────────────────────────────────────╮
+│ mixed SOCKS5+HTTP  127.0.0.1:7897                                                              │
+│ tun                off  press u to enable system-wide capture                                  │
+│ tun settings       stack mixed   device vender0   mtu auto   auto_route on   strict_route off  │
+│ privileges         missing  uid 1000 does not hold CAP_NET_ADMIN (CapEff 0000000000000000)     │
+│ engine binary      /usr/local/bin/sing-box   log info                                          │
+│ config dir         /home/test/.config/vender   bind -   profile provider                       │
+╰────────────────────────────────────────────────╯
+╭─ built-in routing policy ────────────────────────────────── ╮
+│ actions  sniff, protocol=dns -> hijack-dns   final  proxy   selected  Interserver-LA           │
+│  1  critical-direct         domain_suffix=[opencode.ai]                   direct               │
+│  2  private-dest-direct     ip_is_private                                 direct               │
+│  3  ads-block               rule_set=[geosite-category-ads-all]           block                │
+│  4  service-overrides-pr…  rule_set=[geosite-steam geosite-onedrive g…  proxy                │
+… (resize the window, or press ? for help)
+ ○ daemon not running — start it with `vender daemon`  (waiting)
+ ←/→ mode • enter apply • p profile • u tun • a start at login • tab screens • ? help

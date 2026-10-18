@@ -5,10 +5,9 @@ package privatefs
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
-	"golang.org/x/sys/windows"
+	"github.com/ll-lite/vender/internal/testutil/windowsacl"
 )
 
 func TestPrivateWindowsACLAndInheritedFile(t *testing.T) {
@@ -21,26 +20,12 @@ func TestPrivateWindowsACLAndInheritedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range []string{dir, path} {
-		sd, err := windows.GetNamedSecurityInfo(p, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
-		if err != nil {
+		windowsacl.AssertPrivate(t, p)
+	}
+	for i := 0; i < 2; i++ {
+		if err := Protect(path); err != nil {
 			t.Fatal(err)
 		}
-		text := sd.String()
-		if strings.Contains(text, ";;;WD)") || strings.Contains(text, ";;;BU)") || strings.Contains(text, ";;;AU)") {
-			t.Fatalf("broad access in DACL: %s", text)
-		}
-		user, err := windows.GetCurrentProcessToken().GetTokenUser()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !strings.Contains(text, user.User.Sid.String()) || !strings.Contains(text, ";;;SY)") {
-			t.Fatalf("missing user/SYSTEM access: %s", text)
-		}
-	}
-	if err := Protect(path); err != nil {
-		t.Fatal(err)
-	}
-	if err := Protect(path); err != nil {
-		t.Fatal(err)
+		windowsacl.AssertPrivate(t, path)
 	}
 }

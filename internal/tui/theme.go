@@ -89,20 +89,27 @@ func (t theme) panel(title string, width int, lines ...string) string {
 	if width < minWidth {
 		width = minWidth
 	}
-	inner := width - 4 // inside the border, with one space of padding
+	inner := width - lipgloss.Width("││") - 2 // one space of padding on each side
+	// Box-drawing glyphs are also ambiguous-width characters. Fill an odd
+	// remaining column with a space when a horizontal stroke takes two cells.
+	horizontal := func(columns int) string {
+		strokeWidth := lipgloss.Width("─")
+		return strings.Repeat("─", columns/strokeWidth) + strings.Repeat(" ", columns%strokeWidth)
+	}
 
 	var b strings.Builder
 	if title == "" {
-		b.WriteString(t.border.Render("╭" + strings.Repeat("─", width-2) + "╮"))
+		b.WriteString(t.border.Render("╭" + horizontal(width-lipgloss.Width("╭╮")) + "╮"))
 	} else {
-		fill := width - 5 - lipgloss.Width(title)
+		available := width - lipgloss.Width("╭─  ╮")
+		fill := available - lipgloss.Width(title)
 		if fill < 0 {
-			title = truncate(title, max(1, width-6))
-			fill = width - 5 - lipgloss.Width(title)
+			title = truncate(title, max(1, available-1))
+			fill = available - lipgloss.Width(title)
 		}
 		b.WriteString(t.border.Render("╭─ "))
 		b.WriteString(t.title.Render(title))
-		b.WriteString(t.border.Render(" " + strings.Repeat("─", fill) + "╮"))
+		b.WriteString(t.border.Render(" " + horizontal(fill) + "╮"))
 	}
 	for _, l := range lines {
 		b.WriteString("\n")
@@ -113,7 +120,7 @@ func (t theme) panel(title string, width int, lines ...string) string {
 		b.WriteString(t.border.Render("│"))
 	}
 	b.WriteString("\n")
-	b.WriteString(t.border.Render("╰" + strings.Repeat("─", width-2) + "╯"))
+	b.WriteString(t.border.Render("╰" + horizontal(width-lipgloss.Width("╰╯")) + "╯"))
 	return b.String()
 }
 

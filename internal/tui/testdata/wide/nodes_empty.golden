@@ -1,0 +1,12 @@
+ Dashboard   Nodes       Logs        Settings                                             vender M7
+ servers  0   ↑/↓ move · enter select · A auto · t Ping · T all · Esc cancel · r reload
+  profile  manual   (0 of 0 servers; `selected_server: auto` fails over over these)
+╭─ configuration ─────────────────────────────────────── ╮
+│ No servers configured.                                                                         │
+│                                                                                                │
+│   add one with     vender import '<share-link>'                                                │
+│   servers live in /home/test/.config/vender/servers.yaml                                       │
+│   then press       r to reload                                                                 │
+╰────────────────────────────────────────────────╯
+ ○ daemon not running — start it with `vender daemon`  (waiting)
+ ↑/↓ move • enter select • A auto • t Ping • T all • Esc cancel • r reload • tab screens …

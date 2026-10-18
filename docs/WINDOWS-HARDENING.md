@@ -35,7 +35,15 @@
 - schtasks/reg/PowerShell 从 Windows 系统目录解析，DLL 使用 System32 安全加载，不依赖工作目录中的同名文件。
 - privatefs 为 Windows 配置/运行目录及既有敏感文件设置受保护的 DACL，仅当前用户 SID 与 SYSTEM 完全访问；原子写入的临时文件继承此限制。
 - Windows 网卡/TUN 名允许空格和中文；Linux 仍保留其名称限制。
-- 测试中区分 POSIX mode 与 Windows DACL，增加真实 Store 文件 ACL 检查；golden 比较仅归一化路径分隔符，不修改生产输出。
+- 测试中区分 POSIX mode 与 Windows DACL，增加真实 Store 文件 ACL 检查；golden 仅对已知 `/run/vender` 本地规则集路径及精确的 `/run/vender/fakeip.db` 缓存 fixture 归一化分隔符/盘符，不修改生产输出、其他路径或 URL/协议字段。
+
+### Ubuntu/Windows runner 可移植性回归
+
+- TUI 快照分为 `testdata/narrow/` 与 `testdata/wide/`。普通测试通过独立子进程在依赖初始化前设置四种环境：未设置 `RUNEWIDTH_EASTASIAN` 加中文/英文 `LANG` 与 `LC_CTYPE`、显式 `0` 加中文 locale、显式 `1` 加英文 locale；均移除继承的 `LC_ALL`，检查两库实际宽度、快照、截断/补齐和面板精确宽度。TUI 包 `init` 按已初始化的 ANSI 策略一次性设置 runewidth 公开默认值，覆盖 legacy table 的 locale/console 自动推断；未设置时统一窄模式，显式 `1` 时统一宽模式，不在渲染时改全局。CLI 导入 TUI 也会采用该进程级默认值，但当前 CLI 没有直接使用 runewidth 排版。省略号和箱线边框按实际显示宽度计数；一列容不下宽省略号时返回空串。
+- TUN 接口长名仅在 Linux 期望校验失败；Windows 仍执行并断言有效，其他非法配置继续断言拒绝。
+- 锁持有者记录通过原持锁句柄读取并核对完整 PID 行，保留第二次获取锁失败及释放后重新获取成功的真实互斥测试。
+- privatefs 目录、继承文件、重复 Protect 后的文件以及 Store 三类文件，均读取真实 DACL 并用 `GetAce`、`ACCESS_ALLOWED_ACE.SidStart`、`SID.Equals` 校验。仅允许当前用户和 SYSTEM 的有效完全访问；拒绝缺失/null/空 DACL、其他 SID、非允许 ACE、只读和仅继承权限，不依赖 SDDL 的 `LA` 等字符串别名。
+- ACL 断言另有在内存中构造安全描述符的反例测试，覆盖 Everyone、Users、Authenticated Users、Administrators 和无关账户。Windows 原生 ACL、文件继承与 LockFileEx 行为仍须由原生 CI 执行；交叉编译不能验证这些运行时行为。
 
 ## 测试与边界
 
@@ -48,11 +56,12 @@ Windows 专属测试已加入：
 - `internal/privatefs/protect_windows_test.go`：临时目录/文件的 Windows DACL。
 - `internal/autostart/native_windows_test.go`：原生参数解析、Scheduler COM 只解析 XML，不注册真实任务。
 
-`.github/workflows/test.yml` 提供 Linux/Windows CI。Windows hosted runner 也不是 Win11 桌面实机；本轮没有提交/推送工作流或远程执行 CI。
-本机只能交叉编译及执行 Linux 测试，不能宣称上述 Windows 原生测试已经运行通过。
+`.github/workflows/test.yml` 提供 Linux/Windows CI。工作流已随修复推送；2026-10-18 首次实际在 Ubuntu 24.04 与 Windows Server 2025 runner 执行，暴露了上述平台/locale 测试假设。本机仍只能交叉编译及执行 Linux 测试；Windows hosted runner 也不等于 Win11 桌面 TUN 实机验收。
 
-本轮本机最终结果：Linux `go test -race -count=1 ./...` 通过；Linux 与 Windows amd64 的 `go vet ./...` 通过；Windows amd64 测试编译、CGO 禁用的程序构建通过。
+前一轮源码修复的本机记录：Linux `go test -race -count=1 ./...` 通过；Linux 与 Windows amd64 的 `go vet ./...` 通过；Windows amd64 测试编译、CGO 禁用的程序构建通过。
 `GOOS=windows go test -exec=/bin/true` 只算编译检查，不计为 Windows 运行测试。
+
+本次 runner 可移植性修复已由主代理在允许 socket 的真实 Ubuntu 环境重跑：原始环境的全量 `go test -race -count=1 ./...` 通过，包含 unset＋中文/英文 locale、显式宽/窄字符四种 fresh-process 回归。实现子代理沙箱中的 socket 权限限制不是主代理验收的最终结论。Linux/Windows vet 与 Windows 测试编译也已通过；修复后的原生 CI 结果见 [test 工作流](https://github.com/jerryloopback-hash/vender/actions/workflows/test.yml)。
 
 调试包目录：`dist/windows-debug/`，包含 vender、固定版 sing-box、上游附带的 DLL、许可证和本文档；不包含任何节点配置或凭据。它不是正式 Release。
 

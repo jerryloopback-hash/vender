@@ -11,6 +11,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/ll-lite/vender/internal/autostart"
 	"github.com/ll-lite/vender/internal/config"
@@ -714,9 +715,14 @@ func assertGolden(t *testing.T, name, got string, wants []string) {
 			t.Errorf("view does not contain %q", w)
 		}
 	}
-	path := filepath.Join("testdata", name)
+	mode := "narrow"
+	if lipgloss.Width("…") == 2 {
+		mode = "wide"
+	}
+	dir := filepath.Join("testdata", mode)
+	path := filepath.Join(dir, name)
 	if *update {
-		if err := os.MkdirAll("testdata", 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatalf("MkdirAll: %v", err)
 		}
 		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {

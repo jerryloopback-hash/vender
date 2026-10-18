@@ -4,10 +4,9 @@ package config
 
 import (
 	"path/filepath"
-	"strings"
 	"testing"
 
-	"golang.org/x/sys/windows"
+	"github.com/ll-lite/vender/internal/testutil/windowsacl"
 )
 
 // Verify actual Store writes, not POSIX mode bits (which do not express NTFS
@@ -24,20 +23,6 @@ func TestStoreWritesPrivateWindowsFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, path := range []string{store.ConfigPath(), store.ServersPath(), store.ProfilesPath()} {
-		sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
-		if err != nil {
-			t.Fatal(err)
-		}
-		s := sd.String()
-		if strings.Contains(s, ";;;WD)") || strings.Contains(s, ";;;BU)") || strings.Contains(s, ";;;AU)") {
-			t.Fatalf("broad access to %s: %s", path, s)
-		}
-		user, err := windows.GetCurrentProcessToken().GetTokenUser()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !strings.Contains(s, user.User.Sid.String()) {
-			t.Fatalf("missing user access to %s: %s", path, s)
-		}
+		windowsacl.AssertPrivate(t, path)
 	}
 }

@@ -1,0 +1,19 @@
+ Dashboard   Nodes       Logs        Settings                                             vender M7
+╭─ daemon ───────────────────────────────────────────╮
+│ ○ daemon not running  (nothing holds /home/test/.cache/vender)                                │
+│                                                                                                │
+│   start it with   vender daemon                                                                │
+│   run dir           /home/test/.cache/vender                                                   │
+│                                                                                                │
+│   The TUI needs no daemon to start: Nodes and Settings read your configuration.                │
+│   control: no daemon is running in /home/test/.cache/vender: open /home/test/.cache/vender/c… │
+╰────────────────────────────────────────────────╯
+╭─ traffic ────────────────────────────────────────── ╮
+│ no live traffic: the engine is not running                                                     │
+│ traffic counters come from the engine's Clash API, which only exists while it runs             │
+╰────────────────────────────────────────────────╯
+╭─ nodes ─────────────────────────────────────────── ╮
+│ 2 configured, 1 active   ·   press 2 or tab for the list                                      │
+╰────────────────────────────────────────────────╯
+ ○ daemon not running — start it with `vender daemon`  (control: no daemon is running in /home/test/.cache/vender:…)
+ r retry attach • tab screens • ? help
