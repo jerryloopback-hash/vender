@@ -275,13 +275,18 @@ type LatencyArgs struct {
 	Name string `json:"name,omitempty"`
 }
 
-// LatencyData is the reply to CmdLatency. Ms is the round trip through the
-// tunnel; Err is set (and Ms is 0) when the probe failed, so a slow or dead
-// server is data rather than an error.
+// LatencyData retains the v1 name/ms/err fields and adds direct ICMP metadata.
+// ICMP silence does not establish proxy protocol availability.
 type LatencyData struct {
-	Name string `json:"name"`
-	Ms   int    `json:"ms,omitempty"`
-	Err  string `json:"err,omitempty"`
+	Name       string `json:"name"`
+	Ms         int    `json:"ms,omitempty"`
+	Err        string `json:"err,omitempty"`
+	Method     string `json:"method,omitempty"`
+	Sent       int    `json:"sent,omitempty"`
+	Received   int    `json:"received,omitempty"`
+	PacketLoss int    `json:"packetLoss,omitempty"`
+	Address    string `json:"address,omitempty"`
+	Interface  string `json:"interface,omitempty"`
 }
 
 // ApplyData is the reply to the mutating commands (select/mode/start/stop/

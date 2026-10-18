@@ -43,6 +43,8 @@ const (
 
 // ControllerOptions configures a Controller.
 type ControllerOptions struct {
+	// Probe defaults to core.DirectPing; injectable for hermetic embedding/tests.
+	Probe core.PingProbe
 	// Store reads and writes config.yaml / servers.yaml.
 	Store *config.Store
 	// RunDir is the daemon's runtime directory.
@@ -80,6 +82,7 @@ type ControllerOptions struct {
 // stall the daemon, and a request that takes seconds (a restart) does not stop
 // other clients from reading status.
 type Controller struct {
+	probe      core.PingProbe
 	store      *config.Store
 	runDir     string
 	engine     core.Engine
@@ -155,7 +158,11 @@ func NewController(opts ControllerOptions) (*Controller, error) {
 		}
 	}
 
+	if opts.Probe == nil {
+		opts.Probe = core.DirectPing
+	}
 	c := &Controller{
+		probe:         opts.Probe,
 		store:         opts.Store,
 		runDir:        opts.RunDir,
 		engine:        opts.Engine,
@@ -969,72 +976,50 @@ func (c *Controller) Servers() ServersData {
 	return out
 }
 
-// Latency measures a round trip to a server.
-//
-// The active server is measured the way that matters — through the tunnel,
-// via the engine's own delay probe — so a server that connects but cannot
-// carry traffic fails here. Any other server can only be measured with a bare
-// TCP handshake, because vender has a single outbound; that result is marked
-// as such rather than passed off as equivalent.
+// Latency measures direct ICMP independently of the current engine/outbound.
 func (c *Controller) Latency(ctx context.Context, name string) LatencyData {
+	out := LatencyData{Name: name, Method: "icmp-direct"}
 	ss, err := c.store.LoadServers()
 	if err != nil {
-		return LatencyData{Name: name, Err: err.Error()}
+		out.Err = err.Error()
+		return out
 	}
 	c.mu.RLock()
-	selected := c.cfg.SelectedServer
+	selected, iface := c.cfg.SelectedServer, c.cfg.Engine.BindInterface
 	c.mu.RUnlock()
-
-	probe := name
-	if probe == "" {
-		probe = selected
+	if name == "" {
+		name = selected
 	}
-	if probe == "" || strings.EqualFold(probe, config.SelectedServerAuto) {
-		// Auto mode has no single "the server": the caller must name one (the
-		// TUI passes the failover group's current member).
-		return LatencyData{Name: name, Err: "auto failover: name the server to probe"}
+	if name == "" || strings.EqualFold(name, config.SelectedServerAuto) {
+		out.Err = "auto failover: name the server to Ping"
+		return out
 	}
-	srv, ok := ss.Get(probe)
+	srv, ok := ss.Get(name)
 	if !ok {
-		return LatencyData{Name: probe, Err: fmt.Sprintf("no server named %q", probe)}
+		out.Err = fmt.Sprintf("no server named %q", name)
+		return out
 	}
-
-	c.mu.RLock()
-	running := c.running
-	mode := c.cfg.Proxy.Mode
-	auto := c.cfg.IsAutoServer()
-	c.mu.RUnlock()
-
-	// In auto mode a specific member can be measured through the tunnel by
-	// asking the engine to delay-probe that member's outbound; in single mode
-	// the tunnel probe only applies to the selected server.
-	delayTag := ""
-	switch {
-	case !running || mode == config.ModeDirect || !c.clash.Enabled():
-	case auto:
-		delayTag = core.ServerOutboundTag(srv)
-	case strings.EqualFold(srv.Name, selected):
-		delayTag = "proxy"
+	out.Name = srv.Name
+	profiles, err := c.store.LoadProfiles()
+	if err != nil {
+		out.Err = err.Error()
+		return out
 	}
-	if delayTag != "" {
-		ms, derr := c.clash.Delay(ctx, delayTag, core.DefaultDelayTestURL, core.DefaultDelayTimeout)
-		if derr != nil {
-			return LatencyData{Name: srv.Name, Err: derr.Error()}
-		}
-		return LatencyData{Name: srv.Name, Ms: ms}
+	ctx, cancel := context.WithTimeout(ctx, core.DirectPingTimeout)
+	defer cancel()
+	var dns *config.ProfileDNS
+	// DNSMap is renderer-specific and omits captured default nameservers. Ping
+	// also accepts ordered profile defaults, so read the full own policy.
+	if profile, ok := profiles.Get(srv.ProfileName()); ok {
+		dns = profile.DNS
 	}
-
-	start := time.Now()
-	conn, derr := net.DialTimeout("tcp", srv.Endpoint(), 3*time.Second)
-	if derr != nil {
-		return LatencyData{Name: srv.Name, Err: derr.Error()}
+	result, err := c.probe(ctx, core.PingRequest{Host: srv.Address, Interface: iface, DNS: dns})
+	out.Ms, out.Sent, out.Received, out.PacketLoss = result.Ms, result.Sent, result.Received, result.PacketLoss
+	out.Address, out.Interface = result.Address, result.Interface
+	if err != nil {
+		out.Err = err.Error()
 	}
-	conn.Close()
-	ms := int(time.Since(start).Milliseconds())
-	if ms <= 0 {
-		ms = 1
-	}
-	return LatencyData{Name: srv.Name, Ms: ms, Err: "tcp only (not the active server)"}
+	return out
 }
 
 // Rules summarises the routing policy the engine is running with.

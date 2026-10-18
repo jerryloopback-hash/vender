@@ -186,6 +186,10 @@ func newFixture(t *testing.T) *fixture {
 	eng := newFakeEngine()
 	ctrl, err := NewController(ControllerOptions{
 		Store: store, RunDir: runDir, Engine: eng, BinaryPath: "/bin/true", Version: "test",
+		ClashListen: "127.0.0.1:1",
+		Probe: func(context.Context, core.PingRequest) (core.PingResult, error) {
+			return core.PingResult{Ms: 17, Sent: 3, Received: 2, PacketLoss: 33}, nil
+		},
 	})
 	if err != nil {
 		t.Fatalf("NewController: %v", err)
@@ -469,23 +473,14 @@ func TestControllerRulesTracksMode(t *testing.T) {
 	}
 }
 
-// A direct-mode daemon has no proxy outbound, so the engine's tunnel probe has
-// nothing to measure: latency must fall back to the plain TCP path instead of
-// reporting a failure.
 func TestControllerLatencyInDirectMode(t *testing.T) {
 	f := newFixture(t)
-	if err := f.ctrl.StartEngine(); err != nil {
-		t.Fatalf("StartEngine: %v", err)
-	}
 	if err := f.ctrl.SetMode("direct"); err != nil {
-		t.Fatalf("SetMode(direct): %v", err)
+		t.Fatal(err)
 	}
 	res := f.ctrl.Latency(context.Background(), "Node-A")
-	if res.Ms == 0 && res.Err == "" {
-		t.Errorf("latency in direct mode = %+v, want a tcp result", res)
-	}
-	if res.Err != "" && !strings.Contains(res.Err, "tcp only") && !strings.Contains(res.Err, "dial") {
-		t.Errorf("latency error = %q, want a tcp-shaped result", res.Err)
+	if res.Ms != 17 || res.Method != "icmp-direct" || res.Sent != 3 {
+		t.Fatalf("direct ICMP: %+v", res)
 	}
 }
 
@@ -678,39 +673,33 @@ func TestControllerCallRoutesEveryCommand(t *testing.T) {
 	}
 }
 
-func TestControllerLatencyFallsBackToTCPForInactiveServers(t *testing.T) {
+func TestControllerLatencyAlwaysICMP(t *testing.T) {
 	f := newFixture(t)
-
-	// Node-B points at an address that will not answer quickly; the important
-	// assertion is that the probe reports a failure as data, not as an error.
-	res := f.ctrl.Latency(context.Background(), "Node-B")
-	if res.Name != "Node-B" {
-		t.Errorf("latency name = %q", res.Name)
+	var hosts []string
+	f.ctrl.probe = func(ctx context.Context, req core.PingRequest) (core.PingResult, error) {
+		hosts = append(hosts, req.Host)
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("unbounded probe")
+		}
+		return core.PingResult{Ms: 17, Sent: 3, Received: 3}, nil
 	}
-	if res.Err == "" && res.Ms == 0 {
-		t.Errorf("latency result = %+v, want either a time or an error", res)
+	for _, selection := range []string{"Node-A", "Node-B", config.SelectedServerAuto} {
+		f.ctrl.mu.Lock()
+		f.ctrl.cfg.SelectedServer = selection
+		f.ctrl.running = true
+		f.ctrl.mu.Unlock()
+		for _, name := range []string{"Node-A", "Node-B"} {
+			res := f.ctrl.Latency(context.Background(), name)
+			if res.Ms != 17 || res.Method != "icmp-direct" || res.Err != "" {
+				t.Fatalf("%s/%s: %+v", selection, name, res)
+			}
+		}
 	}
-
-	// A TCP-only probe against a real local listener must succeed and be
-	// labelled as such.
-	addr, stop := listenOnce(t)
-	defer stop()
-	ss, err := f.store.LoadServers()
-	if err != nil {
-		t.Fatalf("LoadServers: %v", err)
+	if len(hosts) != 6 || hosts[1] != "203.0.113.11" {
+		t.Fatalf("Hy2/selected/auto probes: %v", hosts)
 	}
-	node := ss.Servers[1]
-	node.Address, node.Port = splitHostPort(t, addr)
-	if err := f.store.SaveServers(ss); err != nil {
-		t.Fatalf("SaveServers: %v", err)
-	}
-	res = f.ctrl.Latency(context.Background(), "Node-B")
-	if res.Ms <= 0 || !strings.Contains(res.Err, "tcp only") {
-		t.Errorf("tcp latency = %+v, want a time labelled tcp only", res)
-	}
-
 	if res := f.ctrl.Latency(context.Background(), "ghost"); !strings.Contains(res.Err, "no server named") {
-		t.Errorf("unknown server latency = %+v", res)
+		t.Fatal(res)
 	}
 }
 

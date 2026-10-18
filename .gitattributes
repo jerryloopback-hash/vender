@@ -1,0 +1,2 @@
+# Keep generated UI/config snapshots byte-stable on Windows checkouts.
+*.golden text eol=lf

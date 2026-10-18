@@ -185,14 +185,14 @@ func TestViewNodesPopulated(t *testing.T) {
 	m := runningModel(t)
 	m = m.switchScreen(screenNodes)
 	m.tabAnim = tabAnimSteps
-	m.latency["Interserver-LA-Hy2"] = control.LatencyData{Name: "Interserver-LA-Hy2", Ms: 38, Err: "tcp only (not the active server)"}
+	m.latency["Interserver-LA-Hy2"] = control.LatencyData{Name: "Interserver-LA-Hy2", Ms: 38, Method: "icmp-direct"}
 	m.rebuildRows()
 
 	assertGolden(t, "nodes_populated.golden", m.View(), []string{
 		"Interserver-LA", "Interserver-LA-Hy2",
 		"vless", "hysteria2",
 		"162.35.170.235:443", "162.35.170.235:8443",
-		"924 ms", "38 ms (tcp)",
+		"924 ms", "38 ms",
 		"▸",
 	})
 }

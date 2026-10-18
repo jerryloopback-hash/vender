@@ -126,6 +126,7 @@ func (a *app) runDaemon(cmd *cobra.Command) error {
 	// and fans engine output out to every attached client.
 	ctrl, err := control.NewController(control.ControllerOptions{
 		Store:      store,
+		Probe:      a.pingProbe,
 		RunDir:     runDir,
 		Engine:     engine,
 		BinaryPath: binaryPath,

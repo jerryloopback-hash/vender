@@ -18,6 +18,7 @@ const appName = "vender"
 // app carries per-invocation state shared by all subcommands. It exists so
 // tests can point the CLI at a temporary config directory.
 type app struct {
+	pingProbe core.PingProbe
 	// configDir overrides the platform config directory when non-empty
 	// (set by --config-dir).
 	configDir string
@@ -93,8 +94,9 @@ func invokingUserHome() string {
 	return u.HomeDir
 }
 
-func newRootCmd() *cobra.Command {
-	a := &app{}
+func newRootCmd() *cobra.Command { return newRootCmdWithApp(&app{}) }
+
+func newRootCmdWithApp(a *app) *cobra.Command {
 
 	root := &cobra.Command{
 		Use:     appName,

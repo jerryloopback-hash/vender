@@ -397,7 +397,7 @@ An animated Bubble Tea interface with four screens:
 | Key | Screen | What it shows |
 |---|---|---|
 | `1` | **Dashboard** | daemon and engine state, the selected server, the active profile, the mode, uptime, and a **live up/down traffic graph** with human-readable rates and session totals |
-| `2` | **Nodes** | every configured server with its profile, type, protocol, endpoint and latency. `enter` makes one active (the daemon restarts the engine in place), `A` switches to auto failover, `t` measures latency |
+| `2` | **Nodes** | every configured server with its profile, type, protocol, endpoint and latency. `enter` makes one active (the daemon restarts the engine in place), `A` switches to auto failover, `t` runs direct ICMP Ping, `T` Pings all rows (all profiles), `Esc` cancels |
 | `3` | **Logs** | the engine's own output, streamed live, with follow mode (`f`) and a filter (`/`) |
 | `4` | **Settings** | the routing mode, the **profiles** (node counts and a `p` key to switch the active one), the listener, the **TUN inbound** (state, device, and whether this machine can actually create it — `u` toggles it), a read-only view of the **active built-in policy**, and the **start-at-login registration** (`a` toggles it) |
 
@@ -412,9 +412,24 @@ also **does not need a daemon to start** — Nodes and Settings are built from
 your configuration files, the Dashboard prints the exact command to start the
 daemon, and attaching is retried once a second.
 
-Traffic and latency come from sing-box's own experimental Clash API, which
-vender switches on for its daemon on a loopback address with a generated
-secret. Nothing outside the daemon talks to it.
+Traffic and automatic failover health come from sing-box's experimental Clash
+API. Manual `t` / `T` uses direct ICMP on Linux and Windows, with mandatory
+physical-interface binding for both Ping and profile DNS. Nodes shows mean RTT
+and packet loss from three Echo samples. `T` runs at most four nodes at once,
+with progress and `Esc` cancellation; navigation and periodic updates continue.
+Each node is limited to 10 seconds and the batch to two minutes. ICMP silence
+means **no ICMP reply**, not a failed proxy protocol. Permissions, unknown
+physical exits or unsupported profile DNS are reported as unmeasurable.
+Literal IPs need no DNS. Domain nodes use a matching profile policy exclusively,
+or try profile UDP/TCP nameservers in order. Without an applicable profile
+resolver, they use vender's built-in direct UDP DNS (223.5.5.5). Configured
+resolver failures never fall back to that default. Resolver hostnames require
+a literal profile nameserver for bootstrap.
+There is no fallback to system/FakeIP DNS or an unbound default route.
+Raw ICMP requires suitable daemon privileges (Linux root/CAP_NET_RAW, Windows
+elevation). No route, TUN, selection or profile is changed. See
+[Direct Ping constraints and API evidence](docs/DIRECT-PING.md) for supported
+hardware, DNS policies, failure details and Windows verification limits.
 
 ### How the TUI talks to the daemon
 
@@ -765,8 +780,9 @@ vender servers use My-Node   # pin a single server again
 
 The group reuses the `proxy` tag, so the routing policy, `route.final` and the
 global-mode DNS resolver are all unchanged. In the **Nodes** screen the header
-shows which member is carrying traffic and the latency column is filled from the
-engine's own URL-test results; `A` switches to auto. Single-server setups are
+shows which member is carrying traffic; URLTest data describes automatic
+failover health only. The Ping column always holds manual direct ICMP results,
+which auto health never overwrites. `A` switches to auto. Single-server setups are
 completely unaffected — the generated config is byte-identical to before, and an
 existing installation (every server in the built-in `manual` profile) keeps
 failing over over every server.

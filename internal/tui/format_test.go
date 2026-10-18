@@ -130,10 +130,10 @@ func TestLatencyText(t *testing.T) {
 		in   control.LatencyData
 		want string
 	}{
-		{control.LatencyData{Ms: 0, Err: "boom"}, "failed"},
+		{control.LatencyData{Ms: 0, Err: "boom"}, "unmeasurable"},
 		{control.LatencyData{Ms: 0}, "-"},
 		{control.LatencyData{Ms: 924}, "924 ms"},
-		{control.LatencyData{Ms: 38, Err: "tcp only"}, "38 ms"},
+		{control.LatencyData{Ms: 38, Method: "icmp-direct", Sent: 3, Received: 2, PacketLoss: 33}, "38 ms/33%"},
 	}
 	for _, c := range cases {
 		if got := latencyText(c.in); got != c.want {

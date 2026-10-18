@@ -21,7 +21,7 @@ import (
 // daemonHarness runs a real `vender daemon` in this process, with the test
 // binary standing in for sing-box (see fake_singbox_test.go). Everything above
 // the fake engine is production code: the lock, the pid file, the controller,
-// the generated config, the Clash API client used for traffic and latency, and
+// the generated config, the Clash API client used for traffic and an injected ICMP probe, and
 // the control server.
 type daemonHarness struct {
 	cfgDir   string
@@ -111,7 +111,9 @@ func startDaemon(t *testing.T, listen string, links ...string) *daemonHarness {
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
 
-	cmd := newRootCmd()
+	cmd := newRootCmdWithApp(&app{pingProbe: func(context.Context, core.PingRequest) (core.PingResult, error) {
+		return core.PingResult{Ms: 17, Sent: 3, Received: 3}, nil
+	}})
 	cmd.SetContext(ctx)
 	cmd.SetOut(h.output)
 	cmd.SetErr(h.output)
@@ -167,7 +169,7 @@ func (h *daemonHarness) dial(t *testing.T) *control.Client {
 
 // TestDaemonControlChannelEndToEnd drives a real daemon through the real
 // control channel: status, servers, select (which restarts the engine in
-// place), latency from the engine's Clash API, live logs and live traffic.
+// place), direct ICMP latency from an injected probe, live logs and live traffic.
 func TestDaemonControlChannelEndToEnd(t *testing.T) {
 	listen := "127.0.0.1:" + fmt.Sprint(freePort(t))
 	h := startDaemon(t, listen, vlessLink, hy2Link)
@@ -217,13 +219,13 @@ func TestDaemonControlChannelEndToEnd(t *testing.T) {
 		t.Fatalf("servers = %+v", servers)
 	}
 
-	// Latency is measured through the fake engine's Clash API delay endpoint.
+	// The injected direct probe is hermetic: no TEST-NET ICMP or Clash delay.
 	lat, err := cli.Latency(ctx, "")
 	if err != nil {
 		t.Fatalf("Latency: %v", err)
 	}
-	if lat.Ms != fakeDelayMs {
-		t.Errorf("latency = %+v, want %d ms from the engine's delay probe", lat, fakeDelayMs)
+	if lat.Ms != 17 || lat.Method != "icmp-direct" {
+		t.Errorf("latency = %+v, want injected direct ICMP", lat)
 	}
 
 	// Live logs: the daemon replays the engine's output to an attaching

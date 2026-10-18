@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -92,8 +93,9 @@ type (
 	logLineMsg struct{ line control.LogLine }
 	trafficMsg struct{ sample control.TrafficSample }
 	latencyMsg struct {
-		name string
-		data control.LatencyData
+		batch uint64
+		name  string
+		data  control.LatencyData
 	}
 	actionDoneMsg struct {
 		label string
@@ -101,7 +103,8 @@ type (
 	}
 	// snapshotMsg is the offline view of the configuration, loaded from disk so
 	// the Nodes and Settings screens work with no daemon at all.
-	snapshotMsg struct{ snap configSnapshot }
+	pingDeadlineMsg struct{ batch uint64 }
+	snapshotMsg     struct{ snap configSnapshot }
 	// autostartMsg is the answer to a start-at-login probe or toggle. autostart
 	// state lives outside the daemon (it is a file in $XDG_CONFIG_HOME, or a
 	// registry value), so the TUI reads and writes it directly. note is set for
@@ -176,15 +179,21 @@ type Model struct {
 	trafStream *control.Stream
 
 	// data
-	snap      configSnapshot
-	servers   []serverRow
-	selected  string
-	latency   map[string]control.LatencyData
-	proxies   control.ProxiesData
-	upRates   []float64
-	downRates []float64
-	totalUp   int64
-	totalDown int64
+	snap                configSnapshot
+	servers             []serverRow
+	selected            string
+	latency             map[string]control.LatencyData
+	pingID              uint64
+	pingCancel          context.CancelFunc
+	pingCtx             context.Context
+	pingPending         []string
+	pingRunning         map[string]bool
+	pingDone, pingTotal int
+	proxies             control.ProxiesData
+	upRates             []float64
+	downRates           []float64
+	totalUp             int64
+	totalDown           int64
 
 	// logs
 	logs         []control.LogLine
@@ -483,20 +492,24 @@ func loadSnapshot(opts Options) configSnapshot {
 	return snap
 }
 
-// latencyCmd probes a server. The probe itself happens inside the daemon (it
-// is the only component that can reach the engine), so this is a plain call.
-//
-// Action commands dial their own short-lived connection instead of sharing the
-// model's: a probe or a restart can take seconds, and the periodic status poll
-// must keep flowing while it does.
-func latencyCmd(ctx context.Context, opts Options, name string) tea.Cmd {
-	return actionCall(ctx, opts, func(cli *control.Client, cctx context.Context) tea.Msg {
-		data, err := cli.Latency(cctx, name)
-		if err != nil {
-			return latencyMsg{name: name, data: control.LatencyData{Name: name, Err: err.Error()}}
+// Each Ping owns a short-lived connection so status/traffic keep flowing.
+func latencyCmd(ctx context.Context, opts Options, name string, batch uint64) tea.Cmd {
+	return func() tea.Msg {
+		cctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+		defer cancel()
+		data := control.LatencyData{Name: name, Method: "icmp-direct"}
+		cli, err := dial(cctx, opts)
+		if err == nil {
+			data, err = cli.Latency(cctx, name)
+			cli.Close()
 		}
-		return latencyMsg{name: name, data: data}
-	})
+		if err != nil {
+			data = control.LatencyData{Name: name, Method: "icmp-direct", Err: err.Error()}
+		} else if data.Method != "icmp-direct" {
+			data = control.LatencyData{Name: name, Err: "daemon does not support direct ICMP Ping; update the daemon"}
+		}
+		return latencyMsg{batch: batch, name: name, data: data}
+	}
 }
 
 func selectServerCmd(ctx context.Context, opts Options, name string) tea.Cmd {
@@ -716,27 +729,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 
+	case pingDeadlineMsg:
+		if msg.batch == m.pingID && m.pingCancel != nil {
+			m.cancelPing("Ping batch timed out")
+		}
+		return m, nil
 	case latencyMsg:
-		m.busy = ""
-		// Key the result by the server the daemon actually probed: an empty
-		// request name means "the active server", and the badge looks it up by
-		// name.
+		if msg.batch != m.pingID || m.pingCancel == nil || !m.pingRunning[msg.name] {
+			return m, nil
+		}
+		delete(m.pingRunning, msg.name)
 		key := msg.data.Name
 		if key == "" {
 			key = msg.name
 		}
 		m.latency[key] = msg.data
-		if msg.data.Ms == 0 {
-			reason := msg.data.Err
-			if reason == "" {
-				reason = "no answer"
+		m.pingDone++
+		if m.pingTotal == 1 {
+			if msg.data.Err != "" {
+				m.setToast("ICMP "+key+": "+msg.data.Err, true)
+			} else {
+				m.setToast("ICMP "+key+": "+latencyText(msg.data), false)
 			}
-			m.setToast("latency "+key+": "+reason, true)
-		} else {
-			m.setToast("latency "+key+": "+humanMillis(msg.data.Ms)+tcpNote(msg.data), false)
+		}
+		cmds := m.schedulePings()
+		if m.pingDone == m.pingTotal {
+			m.pingCancel()
+			m.pingCancel = nil
+			if m.pingTotal > 1 {
+				m.setToast(fmt.Sprintf("ICMP Ping complete: %d/%d", m.pingDone, m.pingTotal), false)
+			}
 		}
 		m.rebuildRows()
-		return m, nil
+		return m, tea.Batch(cmds...)
 
 	case actionDoneMsg:
 		m.busy = ""
@@ -822,11 +847,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch key {
 	case "ctrl+c", "q":
+		if m.pingCancel != nil {
+			m.pingCancel()
+		}
 		return m, tea.Quit
 	case "?":
 		m.showHelp = !m.showHelp
 		return m, nil
 	case "esc":
+		if m.pingCancel != nil {
+			m.cancelPing("ICMP Ping cancelled")
+		}
 		if m.showHelp {
 			m.showHelp = false
 		}
@@ -917,15 +948,19 @@ func (m Model) handleNodesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.busy = "enabling auto failover…"
 		return m, selectServerCmd(m.ctx, m.opts, config.SelectedServerAuto)
+	case "T":
+		names := make([]string, 0, len(m.servers))
+		for _, row := range m.servers {
+			names = append(names, row.Name)
+		}
+		return m.startPings(names)
 	case "t":
 		row := m.currentRow()
 		if row == nil {
 			return m, nil
 		}
 		if !m.attached {
-			// Without a daemon there is no tunnel, but a TCP reachability
-			// probe is still useful; the daemon-side latency call needs the
-			// engine, so this path reports exactly that.
+			// Probes run in the daemon, independently of the engine.
 			m.setToast("latency needs a running daemon", true)
 			return m, nil
 		}
@@ -1027,21 +1062,68 @@ func (m Model) startEngineAction(action string) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) startLatency(name string) (tea.Model, tea.Cmd) {
-	if !m.attached {
-		m.setToast("daemon not running: start it with `vender daemon`", true)
+	if name == "" {
+		if m.proxies.Auto {
+			name = m.activeNode()
+		} else {
+			name = m.selectedName()
+		}
+	}
+	if name == "" || name == config.SelectedServerAuto {
+		m.setToast("no active member to Ping; choose a Nodes row", true)
 		return m, nil
 	}
-	if name == "" && m.proxies.Auto {
-		// The active server is the failover group's current member, which the
-		// daemon names by its tag (the server name).
-		name = m.activeNode()
+	return m.startPings([]string{name})
+}
+
+const pingBatchTimeout = 2 * time.Minute
+
+func (m Model) startPings(names []string) (tea.Model, tea.Cmd) {
+	if m.pingCancel != nil {
+		m.setToast("ICMP Ping already running; Esc cancels", false)
+		return m, nil
 	}
-	label := name
-	if label == "" {
-		label = m.selected
+	if !m.attached {
+		m.setToast("Ping needs a running daemon", true)
+		return m, nil
 	}
-	m.busy = "testing " + label + "…"
-	return m, latencyCmd(m.ctx, m.opts, name)
+	if len(names) == 0 {
+		return m, nil
+	}
+	m.pingID++
+	m.pingCtx, m.pingCancel = context.WithTimeout(m.ctx, pingBatchTimeout)
+	m.pingPending = append([]string(nil), names...)
+	m.pingRunning = map[string]bool{}
+	m.pingTotal, m.pingDone = len(names), 0
+	id := m.pingID
+	cmds := m.schedulePings()
+	ctx := m.pingCtx
+	cmds = append(cmds, func() tea.Msg { <-ctx.Done(); return pingDeadlineMsg{batch: id} })
+	m.rebuildRows()
+	return m, tea.Batch(cmds...)
+}
+
+// At most four commands exist in flight; each completion schedules one next.
+// All bookkeeping stays in Update, never in a worker goroutine.
+func (m *Model) schedulePings() []tea.Cmd {
+	var cmds []tea.Cmd
+	for len(m.pingRunning) < 4 && len(m.pingPending) > 0 && m.pingCtx.Err() == nil {
+		name := m.pingPending[0]
+		m.pingPending = m.pingPending[1:]
+		m.pingRunning[name] = true
+		cmds = append(cmds, latencyCmd(m.pingCtx, m.opts, name, m.pingID))
+	}
+	return cmds
+}
+func (m *Model) cancelPing(reason string) {
+	m.pingCancel()
+	m.pingCancel = nil
+	// Invalidate every result already queued, including a previous deadline.
+	m.pingID++
+	m.pingPending = nil
+	m.pingRunning = nil
+	m.setToast(reason, true)
+	m.rebuildRows()
 }
 
 // tunView is the TUN state as the Settings screen and the Dashboard present it.
@@ -1286,10 +1368,8 @@ func (m *Model) syncRowsFromStatus() {
 }
 
 // rebuildRows merges the two sources of truth: servers.yaml (always available)
-// and the daemon's status (which server is active, what it is doing). In auto
-// mode the daemon's failover state (ProxiesData) overrides both the "active"
-// marker and the latency column, because the engine is the only component that
-// knows which member is carrying traffic right now.
+// and the daemon's status. URLTest health only supplies the active marker
+// and the separate health field; the Ping column always contains manual ICMP.
 func (m *Model) rebuildRows() {
 	rows := make([]serverRow, 0, len(m.snap.Servers))
 	for i := range m.snap.Servers {
@@ -1306,11 +1386,6 @@ func (m *Model) rebuildRows() {
 		if n, ok := m.nodeHealth(srv.Name); ok {
 			row.Active = n.Active
 			row.Health = nodeHealthWord(n)
-			if n.Alive && n.DelayMs > 0 {
-				row.Latency = humanMillis(n.DelayMs)
-			} else if m.proxies.Auto && row.Latency == "" {
-				row.Latency = nodeHealthWord(n)
-			}
 		} else if m.proxies.Auto {
 			// Auto mode with no engine answer yet: nothing is reliably active.
 			row.Active = false
@@ -1374,33 +1449,37 @@ func (m *Model) currentRow() *serverRow {
 }
 
 func (m *Model) latencyText(name string) string {
+	if m.pingCancel != nil {
+		if m.pingRunning[name] {
+			return "pinging…"
+		}
+		for _, pending := range m.pingPending {
+			if pending == name {
+				return "queued"
+			}
+		}
+	}
 	d, ok := m.latency[name]
 	if !ok {
 		return ""
 	}
-	return latencyText(d) + tcpNote(d)
+	return latencyText(d)
 }
 
 func latencyText(d control.LatencyData) string {
 	if d.Ms == 0 {
 		if d.Err != "" {
-			return "failed"
+			if d.Sent > 0 && d.Received == 0 {
+				return "no reply/100%"
+			}
+			return "unmeasurable"
 		}
 		return "-"
 	}
-	return humanMillis(d.Ms)
-}
-
-// tcpNote marks a measurement that did not go through the tunnel. It is
-// deliberately not an error: a bare TCP handshake is the best vender can do
-// for a server that is not the active one (vender has a single outbound), and
-// on a host where a TUN hijacks outbound TCP the number can be optimistic to
-// the point of being meaningless.
-func tcpNote(d control.LatencyData) string {
-	if d.Ms == 0 || d.Err == "" {
-		return ""
+	if d.Sent > 0 {
+		return fmt.Sprintf("%s/%d%%", humanMillis(d.Ms), d.PacketLoss)
 	}
-	return " (tcp)"
+	return humanMillis(d.Ms)
 }
 
 func humanMillis(ms int) string {

@@ -20,6 +20,10 @@ const (
 	DNSRemote = "dns-remote"
 )
 
+// BuiltinDirectDNSAddress is vender's explicit direct DNS default, shared by
+// rule-mode DNS and direct Ping when no profile resolver applies.
+const BuiltinDirectDNSAddress = "223.5.5.5"
+
 // DNSResolverStrategy is sing-box's address-family preference. prefer_ipv4
 // keeps behaviour predictable on dual-stack hosts (a v4 answer first, v6 as a
 // fallback) and avoids the "IPv6 route silently broken" class of failure.
@@ -149,7 +153,7 @@ func RuleModeDNS(user *UserRules) DNS {
 	)
 	return DNS{
 		Servers: []DNSServer{
-			{Tag: DNSCN, Type: "udp", Server: "223.5.5.5"},
+			{Tag: DNSCN, Type: "udp", Server: BuiltinDirectDNSAddress},
 			{Tag: DNSFakeIP, Type: "fakeip", Inet4Range: FakeIPv4Range, Inet6Range: FakeIPv6Range},
 		},
 		Rules:    rules,

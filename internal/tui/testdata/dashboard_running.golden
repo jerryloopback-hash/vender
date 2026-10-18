@@ -3,7 +3,7 @@
 │ ● daemon running  pid 4821  ·  engine running  pid 4829  ·  uptime 3m12s  ·  v1.2.3              │
 │ server   Interserver-LA  vless  162.35.170.235:443                                               │
 │ mode     rule   listen 127.0.0.1:7897   tun off   profile manual   servers 2 (1 active)          │
-│ latency  ● 924 ms   engine sing-box 1.14.3                                                       │
+│ latency  ● 924 ms ICMP   engine sing-box 1.14.3                                                  │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ traffic ────────────────────────────────────────────────────────────────────────────────────────╮
 │ down  520 KiB/s                                                                   ▂▃▅█▆▃▂▂▂▂▁▁   │

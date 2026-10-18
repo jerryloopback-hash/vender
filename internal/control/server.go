@@ -196,10 +196,43 @@ func (s *Server) serveConn(conn net.Conn) {
 	br := bufio.NewReaderSize(conn, 64*1024)
 	enc := json.NewEncoder(conn)
 	dec := json.NewDecoder(br)
-
-	for {
-		var req Request
-		if err := dec.Decode(&req); err != nil {
+	// One reader owns the decoder. Detect peer EOF while a Ping is running so
+	// closing the dedicated client cancels the socket/DNS work in the daemon.
+	connCtx, stopConn := context.WithCancel(context.Background())
+	defer stopConn()
+	defer conn.Close()
+	type incoming struct {
+		req Request
+		err error
+	}
+	frames := make(chan incoming, 1)
+	readerDone := make(chan struct{})
+	defer func() { stopConn(); conn.Close(); <-readerDone }()
+	go func() {
+		defer close(readerDone)
+		defer close(frames)
+		defer stopConn()
+		for {
+			var frame incoming
+			frame.err = dec.Decode(&frame.req)
+			if frame.err != nil {
+				stopConn()
+				select {
+				case frames <- frame:
+				default:
+				}
+				return
+			}
+			select {
+			case frames <- frame:
+			case <-connCtx.Done():
+				return
+			}
+		}
+	}()
+	for frame := range frames {
+		req := frame.req
+		if err := frame.err; err != nil {
 			if !errors.Is(err, io.EOF) && !isClosedConn(err) {
 				// A malformed frame is worth reporting; the client is
 				// probably hand-rolled or a different version.
@@ -221,12 +254,12 @@ func (s *Server) serveConn(conn net.Conn) {
 				return
 			}
 			_ = enc.Encode(Response{V: Version, ID: req.ID, OK: true, Stream: stream})
-			s.pumpStream(conn, enc, stream, data)
+			s.pumpStream(connCtx, conn, enc, stream, data)
 			cancel()
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), callTimeout(req.Cmd))
+		ctx, cancel := context.WithTimeout(connCtx, callTimeout(req.Cmd))
 		data, err := s.handler.Call(ctx, req.Cmd, req.Args)
 		cancel()
 		resp := Response{V: Version, ID: req.ID, OK: err == nil}
@@ -244,7 +277,7 @@ func (s *Server) serveConn(conn net.Conn) {
 
 // pumpStream forwards stream values as event frames until the peer
 // disconnects or the stream ends.
-func (s *Server) pumpStream(conn net.Conn, enc *json.Encoder, stream string, data <-chan any) {
+func (s *Server) pumpStream(ctx context.Context, conn net.Conn, enc *json.Encoder, stream string, data <-chan any) {
 	// A write deadline is refreshed per event: a client that stops reading
 	// (a suspended laptop) must not pin the daemon's goroutine forever.
 	ping := time.NewTicker(30 * time.Second)
@@ -267,6 +300,8 @@ func (s *Server) pumpStream(conn net.Conn, enc *json.Encoder, stream string, dat
 			if err := enc.Encode(Event{V: Version, Stream: stream, KeepAlive: true}); err != nil {
 				return
 			}
+		case <-ctx.Done():
+			return
 		case <-s.done:
 			return
 		}

@@ -351,17 +351,13 @@ func (m Model) serverText() string {
 }
 
 func (m Model) latencyBadge() string {
-	if m.proxies.Auto {
-		cur := m.activeNode()
-		if cur == "" {
-			return m.theme.dim.Render("auto: waiting for a URL test")
-		}
-		if n, ok := m.nodeHealth(cur); ok && n.Alive && n.DelayMs > 0 {
-			return latencyStyle(m.theme, n.DelayMs) + m.theme.dim.Render("  "+cur)
-		}
-		return m.theme.bad.Render("auto: " + cur + " unmeasured")
-	}
 	name := m.selectedName()
+	if m.proxies.Auto {
+		name = m.activeNode()
+	}
+	if m.pingCancel != nil && m.pingRunning[name] {
+		return m.theme.dim.Render("ICMP pinging…")
+	}
 	d, ok := m.latency[name]
 	if name == "" || !ok {
 		return m.theme.dim.Render("press t to test")
@@ -369,7 +365,7 @@ func (m Model) latencyBadge() string {
 	if d.Ms == 0 {
 		return m.theme.bad.Render("failed" + errSuffix(d.Err))
 	}
-	return latencyStyle(m.theme, d.Ms)
+	return latencyStyle(m.theme, d.Ms) + m.theme.dim.Render(" ICMP")
 }
 
 // latencyStyle colours a millisecond figure by how usable it is.
@@ -436,7 +432,7 @@ func (m Model) nodesView() string {
 		title = fmt.Sprintf("servers  %d   auto failover", len(m.servers))
 	}
 	head := " " + m.theme.title.Render(title) + "   " +
-		m.theme.subtle.Render("↑/↓ move · enter select · A auto · t latency · r reload")
+		m.theme.subtle.Render("↑/↓ move · enter select · A auto · t Ping · T all · Esc cancel · r reload")
 	head += "\n  " + m.theme.subtle.Render("profile  ") + m.theme.value.Render(m.activeProfile()) +
 		m.theme.dim.Render(fmt.Sprintf("   (%d of %d servers; `selected_server: auto` fails over over these)",
 			m.profileCount(m.activeProfile()), len(m.servers)))
@@ -446,7 +442,10 @@ func (m Model) nodesView() string {
 			cur = "(waiting for the first URL test)"
 		}
 		head += "\n  " + m.theme.subtle.Render("active member  ") + m.theme.value.Render(cur) +
-			m.theme.dim.Render("   (the engine picks the fastest reachable node)")
+			m.theme.dim.Render("   (URLTest: automatic failover health only; Ping is direct ICMP)")
+	}
+	if m.pingCancel != nil {
+		head += fmt.Sprintf("\n  ICMP Ping %d/%d · %d running · %d queued · Esc cancel", m.pingDone, m.pingTotal, len(m.pingRunning), len(m.pingPending))
 	}
 	if len(m.servers) == 0 {
 		lines := []string{
@@ -461,7 +460,28 @@ func (m Model) nodesView() string {
 		}
 		return head + "\n" + m.theme.panel("configuration", w, lines...)
 	}
-	return head + "\n" + m.theme.panel("servers.yaml", w, strings.Split(m.nodes.View(), "\n")...)
+	body := head + "\n" + m.theme.panel("servers.yaml", w, strings.Split(m.nodes.View(), "\n")...)
+	if row := m.currentRow(); row != nil {
+		detail := "direct ICMP · RTT/loss · ICMP silence is not protocol failure"
+		if d, ok := m.latency[row.Name]; ok && !m.pingRunning[row.Name] {
+			detail = fmt.Sprintf("ICMP %s: %s", row.Name, latencyText(d))
+			if d.Sent > 0 {
+				detail += fmt.Sprintf(" · %d/%d replies", d.Received, d.Sent)
+			}
+			if d.Interface != "" {
+				detail += " · " + d.Interface + " → " + d.Address
+			}
+			if d.Err != "" {
+				detail += " · " + d.Err
+			}
+		}
+		lines := strings.Split(m.theme.dim.Width(max(20, w-2)).Render(detail), "\n")
+		for i := range lines {
+			lines[i] = strings.TrimRight(lines[i], " ")
+		}
+		body += "\n  " + strings.Join(lines, "\n  ")
+	}
+	return body
 }
 
 // newNodesTable builds the Nodes table. Selection is rendered by vender's own
@@ -485,10 +505,10 @@ func newNodesTable(th theme) table.Model {
 // its panel, so the panel border never cuts a column in half. The name column
 // absorbs whatever is left over.
 func nodeColumns(inner int) []table.Column {
-	marker, typ, active, latency := 2, 10, 7, 12
+	marker, typ, active, latency := 2, 10, 7, 14
 	protocol := clampInt(inner/6, 8, 16)
 	endpoint := clampInt(inner/5, 10, 20)
-	profile := clampInt(inner/8, 6, 12)
+	profile := clampInt(inner/8, 6, 10)
 	name := inner - (marker + typ + protocol + endpoint + profile + active + latency)
 	if name < 8 {
 		name = 8
@@ -501,7 +521,7 @@ func nodeColumns(inner int) []table.Column {
 		{Title: "PROTOCOL", Width: protocol},
 		{Title: "ENDPOINT", Width: endpoint},
 		{Title: "ACTIVE", Width: active},
-		{Title: "LATENCY", Width: latency},
+		{Title: "PING (ICMP)", Width: latency},
 	}
 }
 
@@ -967,7 +987,7 @@ func (m Model) helpOverlay() string {
 		{
 			"Dashboard",
 			"  r    refresh the daemon status (or retry attaching)",
-			"  t    test the active server's latency",
+			"  t    direct ICMP Ping of the active server",
 			"  s    start the engine      x  stop it      R  restart it",
 			"  m    cycle the routing mode",
 		},
@@ -975,7 +995,9 @@ func (m Model) helpOverlay() string {
 			"Nodes",
 			"  ↑/↓, j/k   move      enter  select (restarts the engine)",
 			"  A          switch to auto failover (the engine picks the fastest node)",
-			"  t          latency for the highlighted server",
+			"  t          direct ICMP Ping of the highlighted server",
+			"  T          Ping all table rows (4 at a time, all profiles)",
+			"  Esc        cancel Ping; ICMP silence is not protocol failure",
 			"  r          reload servers.yaml from disk",
 		},
 		{
@@ -1022,7 +1044,7 @@ func (m Model) keyMap() help.KeyMap {
 	switch m.screen {
 	case screenNodes:
 		return km{short: append([]key.Binding{
-			b("↑/↓", "move"), b("enter", "select"), b("A", "auto"), b("t", "latency"), b("r", "reload"),
+			b("↑/↓", "move"), b("enter", "select"), b("A", "auto"), b("t", "Ping"), b("T", "all"), b("Esc", "cancel"), b("r", "reload"),
 		}, common...)}
 	case screenLogs:
 		var f key.Binding

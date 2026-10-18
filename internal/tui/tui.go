@@ -6,7 +6,7 @@
 //
 // Four screens — Dashboard, Nodes, Logs, Settings — with a live, animated view
 // of the engine: status, the selected server and mode, an up/down traffic
-// graph fed by sing-box's Clash API, latency, and the engine's own log stream.
+// graph fed by sing-box's Clash API, direct ICMP Ping, and the engine's own log stream.
 //
 // # What it is not
 //

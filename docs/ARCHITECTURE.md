@@ -102,7 +102,7 @@ internal/config/       config.yaml + servers.yaml + profiles.yaml + share-link
                        parsing                                             [M0, M7]
 internal/subscription/ subscription fetching + parsing (links, base64, Clash) [M7]
 internal/core/         engine contract + sing-box rendering + supervision [M1]
-                       + the Clash API client used for traffic and latency  [M3]
+                       + the Clash API client used for traffic and failover health  [M3]
 internal/rules/        built-in routing policy + embedded rule sets        [M2]
 internal/control/      daemon control channel: protocol, server, client,
                        and the controller that owns the engine             [M3]
@@ -668,7 +668,7 @@ asks for it:
 
 - `Route`, `Outbounds` and the rest are unchanged; `RuntimeConfig.ClashListen`
   non-empty asks for sing-box's **Clash API**, which is what gives the TUI live
-  traffic counters and a latency measurement that goes *through* the tunnel
+  traffic counters and automatic failover health
   (§8.3). It is validated rather than passed through blindly: the address must
   be loopback and a secret is mandatory, because an unauthenticated local API
   can switch the active outbound. Leaving `ClashListen` empty emits no
@@ -1250,7 +1250,7 @@ which the connection belongs to it:
 | `mode` | `{mode}` | persists `rule`/`global`/`direct`, restarts the engine |
 | `profile` | `{name}` | M7: persists the active profile in `profiles.yaml`, restarts the engine (with `auto`, that changes the group's members) |
 | `tun` | `{enabled}` | persists `engine.tun.enabled`, restarts the engine; **refuses before touching the engine** when this daemon cannot create a TUN device |
-| `latency` | `{name?}` | round trip in ms (through the tunnel for the active server) |
+| `latency` | `{name?}` | direct ICMP mean RTT, method, sample counts/loss, address/interface or error |
 | `start` / `stop` / `restart` | — | engine lifecycle inside the running daemon |
 | `rules` | — | the active policy: actions, ordered rules, DNS, rule sets |
 | `proxies` | — | M5: the failover group's state (auto? current member) and per-server health |
@@ -1276,24 +1276,19 @@ Three decisions in it are worth recording:
   wedging the daemon. This is the same policy `core` applies to the child's
   stdout. A new subscriber is first handed the last 250 log lines, so attaching
   the TUI an hour into a session still shows history.
-- **Traffic and latency come from sing-box's own counters.** Local counters on
-  the mixed inbound cannot see the proxied payload, so M3 turns on sing-box's
-  experimental **Clash API** (`127.0.0.1`, an OS-assigned port decided by the
-  daemon, a generated secret) and reads `/traffic`, `/connections` and
-  `/proxies/<tag>/delay` through `core.ClashClient`. The endpoint is only
-  reachable from the daemon; the TUI never talks to it.
-  Latency is measured **through the tunnel** for the active server, which is
-  what a user switching servers actually wants to know; for any other server
-  (vender has a single outbound) it falls back to a bare TCP handshake and says
-  so — `(tcp)` — because on a host where a TUN hijacks outbound TCP that number
-  can be optimistic to the point of being meaningless.
+- **Traffic comes from sing-box; manual Ping is independent.** The daemon
+  reads `/traffic` and `/connections` through its private loopback Clash API.
+  `Controller.Latency` uses `core.DirectPing` for every node, including selected,
+  auto members and Hysteria2. Three ICMP Echo samples use mandatory physical
+  socket binding; DNS uses the node's profile policy with the same constraint.
+  No fallback to URLTest, TCP handshakes or system DNS exists. See
+  [Direct Ping](DIRECT-PING.md) for OS APIs, DNS behavior and verification limits.
 - **Failover state is the engine's, read back through the Clash API (M5).**
   `/proxies` reports, for a `urltest` group, which member is `now` active and,
   for each member, its last measured delay (`history`). `Controller.Proxies`
   joins that with `servers.yaml` and answers `CmdProxies` with one row per
-  server: `active`, `alive`, `delayMs`. In auto mode a named member can also be
-  latency-probed *through the tunnel* with `/proxies/<member-tag>/delay`, so the
-  Nodes screen can measure a specific node rather than only the group.
+  server: `active`, `alive`, `delayMs`. These are automatic failover health
+  records only; they never populate or overwrite the manual Ping column.
 
 Streams reconnect on their own: if the engine restarts, the traffic poller
 backs off and reconnects with no involvement from any client.
@@ -1331,7 +1326,7 @@ type Options struct {
 | Key | Screen | Contents |
 |---|---|---|
 | `1` | **Dashboard** | daemon and engine state, selected server, active profile, mode, uptime, latency badge, and an animated up/down traffic graph with a load gauge, human-readable rates and session totals |
-| `2` | **Nodes** | table of configured servers (profile, name, type, protocol, endpoint, latency); `enter` selects and lets the daemon restart the engine, `A` switches to auto failover, `t` measures latency, `r` reloads from disk. In **auto** mode the header shows the active profile and how many servers the group scopes to, plus which member is carrying traffic, and the latency column is fed by the engine's own URL-test results, so node health is visible without probing each one by hand. |
+| `2` | **Nodes** | table of configured servers (profile, name, type, protocol, endpoint, latency); `enter` selects and lets the daemon restart the engine, `A` switches to auto failover, `t` runs direct ICMP Ping, `T` Pings all rows (all profiles, at most four concurrently), `Esc` cancels, `r` reloads from disk. In **auto** mode the header shows the active profile and how many servers the group scopes to, plus which member is carrying traffic, and URLTest is labelled as automatic failover health only. The Ping column always keeps the manual ICMP result. |
 | `3` | **Logs** | the engine's own output as streamed by the daemon, in a scrolling viewport with follow mode (`f`) and a substring filter (`/`) |
 | `4` | **Settings** | the routing mode (rule/global/direct), the **profiles** — every known profile with its node count and (redacted) subscription URL, and `p` to switch the active one — the inbounds — the mixed listener and the **TUN inbound** with its device, its knobs, the privilege verdict and an explicit warning when it is on but cannot work (`u` toggles it) — the engine paths, the **merged routing policy** rendered from `internal/rules` (critical + `rules.yaml` + built-in, with the selected server and whether failover is active), and the **start-at-login registration** with `a` to toggle it |
 

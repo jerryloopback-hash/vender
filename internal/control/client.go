@@ -266,9 +266,13 @@ func (c *Client) SetProfile(ctx context.Context, name string) (ApplyData, error)
 	return out, err
 }
 
-// Latency measures a round trip through the named server (empty: the active
+// Latency measures direct ICMP to the named server (empty: the active
 // one). A failed probe is reported in LatencyData.Err, not as an error.
 func (c *Client) Latency(ctx context.Context, name string) (LatencyData, error) {
+	// Latency connections are interrupted on cancellation, allowing the daemon
+	// to stop ICMP immediately. A cancelled client must be redialled.
+	stop := context.AfterFunc(ctx, func() { c.conn.Close() })
+	defer stop()
 	var out LatencyData
 	err := c.Call(ctx, CmdLatency, LatencyArgs{Name: name}, &out)
 	return out, err
