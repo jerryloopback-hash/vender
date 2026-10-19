@@ -26,6 +26,50 @@
         "server": "dns-cn"
       },
       {
+        "action": "reject",
+        "rule_set": [
+          "geosite-category-ads-all"
+        ]
+      },
+      {
+        "action": "route",
+        "domain": [
+          "bing.com",
+          "www.bing.com",
+          "cn.bing.com",
+          "global.bing.com",
+          "bing.com.cn",
+          "www.bing.com.cn",
+          "s.bing.net"
+        ],
+        "domain_suffix": [
+          "r.bing.com",
+          "th.bing.com",
+          "cn.bing.net",
+          "mm.bing.net"
+        ],
+        "server": "dns-cn"
+      },
+      {
+        "action": "route",
+        "rule_set": [
+          "geosite-steam",
+          "geosite-onedrive",
+          "geosite-microsoft",
+          "geosite-google",
+          "geosite-youtube",
+          "geosite-telegram",
+          "geosite-netflix",
+          "geosite-openai",
+          "geosite-bahamut"
+        ],
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "server": "dns-fakeip"
+      },
+      {
         "action": "route",
         "rule_set": [
           "geosite-cn"
@@ -178,6 +222,24 @@
           "geosite-category-ads-all"
         ],
         "outbound": "block"
+      },
+      {
+        "domain": [
+          "bing.com",
+          "www.bing.com",
+          "cn.bing.com",
+          "global.bing.com",
+          "bing.com.cn",
+          "www.bing.com.cn",
+          "s.bing.net"
+        ],
+        "domain_suffix": [
+          "r.bing.com",
+          "th.bing.com",
+          "cn.bing.net",
+          "mm.bing.net"
+        ],
+        "outbound": "direct"
       },
       {
         "rule_set": [

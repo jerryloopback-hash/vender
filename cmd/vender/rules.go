@@ -101,7 +101,11 @@ func (a *app) newRulesListCmd() *cobra.Command {
 				fmt.Fprintf(w, "  server\t%s\t%s %s\t(%s)\n", s.Tag, s.Type, addr, where)
 			}
 			for _, r := range dns.Rules {
-				fmt.Fprintf(w, "  rule\t%s\t%s\t-> %s\n", r.Name, dnsRuleMatch(r), r.Server)
+				target := r.Server
+				if r.Action == "reject" {
+					target = "reject"
+				}
+				fmt.Fprintf(w, "  rule\t%s\t%s\t-> %s\n", r.Name, dnsRuleMatch(r), target)
 			}
 			fmt.Fprintf(w, "  final\t%s\tstrategy %s\n", dns.Final, dns.Strategy)
 			if err := w.Flush(); err != nil {

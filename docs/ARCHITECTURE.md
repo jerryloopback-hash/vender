@@ -985,7 +985,8 @@ The M5 rule is: **a DNS query must never depend on the proxy.** Two mechanisms
 enforce it:
 
 - **Real, direct resolution for what will go direct.** The critical list, the
-  user's direct list and `geosite-cn` are answered by `dns-cn`
+  user's direct list, ordinary Bing search exceptions and non-overridden
+  `geosite-cn` domains are answered by `dns-cn`
   (`223.5.5.5`, UDP, reached directly). These names get correct, immediately
   usable addresses.
 - **FakeIP for what will be proxied.** Everything else, for address queries
@@ -1000,6 +1001,10 @@ enforce it:
 |---|---|---|---|
 | critical list | `dns-cn` | directly | real address |
 | user `direct:` domains | `dns-cn` | directly | real address |
+| user `proxy:` domains, `A`/`AAAA` | `dns-fakeip` | local | fake address |
+| user `block:` domains and ads | reject | local | refused query |
+| ordinary Bing search entry points / static hosts | `dns-cn` | directly | real address |
+| service overrides, `A`/`AAAA` | `dns-fakeip` | local | fake address |
 | `geosite-cn` | `dns-cn` | directly | real address |
 | everything else, `A`/`AAAA` | `dns-fakeip` | local | fake address, domain preserved |
 | everything else, other types | `dns-cn` (`final`) | directly | real address |
@@ -1026,9 +1031,13 @@ dead proxy: `www.baidu.com` and `opencode.ai` returned real addresses in <0.1 s,
 `google.com` returned a fake address in <0.1 s, while the *old* configuration
 took ~5 s and failed on the same two foreign names.
 
-The DNS rules mirror the routing split by construction: `RuleModeDNS(user)`
-builds the critical and user-direct rules from the same lists the routing policy
-uses, so the two cannot drift. A user `direct:` CIDR is not mirrored into DNS —
+The DNS rules mirror the domain routing split by construction: `RuleModeDNS(user)`
+projects `EffectiveRules(user)` in the same order, including user proxy/block,
+Bing search and service overrides before `geosite-cn`. Thus an overlapping
+Microsoft/CN domain no longer gets a domestic address before being proxied.
+Non-address queries still use the domestic resolver (except blocked names).
+IP-only matches (`ip_is_private`, CIDRs, `geoip-cn`) are routing-only. A user
+`direct:` CIDR is not mirrored into DNS —
 sing-box 1.14 cannot match a CIDR in a DNS rule without response matching — and
 does not need to be: a direct outbound dialling a *name* re-resolves it through
 `dns-cn` anyway, and a connection that already arrives as an IP in the CIDR never

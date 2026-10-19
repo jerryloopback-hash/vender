@@ -920,8 +920,12 @@ func buildDNS(policy rules.DNS) (*singboxDNS, error) {
 		if len(r.RuleSets)+len(r.Domains)+len(r.DomainSuffixes)+len(r.QueryTypes) == 0 {
 			return nil, fmt.Errorf("core: DNS rule %q matches nothing", r.Name)
 		}
+		action := r.Action
+		if action == "" {
+			action = "route"
+		}
 		out.Rules = append(out.Rules, singboxDNSRule{
-			Action:       "route",
+			Action:       action,
 			RuleSet:      r.RuleSets,
 			Domain:       r.Domains,
 			DomainSuffix: r.DomainSuffixes,

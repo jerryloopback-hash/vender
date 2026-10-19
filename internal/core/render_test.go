@@ -721,8 +721,8 @@ func TestRuleModeDeclaresExactlyTheReferencedRuleSets(t *testing.T) {
 			continue
 		}
 		if len(r.RuleSet) == 0 {
-			// The destination rules without a rule set are the critical domain
-			// list and the private-address match (which uses ip_is_private).
+			// The critical list, Bing search exception and private-address match
+			// do not depend on a rule set.
 			ipRules++
 			continue
 		}
@@ -732,8 +732,8 @@ func TestRuleModeDeclaresExactlyTheReferencedRuleSets(t *testing.T) {
 			}
 		}
 	}
-	if ipRules != 2 {
-		t.Errorf("%d destination rules match without a rule set, want the critical list and the private one", ipRules)
+	if ipRules != 3 {
+		t.Errorf("%d destination rules match without a rule set, want critical, Bing search and private", ipRules)
 	}
 	if len(cfg.DNS.Rules) == 0 {
 		t.Fatal("rule mode emitted no DNS rules, so the split DNS policy is gone")

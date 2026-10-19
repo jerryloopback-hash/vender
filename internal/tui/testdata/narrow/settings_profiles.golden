@@ -24,7 +24,7 @@
 │  1  critical-direct         domain_suffix=[opencode.ai]                   direct                 │
 │  2  private-dest-direct     ip_is_private                                 direct                 │
 │  3  ads-block               rule_set=[geosite-category-ads-all]           block                  │
-│  4  service-overrides-pro…  rule_set=[geosite-steam geosite-onedrive ge…  proxy                  │
+│  4  bing-search-direct      domain=[bing.com www.bing.com cn.bing.com g…  direct                 │
 … (resize the window, or press ? for help)
  ○ daemon not running — start it with `vender daemon`  (waiting)
  ←/→ mode • enter apply • p profile • u tun • a start at login • tab screens • ? help

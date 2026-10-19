@@ -18,13 +18,13 @@
 │  1  critical-direct         domain_suffix=[opencode.ai]                   direct               │
 │  2  private-dest-direct     ip_is_private                                 direct               │
 │  3  ads-block               rule_set=[geosite-category-ads-all]           block                │
-│  4  service-overrides-pr…  rule_set=[geosite-steam geosite-onedrive g…  proxy                │
-│  5  cn-direct               rule_set=[geosite-cn geoip-cn]                direct               │
-│ dns      2 servers, 3 rules, final dns-cn   user rules  none   sets  12, 494 KiB               │
+│  4  bing-search-direct      domain=[bing.com www.bing.com cn.bing.com …  direct               │
+│  5  service-overrides-pr…  rule_set=[geosite-steam geosite-onedrive g…  proxy                │
+│  6  cn-direct               rule_set=[geosite-cn geoip-cn]                direct               │
+│ dns      2 servers, 6 rules, final dns-cn   user rules  none   sets  12, 494 KiB               │
 ╰────────────────────────────────────────────────╯
 ╭─ autostart ───────────────────────────────────────── ╮
 │ start at login  checking…                                                                     │
-│ system proxy    `vender proxy on|off` points the desktop at the local inbound                  │
-╰────────────────────────────────────────────────╯
+… (resize the window, or press ? for help)
  ● daemon pid 4821  attached to the daemon at 127.0.0.1:41234
  ←/→ mode • enter apply • p profile • u tun • a start at login • tab screens • ? help

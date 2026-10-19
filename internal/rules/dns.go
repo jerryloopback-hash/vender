@@ -80,6 +80,9 @@ type DNSServer struct {
 // off the proxy needs to match exact domains and suffixes (the critical and
 // user lists) and the query type (only address queries may go to FakeIP).
 type DNSRule struct {
+	// Action defaults to route; reject mirrors a blocked domain without an
+	// upstream lookup. Server is empty for reject rules.
+	Action string
 	// Name is a human-readable identifier.
 	Name string
 	// RuleSets lists the destination rule sets this rule applies to. A DNS
@@ -113,14 +116,14 @@ type DNS struct {
 // against; the engine is rendered with RuleModeDNS(user) instead.
 func BuiltinDNS() DNS { return RuleModeDNS(nil) }
 
-// RuleModeDNS builds the rule-mode DNS policy, including the user's direct
-// list. The design, and why it cannot hang on a dead proxy:
+// RuleModeDNS projects the domain-matchable portion of EffectiveRules into
+// DNS rules in the same order. IP-only conditions cannot be evaluated before
+// resolution and are intentionally not projected. The design:
 //
 //   - Every server is either local or reached directly. No query is ever sent
 //     through the proxy, so a slow or dead proxy cannot stall name resolution.
-//   - Domains that will be routed directly (the critical list, the user's
-//     direct list, geosite-cn) are resolved for real by DNSCN. Their addresses
-//     are correct and immediately usable.
+//   - Direct domain rules use DNSCN; blocked domain rules reject the query.
+//   - Proxy domain rules precede CN rules, including where sets overlap.
 //   - Everything else — i.e. everything that will be routed through the proxy
 //     — is answered by DNSFakeIP: a synthetic address, handed out locally in
 //     microseconds, with the domain preserved so the proxy receives the name
@@ -128,27 +131,43 @@ func BuiltinDNS() DNS { return RuleModeDNS(nil) }
 //     also means a poisoned domestic answer can never be used for a proxied
 //     connection).
 //
-// The rule order is the policy: critical, user direct, Chinese, then the
-// FakeIP catch-all for address queries. `final` is DNSCN rather than FakeIP so
+// `final` is DNSCN rather than FakeIP so
 // non-address queries (HTTPS/SVCB, TXT, ...) for unmatched names still get a
 // real answer; the domain is exposed to the domestic resolver, which is the one
 // deliberate trade-off of this design (documented in docs/ARCHITECTURE.md).
 func RuleModeDNS(user *UserRules) DNS {
-	rules := []DNSRule{{
-		Name:           "critical-direct-real",
-		DomainSuffixes: CriticalDirectSuffixes(),
-		Server:         DNSCN,
-	}}
-	if domains, suffixes := user.DirectSuffixes(); len(domains)+len(suffixes) > 0 {
-		rules = append(rules, DNSRule{
-			Name:           "user-direct-real",
-			Domains:        domains,
-			DomainSuffixes: suffixes,
-			Server:         DNSCN,
-		})
+	// Invalid user entries are rejected by the caller's configuration/route
+	// validation. Do not build a partial DNS policy from an invalid list.
+	policy, err := EffectiveRules(user)
+	if err != nil {
+		policy, _ = EffectiveRules(nil)
+	}
+	var rules []DNSRule
+	for _, route := range policy {
+		r := DNSRule{Domains: route.Domains, DomainSuffixes: route.DomainSuffixes}
+		for _, tag := range route.RuleSets {
+			if set, ok := LookupRuleSet(tag); ok && set.Kind() == "geosite" {
+				r.RuleSets = append(r.RuleSets, tag)
+			}
+		}
+		if len(r.RuleSets)+len(r.Domains)+len(r.DomainSuffixes) == 0 {
+			continue
+		}
+		switch route.Outbound {
+		case OutDirect:
+			r.Name, r.Server = route.Name+"-real", DNSCN
+			if route.Name == "cn-direct" {
+				r.Name = "cn-domains-real"
+			}
+		case OutProxy:
+			r.Name, r.Server = route.Name+"-fakeip", DNSFakeIP
+			r.QueryTypes = []string{"A", "AAAA"}
+		case OutBlock:
+			r.Name, r.Action = route.Name+"-reject", "reject"
+		}
+		rules = append(rules, r)
 	}
 	rules = append(rules,
-		DNSRule{Name: "cn-domains-real", RuleSets: []string{"geosite-cn"}, Server: DNSCN},
 		DNSRule{Name: "proxied-fakeip", QueryTypes: []string{"A", "AAAA"}, Server: DNSFakeIP},
 	)
 	return DNS{

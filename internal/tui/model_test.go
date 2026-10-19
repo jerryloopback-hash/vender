@@ -279,6 +279,8 @@ func TestSettingsProfileCycleIsACommand(t *testing.T) {
 // complete with no daemon running and shows the concrete artifact.
 func TestSettingsShowsTheAutostartState(t *testing.T) {
 	m := detachedModel(t)
+	// Leave room for the expanded routing policy above the autostart panel.
+	m.height = 45
 	m = m.switchScreen(screenSettings)
 	m.autostartKnown = true
 	m.startAtLogin = autostart.State{

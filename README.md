@@ -703,11 +703,20 @@ The policy, in evaluation order (first match wins):
 | 4 | `user-block` | `rules.yaml` `block:` | `block` |
 | 5 | `private-dest-direct` | `ip_is_private` (RFC1918, loopback, link-local) | `direct` |
 | 6 | `ads-block` | `geosite-category-ads-all` | `block` |
-| 7 | `service-overrides-proxy` | Steam, OneDrive, Microsoft, Google, YouTube, Telegram, Netflix, OpenAI, Bahamut | `proxy` |
-| 8 | `cn-direct` | `geosite-cn`, `geoip-cn` | `direct` |
+| 7 | `bing-search-direct` | Ordinary Bing search entry points and image/static hosts (see below) | `direct` |
+| 8 | `service-overrides-proxy` | Steam, OneDrive, Microsoft, Google, YouTube, Telegram, Netflix, OpenAI, Bahamut | `proxy` |
+| 9 | `cn-direct` | `geosite-cn`, `geoip-cn` | `direct` |
 | — | `route.final` | everything else | `proxy` |
 
-Two things about the order are load-bearing:
+Bing search uses exact matches for `bing.com`, `www.bing.com`, `cn.bing.com`,
+`global.bing.com`, `bing.com.cn`, `www.bing.com.cn` and `s.bing.net`, plus
+suffix matches for `r.bing.com`, `th.bing.com`, `cn.bing.net` and `mm.bing.net`.
+It does **not** exempt all of `bing.com`: `edgeservices.bing.com`,
+`sydney.bing.com` and `copilot.microsoft.com` retain the Microsoft proxy policy.
+HTTPS paths cannot be split: an AI page sharing `www.bing.com` also uses direct.
+These exceptions only apply in rule mode; global remains fully proxied.
+
+The following ordering choices are load-bearing:
 
 - **The critical list is first, and tiny.** It holds the domains whose loss would
   make the machine unmanageable rather than merely inconvenient, and that are
@@ -736,10 +745,21 @@ IPs. DNS is split so that **name resolution never depends on the proxy**:
 ```
 critical list         -> dns-cn      223.5.5.5 over UDP, direct   -> real address
 rules.yaml direct:    -> dns-cn      direct                        -> real address
+rules.yaml proxy: A/AAAA -> dns-fakeip local, no upstream           -> fake address
+rules.yaml block:     -> reject
+ads                   -> reject
+Bing search           -> dns-cn      direct                        -> real address
+service overrides: A/AAAA -> dns-fakeip local, no upstream          -> fake address
 geosite-cn            -> dns-cn      direct                        -> real address
 everything else, A/AAAA -> dns-fakeip  local, no upstream          -> fake address
 everything else, other  -> dns-cn      direct                        -> real address
 ```
+
+DNS rules are generated from the same effective domain policy, in the same
+order as routing. Thus a user proxy override or a Microsoft/CN overlap no
+longer obtains a domestic real address before being proxied. IP-only rules
+(private destinations, CIDRs and `geoip-cn`) cannot be decided from a DNS query
+name and remain routing-only; this is not an IP-geolocation DNS classifier.
 
 The proxied side is answered by a local **FakeIP** resolver: it hands out a
 synthetic `198.18.0.0/15` address in microseconds, with no query to anyone, and

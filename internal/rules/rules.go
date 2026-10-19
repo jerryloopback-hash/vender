@@ -107,11 +107,25 @@ func BuiltinRules() []Rule {
 			RuleSets: []string{"geosite-category-ads-all"},
 		},
 
+		// Ordinary Bing search and its image/static hosts are reachable from
+		// mainland China. Match search entry points exactly: a bing.com suffix
+		// would also exempt edgeservices.bing.com / sydney.bing.com (Copilot).
+		// Paths on www.bing.com cannot be split by domain-based routing.
+		{
+			Name:     "bing-search-direct",
+			Outbound: OutDirect,
+			Domains: []string{
+				"bing.com", "www.bing.com", "cn.bing.com", "global.bing.com",
+				"bing.com.cn", "www.bing.com.cn", "s.bing.net",
+			},
+			DomainSuffixes: []string{"r.bing.com", "th.bing.com", "cn.bing.net", "mm.bing.net"},
+		},
+
 		// 3. Service overrides. These must come *before* the China rule,
 		// because several of them (Steam, Microsoft, Google) have China-facing
-		// entries in geosite-cn that would otherwise claim them and send a
-		// store page or a CDN handshake direct. Everything here is a service
-		// that only works properly from outside the mainland.
+		// entries in geosite-cn that would otherwise claim them. These broad
+		// service policies intentionally proxy even overlapping CN entries,
+		// except for explicit direct exceptions above (ordinary Bing search).
 		//
 		// Keep this list short and justified; adding a category here costs a
 		// proxy hop for every connection it contains.
@@ -119,9 +133,9 @@ func BuiltinRules() []Rule {
 			Name:     "service-overrides-proxy",
 			Outbound: OutProxy,
 			RuleSets: []string{
-				"geosite-steam",     // store / community (download CDNs stay in geosite-cn)
+				"geosite-steam",     // store / community / download CDNs
 				"geosite-onedrive",  // sync endpoints are throttled from CN
-				"geosite-microsoft", // non-CN Microsoft services (also covers GitHub)
+				"geosite-microsoft", // includes CN services and GitHub; Bing search is exempt above
 				"geosite-google",
 				"geosite-youtube",
 				"geosite-telegram",

@@ -19,6 +19,7 @@ func TestBuiltinRulesAreOrderedAndComplete(t *testing.T) {
 	}{
 		{"private-dest-direct", OutDirect},
 		{"ads-block", OutBlock},
+		{"bing-search-direct", OutDirect},
 		{"service-overrides-proxy", OutProxy},
 		{"cn-direct", OutDirect},
 	}
