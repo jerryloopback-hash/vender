@@ -65,6 +65,9 @@ left.
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and the
 interfaces between milestones.
 
+Migrating from Clash for Windows? See the [Windows migration handoff (中文)](docs/WINDOWS-MIGRATION-HANDOFF.md)
+and the [ready-to-paste local agent prompt](docs/WINDOWS-MIGRATION-PROMPT.md).
+
 ## Build
 
 Requires **Go 1.26+**.
