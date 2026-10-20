@@ -90,10 +90,22 @@ try {
         }
         Initialize-VenderNative;[VenderSetupNative]::Refresh()
         if($HideCurrentWindow){
-            # Last operation: detaching this setup process's console can make
-            # subsequent native-command invocation from Windows PowerShell fail.
-            $handle=[VenderSetupNative]::Console([uint32]$daemon.ProcessId,[uint32]$core.ProcessId,[uint32]$PID,$true,0)
-            $state.WindowHidden=($handle -ne 0);Save-VenderSetupState $state $statePath
+            # Attaching to another console must never detach the user's shell.
+            # Isolate FreeConsole/AttachConsole in a short-lived owned process.
+            $resultPath=Join-Path $BackupDir 'hide-result.json'
+            $worker=Join-Path $PSScriptRoot 'hide-console.ps1'
+            $powershell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $arguments=@('-NoProfile','-NonInteractive','-File',('"'+$worker+'"'),'-DaemonPid',"$($daemon.ProcessId)",'-CorePid',"$($core.ProcessId)",'-ExpectedExe',('"'+$cli+'"'),'-ExpectedUserSid',$sid,'-ExpectedCreatedTicks',"$($daemon.CreationDate.ToUniversalTime().Ticks)",'-ResultPath',('"'+$resultPath+'"'))
+            $child=Start-Process -FilePath $powershell -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $BackupDir 'hide-worker.stdout.log') -RedirectStandardError (Join-Path $BackupDir 'hide-worker.stderr.log')
+            if(!$child.WaitForExit(20000)){
+                $owned=Get-CimInstance Win32_Process -Filter "ProcessId=$($child.Id)"
+                if($owned.ExecutablePath -eq $powershell -and $owned.CommandLine.Contains($worker)){$child.Kill()}
+                throw 'Console worker timed out; caller console was not detached.'
+            }
+            if($child.ExitCode -ne 0 -or !(Test-Path -LiteralPath $resultPath)){throw 'Console worker refused or failed; inspect the protected worker result.'}
+            $result=Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+            if(!$result.Success){throw 'Console worker did not report success.'}
+            $state.WindowHidden=[bool]$result.Changed;Save-VenderSetupState $state $statePath
         }
     } catch {
         $message=$_.Exception.Message

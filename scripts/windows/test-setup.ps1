@@ -67,7 +67,10 @@ Restore-VenderSetupState $state ($root+'\missing-env') ($root+'\missing-app') $f
 Assert-Vender ($fake.Writes -eq 1) 'Missing registry values do not prevent task restoration'
 Restore-VenderSetupState $state ($root+'\missing-env') ($root+'\missing-app') $fake
 Assert-Vender ($fake.Writes -eq 1) 'Repeated task restoration is idempotent'
-foreach($file in @('setup.ps1','setup-lib.ps1')){$tokens=$null;$errors=$null;$null=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $file),[ref]$tokens,[ref]$errors);Assert-Vender ($errors.Count -eq 0) "Parse $file"}
+foreach($file in @('setup.ps1','setup-lib.ps1','hide-console.ps1')){$tokens=$null;$errors=$null;$null=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $file),[ref]$tokens,[ref]$errors);Assert-Vender ($errors.Count -eq 0) "Parse $file"}
+$entry=Get-Content (Join-Path $PSScriptRoot 'setup.ps1') -Raw
+Assert-Vender ($entry -notmatch '\[VenderSetupNative\]::Console\(') 'Entry point never detaches caller console'
+Assert-Vender ($entry -match 'hide-console.ps1' -and $entry -match 'Start-Process') 'Hide operation isolated in an owned worker'
 $private=Join-Path ([IO.Path]::GetTempPath()) ('vender-setup-test-'+[guid]::NewGuid().ToString('N'))
 try {
     New-VenderPrivateDirectory $private $sid
@@ -75,6 +78,15 @@ try {
     foreach($ace in (Get-Acl -LiteralPath $private).GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])){Assert-Vender ($ace.IdentityReference.Value -in @($sid,'S-1-5-18','S-1-5-32-544')) 'Backup excludes other identities'}
     Save-VenderSetupState ([pscustomobject]@{Schema=1;SID=$sid}) (Join-Path $private 'state.json')
     Assert-Vender ((Get-Content (Join-Path $private 'state.json') -Raw | ConvertFrom-Json).SID -eq $sid) 'Protected backup persisted'
+    $consoleBefore=[VenderSetupNative]::CurrentConsole()
+    $workerResult=Join-Path $private 'worker-result.json'
+    $worker=Join-Path $PSScriptRoot 'hide-console.ps1'
+    $power=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $workerArgs=@('-NoProfile','-NonInteractive','-File',('"'+$worker+'"'),'-DaemonPid','2147483647','-CorePid','2147483646','-ExpectedExe',('"'+$bin+'\vender.exe"'),'-ExpectedUserSid',$sid,'-ExpectedCreatedTicks','0','-ResultPath',('"'+$workerResult+'"'))
+    $child=Start-Process -FilePath $power -ArgumentList $workerArgs -WindowStyle Hidden -PassThru
+    Assert-Vender ($child.WaitForExit(20000) -and $child.ExitCode -ne 0) 'Worker rejects nonexistent daemon'
+    Assert-Vender (!(Get-Content $workerResult -Raw | ConvertFrom-Json).Success) 'Worker reports refusal in protected result'
+    Assert-Vender ([VenderSetupNative]::CurrentConsole() -eq $consoleBefore) 'Worker does not detach caller console'
     $privateBin=Join-Path $private 'bin'
     $null=New-Item -ItemType Directory -Path $privateBin
     $acl=Get-Acl -LiteralPath $privateBin
@@ -88,6 +100,7 @@ try {
     Assert-VenderThrows {Test-VenderBinPermissions $privateBin $sid} 'Reject ordinary-user write access'
 } finally {
     if(Test-Path (Join-Path $private 'state.json')){Remove-Item -LiteralPath (Join-Path $private 'state.json')}
+    if(Test-Path (Join-Path $private 'worker-result.json')){Remove-Item -LiteralPath (Join-Path $private 'worker-result.json')}
     if(Test-Path (Join-Path $private 'bin')){[IO.Directory]::Delete((Join-Path $private 'bin'))}
     if(Test-Path -LiteralPath $private){[IO.Directory]::Delete($private)}
 }

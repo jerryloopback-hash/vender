@@ -170,6 +170,7 @@ for t in "${targets[@]}"; do
 		mkdir -p "$dir/scripts/windows" "$dir/docs"
 		install -m 0644 "${ROOT}/scripts/windows/setup.ps1" "$dir/scripts/windows/setup.ps1"
 		install -m 0644 "${ROOT}/scripts/windows/setup-lib.ps1" "$dir/scripts/windows/setup-lib.ps1"
+		install -m 0644 "${ROOT}/scripts/windows/hide-console.ps1" "$dir/scripts/windows/hide-console.ps1"
 		install -m 0644 "${ROOT}/scripts/windows/test-setup.ps1" "$dir/scripts/windows/test-setup.ps1"
 		install -m 0644 "${ROOT}/docs/WINDOWS-MANUAL-INSTALL.md" "$dir/docs/WINDOWS-MANUAL-INSTALL.md"
 		;;

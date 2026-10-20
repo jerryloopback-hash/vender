@@ -265,7 +265,7 @@ $backup = Join-Path $env:LOCALAPPDATA 'vender-install-backup-REPLACE-DATE'
 .\scripts\windows\setup.ps1 -BinDir $bin -AddPath -RegisterAppPath -SilentTask -ExpectedUserSid $dailySid -BackupDir $backup -DryRun
 ```
 
-将 `$dailySid` 替换成普通日常窗口实际记录的 SID，不要拿错误提升账户的 SID 自证正确。核对预演后去掉 `-DryRun` 执行；仅在明确想隐藏当前控制台时追加 `-HideCurrentWindow`。脚本与备份必须在稳定、私密位置保留，不能用全局绕过执行策略作为默认前提。
+将 `$dailySid` 替换成普通日常窗口实际记录的 SID，不要拿错误提升账户的 SID 自证正确。核对预演后去掉 `-DryRun` 执行；仅在明确想隐藏当前控制台时追加 `-HideCurrentWindow`。控制台附着与隐藏交给同目录的短生命周期 `hide-console.ps1` 子进程，不从调用者的 PowerShell 直接脱离控制台。复制安装脚本时必须连同 setup-lib.ps1 与 hide-console.ps1 一起保留。脚本与备份必须在稳定、私密位置保留，不能用全局绕过执行策略作为默认前提。
 
 `-SilentTask` 要求已经存在并核验过的 vender 任务，当前进程必须是匹配日常用户的提升会话。它应保留 SID、运行级别、参数和触发器，拒绝不属于 vender 的目标。先在 TUN enabled 状态执行原生 `autostart on`，再转换静默任务，不能反过来让脚本猜测权限。隐藏方案应在创建时隐藏控制台，让内核继承；启动后才隐藏并不能保证不闪窗。
 

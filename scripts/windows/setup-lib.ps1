@@ -105,6 +105,7 @@ public static class VenderSetupNative {
  [DllImport("kernel32.dll")] static extern bool FreeConsole();
  [DllImport("kernel32.dll")] static extern uint GetConsoleProcessList([Out] uint[] p,uint n);
  [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();
+ public static long CurrentConsole() {return GetConsoleWindow().ToInt64();}
  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
  [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr h,int s);
  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h,StringBuilder s,int n);

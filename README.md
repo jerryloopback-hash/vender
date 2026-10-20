@@ -104,7 +104,7 @@ scripts/install.sh --uninstall  # remove both, and the autostart entry
 Each archive unpacks to `vender-<version>-<target>/` with the `vender` binary,
 the matching **sing-box** binary, `README.md`, `LICENSE`, `NOTICE` and
 `LICENSE.sing-box`. Windows archives also include the GUI-subsystem
-`vender-daemon.exe` companion, `scripts/windows/setup*.ps1`, the manual guide,
+`vender-daemon.exe` companion, the `scripts/windows/` setup scripts, the manual guide,
 and optional engine libraries such as `libcronet.dll` from the official archive.
 `package.sh` fetches the pinned sing-box automatically if
 `dist/sing-box/` is empty (it is 80 MB and git-ignored, so a fresh clone has to
