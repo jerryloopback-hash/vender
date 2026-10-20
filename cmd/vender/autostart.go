@@ -80,8 +80,9 @@ func (a *app) newAutostartCmd() *cobra.Command {
 		Short: "Start vender automatically at login",
 		Long: `Register or inspect vender's start-at-login entry.
 
-The entry only has to run ` + "`vender daemon`" + `, which is headless: no console,
-no terminal, one daemon per run directory, and a clean exit on SIGTERM. The
+The entry only has to run ` + "`vender daemon`" + `: no TUI is required, one daemon
+per run directory, and a clean exit on SIGTERM. On Windows a sibling GUI
+companion hides its inherited console; the console CLI remains a fallback. The
 mechanism is chosen per platform:
 
   Linux    a systemd user unit (vender.service, WantedBy=default.target); an
@@ -99,9 +100,9 @@ the mechanism that works:
   Windows  the same logon task registered as HighestAvailable — one elevated
            ` + "`vender autostart on`" + `
 
-If that privileged registration cannot be made, ` + "`on`" + ` still installs the
-per-user one and returns an error saying what TUN mode is still missing; either
-way ` + "`status`" + ` reports whether what is registered can actually create a TUN.
+Windows TUN registration refuses an unprivileged Run-key fallback. A Linux
+per-user fallback may still be installed with an error naming the missing
+privilege. ` + "`status`" + ` reports whether the registration can create a TUN.
 ` + "`on`" + ` and ` + "`off`" + ` are idempotent, and ` + "`status`" + ` exits non-zero when nothing is
 registered.`,
 	}

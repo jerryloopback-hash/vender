@@ -1,4 +1,4 @@
- Dashboard   Nodes       Logs        Settings                                             vender M7
+ Dashboard   Nodes       Logs        Settings                                             vender M8
  servers  2   ↑/↓ move · enter select · A auto · t Ping · T all · Esc cancel · r reload
   profile  manual   (2 of 2 servers; `selected_server: auto` fails over over these)
 ╭─ servers.yaml ────────────────────────────────────────╮

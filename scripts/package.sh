@@ -164,9 +164,23 @@ for t in "${targets[@]}"; do
 
 	case "$os" in
 	linux) install -m 0755 "$vbin" "$dir/vender" ;;
-	windows) install -m 0755 "$vbin" "$dir/vender.exe" ;;
+	windows)
+		install -m 0755 "$vbin" "$dir/vender.exe"
+		install -m 0755 "${ROOT}/dist/vender-daemon.exe" "$dir/vender-daemon.exe"
+		mkdir -p "$dir/scripts/windows" "$dir/docs"
+		install -m 0644 "${ROOT}/scripts/windows/setup.ps1" "$dir/scripts/windows/setup.ps1"
+		install -m 0644 "${ROOT}/scripts/windows/setup-lib.ps1" "$dir/scripts/windows/setup-lib.ps1"
+		install -m 0644 "${ROOT}/scripts/windows/test-setup.ps1" "$dir/scripts/windows/test-setup.ps1"
+		install -m 0644 "${ROOT}/docs/WINDOWS-MANUAL-INSTALL.md" "$dir/docs/WINDOWS-MANUAL-INSTALL.md"
+		;;
 	esac
 	install -m 0755 "$sbin" "$dir/$(basename "$sbin")"
+	# Preserve optional libraries from the official engine archive, not a DLL site.
+	for lib in libcronet.dll libcronet.so; do
+		if [ -f "${SINGBOX_ROOT}/${t}/$lib" ]; then
+			install -m 0755 "${SINGBOX_ROOT}/${t}/$lib" "$dir/$lib"
+		fi
+	done
 	install -m 0644 "${ROOT}/README.md" "$dir/README.md"
 	install -m 0644 "${ROOT}/LICENSE" "$dir/LICENSE"
 	install -m 0644 "${ROOT}/NOTICE" "$dir/NOTICE"

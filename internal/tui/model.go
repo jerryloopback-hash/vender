@@ -51,10 +51,9 @@ const (
 // it unset.
 const defaultRefreshInterval = time.Second
 
-// milestoneTag is the build milestone shown in the tab bar. It is what the
-// documentation and `vender version` are read against, so it moves with the
-// milestone rather than with the build.
-const milestoneTag = "M7"
+// milestoneTag describes the implemented feature milestone, not binary provenance.
+// Use `vender version` for the actual version, commit and build date.
+const milestoneTag = "M8"
 
 // --- messages ---------------------------------------------------------------
 

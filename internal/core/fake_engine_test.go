@@ -127,7 +127,11 @@ func flagValue(args []string, name string) string {
 // SIGTERM behaviour terminates the process, which is exactly what sing-box does
 // and what Stop's graceful path relies on.
 func blockForever() {
-	select {}
+	// A bare select{} is a runtime deadlock when never-listen is the only
+	// goroutine. Keep a timer alive so this fixture can test readiness timeouts.
+	for {
+		time.Sleep(time.Hour)
+	}
 }
 
 func sleepMillis(ms int) {

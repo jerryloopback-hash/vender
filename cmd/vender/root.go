@@ -105,9 +105,9 @@ func newRootCmdWithApp(a *app) *cobra.Command {
 		Long: `vender is a lightweight, cross-platform personal proxy client.
 
 It runs sing-box as a managed child process and exposes a local mixed
-SOCKS5+HTTP inbound (default 127.0.0.1:7897) that applications can use. Two
-outbound protocols are supported: VLESS + Vision + REALITY (TCP) and
-Hysteria2 (UDP).
+SOCKS5+HTTP inbound (default 127.0.0.1:7897) that applications can use.
+Supported outbounds are VLESS + Vision + REALITY, Hysteria2, Shadowsocks,
+VMess and Trojan; protocol-specific transport limits are documented in README.
 
 The daemon does the proxying; the TUI (M3) is an optional client that attaches
 to it. Configuration lives in the platform user config directory:

@@ -67,6 +67,8 @@ interfaces between milestones.
 
 Migrating from Clash for Windows? See the [Windows migration handoff (中文)](docs/WINDOWS-MIGRATION-HANDOFF.md)
 and the [ready-to-paste local agent prompt](docs/WINDOWS-MIGRATION-PROMPT.md).
+Installing by hand on another Windows 11 PC, without an agent? Start with the
+[manual Windows installation and troubleshooting guide (中文)](docs/WINDOWS-MANUAL-INSTALL.md).
 
 ## Build
 
@@ -83,6 +85,7 @@ Cross-compile for Windows:
 
 ```sh
 GOOS=windows GOARCH=amd64 go build -o vender.exe ./cmd/vender
+GOOS=windows GOARCH=amd64 go build -ldflags=-H=windowsgui -o vender-daemon.exe ./cmd/vender-daemon
 ```
 
 `scripts/build.sh` builds both targets into `dist/` with version metadata
@@ -100,7 +103,10 @@ scripts/install.sh --uninstall  # remove both, and the autostart entry
 
 Each archive unpacks to `vender-<version>-<target>/` with the `vender` binary,
 the matching **sing-box** binary, `README.md`, `LICENSE`, `NOTICE` and
-`LICENSE.sing-box`. `package.sh` fetches the pinned sing-box automatically if
+`LICENSE.sing-box`. Windows archives also include the GUI-subsystem
+`vender-daemon.exe` companion, `scripts/windows/setup*.ps1`, the manual guide,
+and optional engine libraries such as `libcronet.dll` from the official archive.
+`package.sh` fetches the pinned sing-box automatically if
 `dist/sing-box/` is empty (it is 80 MB and git-ignored, so a fresh clone has to
 get it from somewhere).
 
@@ -305,7 +311,7 @@ be configured per application, see [TUN mode](#tun-mode) below.
 | Platform | What is written |
 |---|---|
 | Linux | the GNOME proxy schema through `gsettings` (`org.gnome.system.proxy.*`), with loopback in `ignore-hosts`; `off` restores `mode: none` |
-| Windows | the per-user WinINET settings `HKCU\...\Internet Settings` (`ProxyEnable`, `ProxyServer` = `http=...;https=...;socks=...`, `ProxyOverride`), then `InternetSetOption` to make running applications re-read them; `off` clears only `ProxyEnable` |
+| Windows | the per-user effective WinINET settings, including manual proxy, PAC and discovery flags; `on` saves the original durably, `off` restores that backup, and conflicting external changes are refused unless deliberately forced |
 
 Neither touches WinHTTP's own configuration (`netsh winhttp`), because a browser
 does not use it.
@@ -313,7 +319,7 @@ does not use it.
 ## Start at login (autostart)
 
 ```sh
-./vender autostart on          # register, and start it now
+./vender autostart on          # register; Windows does not start the task immediately
 ./vender autostart status      # what is registered, and where
 ./vender autostart status --json
 ./vender autostart off         # remove it
@@ -340,16 +346,26 @@ down when your last session ends. `autostart on` asks logind for lingering
 is still correct and `status` says so in its `detail` line — run
 `loginctl enable-linger` yourself to finish the job.
 
-**Windows caveat.** The task is registered hidden and at the least privilege,
-but vender is a *console-subsystem* executable, so Task Scheduler does not
-guarantee a fully invisible start — a console window can flash at logon. A
-windowless start needs a GUI-subsystem build or a `conhost --headless` launcher
-and is deferred to M7; the daemon itself does not need a console. The Windows
-paths are compile-checked (`GOOS=windows go build ./...`) and their XML, argument
-vectors and output parsing are unit-tested, but they cannot be *executed* on a
-Linux development host.
+**Windows console and TUI.** Keep `vender.exe` a console-subsystem application.
+When the sibling GUI-subsystem `vender-daemon.exe` is present, native task
+registration selects it for silent startup. It creates the daemon console hidden
+from the start, so the engine inherits that hidden console; a lifetime Job Object
+binds the whole tree. Without the companion, the task uses the console CLI and
+status explicitly reports the fallback. The task's `Hidden` attribute alone
+does not hide an application window. A malformed/non-GUI companion is rejected.
+The non-TUN Run-key fallback still runs the console CLI and does not promise silence.
 
-The entry only ever runs `vender daemon`, which is headless: one daemon per run
+`scripts/windows/setup.ps1` can add **user-only** PATH and App Paths entries,
+convert a verified existing task, or hide a verified current daemon window without
+stopping it. Use `-DryRun` first; protected backups and guarded `-RestoreFrom`
+are provided. Reopen old terminals or refresh their process PATH. Shell/App Paths
+lookup from an old elevated process is not a guarantee that Win+R has refreshed.
+The [manual guide](docs/WINDOWS-MANUAL-INSTALL.md) includes exact commands and limits.
+Only a real task start and subsequent logon can validate startup on a new machine;
+Linux cross-builds and Windows isolated fixtures do not replace that acceptance.
+
+The entry runs the logical `vender daemon`, directly or through the GUI
+companion. It needs no TUI: one daemon per run
 directory, a fresh control token per start, and a clean exit on `SIGTERM`.
 
 ### Autostart with TUN mode
@@ -365,10 +381,10 @@ mechanism that *can*:
 | Linux | a **system** unit `/etc/systemd/system/vender.service` with `User=<you>` and `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW` | one `sudo vender autostart on`. The daemon still runs as you, not as root; `CapabilityBoundingSet` keeps every other capability out of reach |
 | Windows | the same logon task, registered as `HighestAvailable` instead of `LeastPrivilege` | one `vender autostart on` from an **elevated** prompt |
 
-If that privileged registration cannot be made — no root, no elevation — `on`
-still installs the per-user entry (so the daemon does start at login) and then
-**returns an error** naming what TUN mode is still missing. It never reports a
-setup that cannot work. `status` tells the same truth at any time: it says which
+On Windows, TUN registration requires actual elevation and refuses to install a
+non-elevated Run-key fallback. On Linux a per-user fallback may still be installed
+with an error explaining the missing privilege. It never reports a setup that
+cannot work. `status` tells the same truth at any time: it says which
 mechanism is registered and whether that mechanism can create a TUN, and when it
 cannot it prints the fix.
 

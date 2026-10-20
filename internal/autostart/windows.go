@@ -50,6 +50,9 @@ type windowsBackend struct {
 	deleteRunKey func() error
 	taskExists   func() (bool, error)
 	isElevated   func() bool
+	// taskExe is the optional GUI companion; exe remains the original CLI.
+	taskExe     string
+	launcherErr error
 }
 
 func defaultWindowsBackend() windowsBackend {
@@ -100,6 +103,9 @@ func (b windowsBackend) enable() (State, error) { return b.enableWith(Options{})
 func (b windowsBackend) enableWith(o Options) (State, error) {
 	if b.identityErr != nil {
 		return State{}, b.identityErr
+	}
+	if b.launcherErr != nil {
+		return State{}, b.launcherErr
 	}
 	if o.TUN && b.isElevated != nil && !b.isElevated() {
 		return State{}, errors.New("registering TUN autostart requires an elevated Administrator prompt; HighestAvailable cannot grant Administrator rights to a standard user")
@@ -166,7 +172,11 @@ func (b windowsBackend) enableTaskWith(o Options) (State, error) {
 	if b.writeTemp == nil {
 		return State{}, errors.New("autostart: no way to stage the task XML")
 	}
-	xmlPath, err := b.writeTemp(taskXMLWith(b.exe, o, b.userSID))
+	command := b.exe
+	if b.taskExe != "" {
+		command = b.taskExe
+	}
+	xmlPath, err := b.writeTemp(taskXMLWith(command, o, b.userSID))
 	if err != nil {
 		return State{}, err
 	}
@@ -182,6 +192,12 @@ func (b windowsBackend) enableTaskWith(o Options) (State, error) {
 		detail = "Task Scheduler logon task created with the highest available privileges (hidden) because TUN mode is on; " +
 			"the daemon can create the WinTun adapter at logon without another prompt. " +
 			"A short console window can still appear because vender is a console-subsystem binary"
+	}
+	if b.taskExe != "" {
+		detail = "Task Scheduler logon task created using the GUI companion vender-daemon.exe; daemon and engine inherit a console hidden at creation; registration does not start the task"
+		if o.TUN {
+			detail += "; HighestAvailable is retained for TUN"
+		}
 	}
 	return State{
 		Enabled:   true,
@@ -253,6 +269,11 @@ func (b windowsBackend) statusWith(o Options) (State, error) {
 		if out, err := b.run("schtasks", "/Query", "/TN", winTaskName, "/XML"); err == nil {
 			if looksLikeTaskXML(out) {
 				detail := "Task Scheduler logon task " + winTaskName + " is registered" + describeTaskCommand(out)
+				if strings.Contains(strings.ToLower(normalizeWinOutput(out)), "vender-daemon.exe</command>") {
+					detail += "; GUI companion selected for silent startup"
+				} else {
+					detail += "; console fallback: Hidden hides the task entry, not the console window"
+				}
 				if o.TUN {
 					if taskIsElevated(out) {
 						detail += "; it runs with the highest available privileges, which is what TUN mode needs"

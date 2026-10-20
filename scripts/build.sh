@@ -40,6 +40,9 @@ for target in "${TARGETS[@]}"; do
 		echo "building windows/amd64 -> dist/vender.exe"
 		CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
 			go build -trimpath -ldflags "$LDFLAGS" -o dist/vender.exe ./cmd/vender
+		echo "building windows/amd64 GUI companion -> dist/vender-daemon.exe"
+		CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+			go build -trimpath -ldflags "-H=windowsgui $LDFLAGS" -o dist/vender-daemon.exe ./cmd/vender-daemon
 		;;
 	*)
 		echo "unknown target: $target (want linux or windows)" >&2

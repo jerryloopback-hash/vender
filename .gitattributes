@@ -1,2 +1,6 @@
 # Keep generated UI/config snapshots byte-stable on Windows checkouts.
 *.golden text eol=lf
+# Shell release tooling must also run after a Windows checkout.
+*.sh text eol=lf
+# PowerShell 5.1 scripts are ASCII-compatible and accept native Windows endings.
+*.ps1 text eol=crlf

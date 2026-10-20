@@ -1,4 +1,4 @@
- Dashboard   Nodes       Logs        Settings                                             vender M7
+ Dashboard   Nodes       Logs        Settings                                             vender M8
 ╭─ routing mode ───────────────────────────────────────────────────────────────────────────────────╮
 │ ▸ (●) rule   active  built-in policy: CN and private destinations direct, ads blocked, the rest… │
 │   ( ) global         every connection through the selected server                                │

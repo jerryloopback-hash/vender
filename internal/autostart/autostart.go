@@ -9,14 +9,14 @@
 //	        systemd to system services — so a *system* unit is installed instead
 //	        (User=<you>, AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW), which
 //	        needs root once.
-//	Windows a Task Scheduler logon task that runs at logon without a console
-//	        window when it can be created, otherwise the per-user Registry Run
+//	Windows a Task Scheduler logon task, silent with the GUI companion or using
+//	        the console CLI as fallback; otherwise the per-user Registry Run
 //	        key. With TUN mode enabled the task is registered as
 //	        HighestAvailable, which needs one elevated registration and cannot
 //	        be replaced by the Run key.
 //
-// The entry only ever has to run `vender daemon`. That program is headless (no
-// console, no TTY), takes an advisory lock on its run directory so two copies
+// The entry only ever has to run `vender daemon`. It needs no TUI, takes an
+// advisory lock on its run directory so two copies
 // cannot fight, and exits cleanly on SIGTERM — which is exactly what a systemd
 // unit sends. Its control channel is loopback TCP, so a client started in a
 // later login session can reach the daemon autostart started.

@@ -4,6 +4,7 @@ package autostart
 
 import (
 	"context"
+	"debug/pe"
 	"errors"
 	"fmt"
 	"os"
@@ -28,6 +29,37 @@ func configureNativeWindowsBackend(b *windowsBackend) {
 	b.deleteRunKey = deleteWindowsRunKey
 	b.deleteTask = deleteWindowsTask
 	b.taskExists = windowsTaskExists
+	b.taskExe, b.launcherErr = siblingGUICompanion(b.exe)
+}
+
+func siblingGUICompanion(cli string) (string, error) {
+	path := filepath.Join(filepath.Dir(cli), "vender-daemon.exe")
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("inspect GUI companion: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", errors.New("autostart companion must be a regular executable file")
+	}
+	f, err := pe.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("invalid GUI companion: %w", err)
+	}
+	defer f.Close()
+	var subsystem uint16
+	switch h := f.OptionalHeader.(type) {
+	case *pe.OptionalHeader64:
+		subsystem = h.Subsystem
+	case *pe.OptionalHeader32:
+		subsystem = h.Subsystem
+	}
+	if subsystem != pe.IMAGE_SUBSYSTEM_WINDOWS_GUI {
+		return "", errors.New("vender-daemon.exe must be built with -ldflags=-H=windowsgui")
+	}
+	return path, nil
 }
 
 func windowsTool(name string) (string, error) {
